@@ -4,92 +4,130 @@
 
 `stitchpad.md` is a self-describing markdown file. The roster of who's in the
 room lives *inside the file* as a fenced ` ```roster ` block. You talk to a
-teammate by writing a line that starts with `@their-name`. A watcher notices the
-new mention, looks them up in the roster, and **wakes them in their own
-terminal** — works for Claude Code, codex, cursor, pi, anything that runs in a
-shell. Every message is one commit in an isolated git repo, so the whole
-conversation has blame and diff. A TUI renders it live like a chat client.
+teammate by writing a line that starts with `@their-name`. When that teammate's
+agent next finishes a turn, its **runtime wake hook** reads the pad, sees the new
+`@mention`, and feeds it back in as the agent's next turn — so it picks the
+message up and replies. Works for Claude Code, Codex, and pi today; any runtime
+with a turn-end hook is a one-file adapter away. Every message is one commit in
+an isolated git repo, so the whole conversation has blame and diff. A TUI renders
+it live like a chat client.
 
-The elegance is the whole point: **it's a markdown file + a watcher.** Open the
+The elegance is the whole point: **it's a markdown file + a wake hook.** Open the
 file and you see both who's in the room and the entire conversation. Any agent
 joins by adding one line.
 
 ```
 stitchpad.md  (the bus — roster lives inside it)
    │
-   ├── stitchpad MCP server   ← agents connect here; `join` auto-registers
-   │      tools: join · say · read · who      their own tmux pane
+   ├── stitchpad MCP server   ← agents connect here; `join` registers their
+   │      tools: join · say · read · who      name + runtime (no wake itself)
    │
-   └── watcher (fswatch on stitchpad.md)
-          on new @name  →  tmux send-keys into that teammate's pane
+   └── runtime wake hook (per agent)
+          at turn-end → `stitchpad wake @me` → any new mentions become
+          the agent's next turn (claude/codex Stop hook · pi extension)
 ```
 
-## The wake: tmux
+## The wake: native runtime hooks
 
-Every terminal coding agent runs in a tmux pane. tmux can deliver text to any
-pane from the outside — `tmux send-keys -t <pane> "..."` — as a first-class,
-supported feature. So the wake for **any** runtime is one line: send-keys to that
-teammate's pane. No per-runtime hooks, no keystroke-injection hacks, no
-vendor-specific API. A teammate's "address" is just their pane id (`%N`), and the
-MCP server fills that in automatically from `$TMUX_PANE` when they join.
+Every modern coding agent fires a hook when it finishes a turn — Claude Code and
+Codex both have a **Stop hook** with an identical contract, and pi has an
+**`agent_end`** extension event. stitchpad hangs one tiny script on that hook.
+When the agent goes idle, the hook runs `stitchpad wake <me>`, which prints any
+pad messages addressed to `@me` since the last drain. If there are some, the hook
+tells the runtime "don't stop — treat this as a new prompt," and the agent reads
+and replies. Nothing new → it stops normally, no model turn burned.
 
-> Earlier designs tried per-runtime hooks (fragile, one adapter per runtime) and
-> raw TTY injection (OS-blocked, unsafe, races the keyboard). tmux is the simple,
-> universal answer.
+One brain, three adapters: claude (Stop hook), codex (the *same* Stop hook
+script), and pi (extension) all shell out to the **same** `stitchpad wake`
+command. The only per-runtime part is how the result is fed back in.
+
+> **The honest limit:** this is *drain-at-turn-end*, not instant interrupt. A
+> teammate picks up its mentions whenever it next finishes a turn — native and
+> reliable, just turn-gated rather than interrupt-driven. That's the right rhythm
+> for agent-to-agent back-and-forth.
+>
+> Earlier designs tried raw TTY keystroke injection (OS-blocked, races the
+> keyboard) and a tmux `send-keys` wake (needed every agent inside tmux). Native
+> turn-end hooks are the simpler, safer answer.
 
 ## Quickstart
 
+Once per machine — install the CLI and wire your runtime's hook:
+
 ```bash
-# install (symlinks stitchpad + stitchpad-tui into ~/.local/bin)
+# 1. install: symlinks the CLI/TUI onto PATH, and points ~/.stitchpad at this
+#    checkout so hook paths resolve no matter where you cloned it.
 ./tool/install.sh
-export STITCHPAD_HOME="$PWD/tool"     # so adapters resolve
 
-# in any project (run your agents inside tmux)
-stitchpad init
-stitchpad join chief tmux push '%1'   # or let the MCP auto-detect the pane
-stitchpad join larry tmux push '%2'
-stitchpad start                       # background watcher
+# 2. wire the wake hook for each runtime you use (one time):
+#    Claude — add to ~/.claude/settings.json:
+#      { "hooks": { "Stop": [ { "hooks": [ { "type": "command",
+#          "command": "~/.stitchpad/adapters/stop-hook.sh" } ] } ] } }
+#    Codex  — add the same block to ~/.codex/hooks.json, then run /hooks and
+#             trust it once.
+#    pi     — install the extension (tracks repo edits):
+#               pi install ~/.stitchpad/adapters/pi
+```
 
-# talk — addressing @larry wakes larry's pane
-stitchpad say chief "@larry the auth test is red, take a look"
+Then, in any project:
+
+```bash
+stitchpad init                  # create .stitchpad/ in this project
+stitchpad join john claude      # each agent joins: <name> <claude|codex|pi>
+
+# talk — addressing @larry wakes larry at their next turn-end
+stitchpad say john "@larry the auth test is red, take a look"
 
 # watch it live
 stitchpad-tui
 ```
+
+> Restart any already-running claude/codex sessions after wiring the hook so it
+> loads. Identity is recorded when an agent joins, so the hook knows who "I" am
+> with no hardcoded name.
 
 ## CLI
 
 | command | what it does |
 |---------|--------------|
 | `stitchpad init [--name <pad>]` | create `.stitchpad/` in the current project |
-| `stitchpad join <name> <adapter> [wake] [target]` | add a participant to the roster |
+| `stitchpad join <name> <adapter> [wake] [target]` | add a participant to the roster (adapter = `claude`/`codex`/`pi`) |
 | `stitchpad say <from> <text…>` | post a message (auto-commits) |
 | `stitchpad read [-n N]` | print the recent conversation |
+| `stitchpad wake <name> [--peek]` | print new `@name` messages since last drain (what the hook calls) |
 | `stitchpad roster` / `who` | print the parsed roster |
-| `stitchpad start\|stop\|status\|restart` | manage the background watcher |
-| `stitchpad watch` | run the watcher in the foreground |
+| `stitchpad watch` | run the optional file watcher in the foreground |
+| `stitchpad start\|stop\|status\|restart` | manage the optional background watcher |
 | `stitchpad log [-n N]` | git history (one commit per message) |
 | `stitchpad-tui` | live Slack-style terminal view |
 
+> The watcher (`start`/`watch`) is **optional** — it's a convenience for
+> non-hooked surfaces (e.g. desktop notifications). The actual wake is the
+> per-runtime turn-end hook; you do not need the watcher running for agents to
+> pick up their mentions.
+
 ## Adapters (how a teammate gets woken)
 
-Adapters live in `tool/adapters/<name>.sh`. The roster's `adapter` column picks one.
+The roster's `adapter` column records which runtime a teammate is. The wake
+itself is wired once per machine at the runtime level (see Quickstart).
 
-| adapter | wake | target |
-|---------|------|--------|
-| `tmux`  | **send-keys into the teammate's pane** (the default, universal) | tmux pane id, e.g. `%2` or `main:1.2` |
-| `pi`    | spawn a headless `pi -p` session with the task | extension path |
-| `notify` (`claude.sh`) | desktop notification + ping flag only (no auto-wake) | — |
+| adapter | wake mechanism | wiring |
+|---------|----------------|--------|
+| `claude` | Stop hook → `stitchpad wake` | `~/.claude/settings.json` → `adapters/stop-hook.sh` |
+| `codex` | Stop hook (same script) → `stitchpad wake` | `~/.codex/hooks.json` → `adapters/stop-hook.sh` (trust via `/hooks`) |
+| `pi` | `agent_end` extension event → `stitchpad wake` | `pi install ~/.stitchpad/adapters/pi` |
 
-Add a runtime by dropping one `<name>.sh` in `tool/adapters/` and using it in a
-roster line. That's the whole extension model.
+Add a runtime by giving it a turn-end hook that shells out to `stitchpad wake
+<name>` and feeds the output back in as the next turn. claude and codex already
+share one script; pi is a ~75-line extension. That's the whole extension model.
 
 ## MCP (agent-facing, plug-and-play)
 
-Agents connect the stitchpad MCP server and call `join` once — it auto-detects
-their tmux pane, so `@them` wakes their exact terminal. Tools: `join`, `say`,
-`read`, `who`. There's no `wait_for_mention` — the wake is push (tmux), not a
-poll. See [`tool/mcp/README.md`](tool/mcp/README.md).
+The MCP server is the **identity + talking** surface — it does *not* do the wake.
+An agent adds the server and calls `join` once, which records its name + runtime
+in the pad so the runtime's own hook knows who it is. Tools: `join`, `say`,
+`read`, `who`. There's no `wait_for_mention` — the wake is the turn-end hook
+reading the pad, not a poll. See [`tool/mcp/README.md`](tool/mcp/README.md).
 
 ```bash
 claude mcp add stitchpad -- node "$PWD/tool/mcp/server.mjs"
@@ -103,7 +141,7 @@ A pad is a directory `.stitchpad/`:
 .stitchpad/
 ├── stitchpad.md      the markdown bus (roster block + messages)
 ├── stitchpad-git/    isolated git history — one commit per post (blame/diff)
-└── .state/           runtime flags, counters, watcher pid/log (gitignored)
+└── .state/           runtime flags, per-name wake cursors, whoami (gitignored)
 ```
 
 The isolated git tracks only `stitchpad.md`, separate from your project repo.
@@ -113,32 +151,30 @@ The isolated git tracks only `stitchpad.md`, separate from your project repo.
 ```
 tool/
 ├── bin/
-│   ├── stitchpad        CLI
+│   ├── stitchpad        CLI (init/join/say/read/wake/roster/watch/...)
 │   ├── stitchpad-tui →  tui.sh
-│   ├── lib.sh           core: roster parse, isolated git, mention detect, notify
-│   ├── watch.sh         the fswatch watcher body
-│   ├── daemon.sh        background start/stop/status/restart
+│   ├── lib.sh           core: roster parse, isolated git, mention detect, locking
+│   ├── watch.sh         the optional fswatch watcher body
+│   ├── daemon.sh        optional background start/stop/status/restart
 │   └── tui.sh           live Slack-style renderer
 ├── adapters/
-│   ├── tmux.sh          the universal wake (send-keys)
-│   ├── pi.sh            headless pi spawn (push)
-│   └── claude.sh        notify-only fallback
+│   ├── stop-hook.sh     shared claude + codex Stop hook → `stitchpad wake`
+│   └── pi/              pi extension (index.ts + package.json) → `stitchpad wake`
 ├── mcp/
-│   ├── server.mjs       MCP server (join/say/read/who)
+│   ├── server.mjs       MCP server (join/say/read/who) — identity + talk, no wake
 │   └── README.md
 └── install.sh
 
 reference/               prior art — NOT shipped, just study
-├── librarian-hooks/     the original bash hook version (chief↔larry)
-└── node-watcher/        a 291-line Node version of the @larry watcher
 ```
 
 `reference/` is the lineage: stitchpad started as coordination plumbing for the
-Librarian app (hook-based, per-runtime) before becoming its own tool. Kept for
-study, not shipped.
+Librarian app before becoming its own tool. Kept for study, not shipped.
 
 ## Requirements
 
-- `tmux` (the wake), `fswatch` (the watcher), `git`, `awk`, `bash` — macOS/Linux.
-- `node` for the MCP server.
-- Optional: `terminal-notifier` (falls back to `osascript` for notifications).
+- `git`, `awk`, `bash` — macOS/Linux.
+- `node` for the MCP server and the pi extension.
+- A runtime with a turn-end hook: Claude Code, Codex, or pi.
+- Optional: `fswatch` (only for the optional background watcher);
+  `terminal-notifier` / `osascript` for desktop notifications.
