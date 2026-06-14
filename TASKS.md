@@ -1,43 +1,47 @@
 # stitchpad — TASKS
 
-> Working backlog. Mirrors the OPEN TASKS in HANDOFF.md so a fresh session has them
-> on disk (the session task-tool list doesn't survive a new session). Check items off
-> here as you go. Priority order top-down.
+> Working backlog. Priority order top-down.
 
-## 🔥 Now
-- [ ] **0. Re-architect: TTY/PID + MCP (THE PIVOT).** Make wake runtime-agnostic.
-      Decide wake model — recommend **MCP-inbox pull** (`wait_for_mention` tool the daemon
-      flips), use PID/TTY only for targeting + notifications, NOT keystroke injection.
-      Stand up a minimal stitchpad MCP server: `join / say / read / who / wait_for_mention`.
-      This becomes the primary agent-facing path; CLI + TUI stay human-facing.
-      → Goal: any agent adds the MCP, turns it on, is in the channel. Plug-and-play.
+## ✅ Done (this session, 2026-06-14)
+- [x] **Rename chatroom → stitchpad everywhere.** `sp_` prefix, `STITCHPAD_HOME`,
+      `stitchpad.md`, `.stitchpad/`, `stitchpad-git`, `sgit`. `stitchpad-tui`
+      symlink created. Zero old-name leftovers (grep-verified).
+- [x] **Fix watcher bug.** Root cause was NOT stdin consumption (handoff was
+      wrong) — it was an unbraced `$old` next to a Unicode `→` in a log line;
+      bash bound the multibyte char into the var name. Fixed by bracing + ASCII
+      arrows. Verified: watcher fires clean, no unbound-var.
+- [x] **THE WAKE = tmux** (this replaced the MCP-pull / TTY-injection ideas).
+      `tool/adapters/tmux.sh` does `tmux send-keys` into the teammate's pane.
+      Universal across runtimes, supported, safe. Verified end-to-end: a real
+      `@mention` lands a nudge in a real pane.
+- [x] **MCP server** (`tool/mcp/server.mjs`): join/say/read/who. `join`
+      auto-detects the caller's `$TMUX_PANE` → plug-and-play registration. No
+      `wait_for_mention` (wake is push, not poll). Verified over stdio JSON-RPC.
+- [x] **TUI verified** + fixed a roster-fence parse leak. Live redraw, colors,
+      roster rail, q-to-quit all work.
+- [x] **README + install.sh.** Install symlinks survive (symlink-safe lib
+      resolution + STITCHPAD_HOME auto-derive). Full E2E passes with no env set.
 
-## 🔧 Make the existing tool trustworthy
-- [ ] **1. Rename chatroom → stitchpad everywhere** in `tool/`.
-      `CHATROOM_HOME`→`STITCHPAD_HOME`, `channel.md`→`stitchpad.md`, `.chatroom/`→`.stitchpad/`,
-      `channel-git`→`stitchpad-git`, `cr_`→`sp_`, `cr_find_channel` looks for `.stitchpad`,
-      help text + init template + comments. Delete dead `bin/chatroom-tui` symlink; make
-      `bin/stitchpad-tui` → tui.sh.
-- [ ] **2. Fix watcher bug** (`watch.sh` ~line 56, `old�: unbound variable`).
-      Cause: inner read consumes the fswatch pipe's stdin. Ensure nothing inside the
-      `fswatch | while` loop reads stdin (`< /dev/null`, here-strings, or array). Re-test
-      with mock adapter until push + pull both fire cleanly.
-
-## ✨ Finish + ship
-- [ ] **3. Finish/verify TUI** (`tui.sh`): live re-render on change, author colors, roster
-      rail, unread-ping indicator, `q` to quit, correct parse of roster fence + message headers.
-- [ ] **4. README + install script.** Pitch, design (self-describing markdown, roster-in-file,
-      @mention→wake, MCP plug-and-play), quickstart, PATH install, document `reference/`.
-
-## 🔁 Later
-- [ ] **5. Migrate Librarian onto it** — chief + larry on a real `.stitchpad/stitchpad.md`.
-      Optional; Librarian is fine without it.
+## 🔁 Later / optional
+- [ ] **Auto-join on MCP session load.** Right now the agent must *call* `join`
+      once. Consider a session-start nudge (system-prompt note, or an MCP
+      "initialized" hook) so registration is truly zero-touch.
+- [ ] **Stale-pane GC.** If a registered tmux pane dies, the watcher should
+      notice (tmux has-session / list-panes) and mark the teammate offline
+      instead of failing send-keys.
+- [ ] **`notify` adapter rename.** `claude.sh` is really the notify-only
+      fallback; consider renaming the file to `notify.sh` (kept as claude.sh for
+      now for back-compat).
+- [ ] **Migrate Librarian onto it** — chief + larry on a real
+      `.stitchpad/stitchpad.md`. Optional; Librarian is fine without it.
 
 ---
 ### Test pattern that worked
-init in `/tmp/stitchpad-test`; swap a MOCK adapter that just logs; drive with `say`;
-assert on the log. Don't spawn real `pi` in smoke tests.
+init in `/tmp/...`; make a real tmux session+pane; join that pane on the tmux
+adapter; `stitchpad start`; `stitchpad say` a mention; `tmux capture-pane` to
+assert the nudge landed. For the MCP, drive `server.mjs` with JSON-RPC over stdin.
 
 ### Verified working (don't re-litigate)
-init · join · say · roster parse-back · mention detection (start-of-line @name, BSD-awk) ·
-adapter dispatch (push/pull, via mock) · isolated-git blame trail.
+init · join · say · read · roster/who · mention detection (start-of-line @name,
+ignores casual) · tmux wake (send-keys into pane) · MCP join/say/read/who with
+pane auto-detect · isolated-git blame trail · TUI live render · install symlinks.

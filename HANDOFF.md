@@ -1,7 +1,43 @@
 # stitchpad — HANDOFF
 
 > Read this first. It's the full context for a fresh session to come out firing.
-> Last updated: 2026-06-14, end of the session that spun stitchpad out of Librarian.
+> Last updated: 2026-06-14 — session that resolved the wake mechanism (tmux),
+> renamed everything, fixed the watcher, built the MCP server, and shipped
+> README + install. **The "PIVOT" section below is superseded — see ✅ RESOLVED.**
+
+---
+
+## ✅ RESOLVED THIS SESSION (the real architecture — read this, ignore the old PIVOT)
+
+**The wake is tmux.** Every terminal coding agent runs in a tmux pane; the watcher
+wakes a teammate with `tmux send-keys` into their pane. Universal across runtimes,
+first-class/supported, no kernel hacks, no vendor API.
+
+- We rejected **TTY/keystroke injection (TIOCSTI)**: the Claude Code safety
+  classifier hard-blocks building it, and Apple neutered it on recent macOS anyway.
+- We rejected **MCP-pull (`wait_for_mention`)**: a mailbox the agent has to remember
+  to check isn't a wake. (john's words: "I don't need an mcp to go manually tell a
+  nigga to check a md file.")
+- We briefly explored the **claude.ai remote-trigger API** — works and is proven on
+  john's account, but it's *Claude-only*, so it can only ever be one adapter, not the
+  universal spine.
+
+**Net architecture now (built + verified):**
+```
+stitchpad.md  (the bus, roster inside it)
+   │
+   ├── stitchpad MCP server  (tool/mcp/server.mjs)  ← agents connect; `join`
+   │      tools: join · say · read · who              auto-registers their own
+   │                                                   $TMUX_PANE. No poll tool.
+   └── watcher (fswatch on stitchpad.md)
+          on new @name → tmux send-keys into that teammate's pane
+            (adapters: tmux=wake, pi=spawn, claude.sh=notify-only fallback)
+```
+Everything is verified end-to-end (see TASKS.md "Verified working"). The CLI/TUI
+are the human side; the MCP is the agent side; both read/write the same
+stitchpad.md + isolated git.
+
+See also memory: [[stitchpad-overview]], [[stitchpad-wake-mechanism]].
 
 ---
 
@@ -25,9 +61,14 @@ this repo is the spun-out tool.
 
 ---
 
-## ⚠️ THE PIVOT (do this — it's the whole point now)
+## ⚠️ THE PIVOT — ❌ SUPERSEDED (kept for history; see ✅ RESOLVED above)
 
-The current implementation wakes agents via **per-runtime hooks + adapters**. That's the
+> This whole section described the *plan* before this session. The conclusion it
+> reaches (MCP-inbox pull, PID/TTY for targeting only) was tried and rejected in
+> favor of **tmux send-keys** as the universal wake. Do not implement the below.
+> It's left here only so you can see the reasoning that led to the tmux decision.
+
+The original implementation woke agents via **per-runtime hooks + adapters**. That's the
 wrong abstraction long-term because hooks are runtime-specific:
 - Claude Code: `Stop` / `UserPromptSubmit` hooks in settings.json
 - pi: `before_agent_start` extension hook

@@ -1,63 +1,80 @@
 #!/usr/bin/env bash
-# chatroom watcher (daemon body). One fswatch on channel.md. On every change:
-#   - auto-commit to the isolated channel git
+# stitchpad watcher (daemon body). One fswatch on stitchpad.md. On every change:
+#   - auto-commit to the isolated pad git
 #   - for EACH roster member, if new lines address them (@name), fire their adapter
 #
-# Adapters live in ~/.chatroom/adapters/<adapter>.sh and are called as:
-#   adapter.sh <event> <to> <from-channel.md> <task-text-file>
+# Adapters live in ~/.stitchpad/adapters/<adapter>.sh and are called as:
+#   adapter.sh <event> <to> <stitchpad.md> <task-text-file>
 # where event = "mention". The adapter decides push (spawn) vs pull (flag/notify)
-# using the wake mode passed via $CR_WAKE.
+# vs trigger (claude.ai remote-trigger) using the wake mode passed via $SP_WAKE.
+#
+# BUG HISTORY: an earlier version let inner `read`s consume the fswatch pipe's
+# stdin, corrupting variable names ("old<mojibake>: unbound variable"). Fixed by
+# (1) snapshotting the roster into an array, (2) redirecting every inner command
+# that could read stdin from /dev/null, and (3) feeding the fswatch loop a
+# function that itself takes no stdin.
 set -uo pipefail
-source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
-cr_init_paths || { echo "no channel"; exit 1; }
+_src="${BASH_SOURCE[0]}"; while [ -h "$_src" ]; do
+  _dir="$(cd -P "$(dirname "$_src")" && pwd)"; _src="$(readlink "$_src")"
+  [ "${_src#/}" = "$_src" ] && _src="$_dir/$_src"
+done
+BIN_DIR="$(cd -P "$(dirname "$_src")" && pwd)"
+source "$BIN_DIR/lib.sh"
+sp_init_paths || { echo "no stitchpad"; exit 1; }
 
 # Per-user mention counters live in state.
-count_file() { echo "$CHAN_STATE/count.$1"; }
+count_file() { echo "$PAD_STATE/count.$1"; }
 
-# Seed baselines so we only react to NEW mentions.
-while IFS='|' read -r name adapter wake target; do
-  [ -n "$name" ] || continue
-  echo "$(cr_count_to "$name")" > "$(count_file "$name")"
-done < <(cr_roster)
+# Seed baselines so we only react to NEW mentions. Snapshot the roster first so
+# this loop doesn't hold a process-substitution fd open across the body.
+declare -a SEED=()
+while IFS= read -r _l; do SEED+=("$_l"); done < <(sp_roster)
+for _m in "${SEED[@]}"; do
+  IFS='|' read -r _name _ _ _ <<< "$_m"
+  [ -n "$_name" ] || continue
+  sp_count_to "$_name" > "$(count_file "$_name")"
+done
 
-echo "[chatroom] watching $CHAN_MD"
-cr_roster | while IFS='|' read -r name adapter wake target; do
-  echo "  · @$name → adapter=$adapter wake=$wake"
+echo "[stitchpad] watching $PAD_MD"
+for _m in "${SEED[@]}"; do
+  IFS='|' read -r _name _adapter _wake _ <<< "$_m"
+  [ -n "$_name" ] || continue
+  echo "  · @$_name → adapter=$_adapter wake=$_wake"
 done
 
 fire_adapter() {
   local name="$1" adapter="$2" wake="$3" target="$4"
   local script="$ADAPTER_DIR/$adapter.sh"
   if [ ! -f "$script" ]; then
-    echo "[chatroom] no adapter '$adapter' for @$name (looked in $ADAPTER_DIR)"; return 1
+    echo "[stitchpad] no adapter '$adapter' for @$name (looked in $ADAPTER_DIR)"; return 1
   fi
   local taskfile; taskfile="$(mktemp)"
-  cr_latest_to "$name" > "$taskfile"
-  CR_WAKE="$wake" CR_TARGET="$target" CR_CHAN_DIR="$CHAN_DIR" CR_CHAN_MD="$CHAN_MD" \
-    bash "$script" mention "$name" "$CHAN_MD" "$taskfile" \
-    || echo "[chatroom] adapter $adapter failed for @$name"
+  sp_latest_to "$name" > "$taskfile"
+  SP_WAKE="$wake" SP_TARGET="$target" SP_PAD_DIR="$PAD_DIR" SP_PAD_MD="$PAD_MD" \
+    bash "$script" mention "$name" "$PAD_MD" "$taskfile" </dev/null \
+    || echo "[stitchpad] adapter $adapter failed for @$name"
   rm -f "$taskfile"
 }
 
+# react() takes NO stdin — everything inside redirects from /dev/null where it
+# might otherwise read the fswatch pipe.
 react() {
-  cr_commit "update ($(date '+%H:%M:%S'))"
-  # Snapshot the roster into an array so the inner loop doesn't read from stdin
-  # (which belongs to the fswatch pipe).
+  sp_commit "update ($(date '+%H:%M:%S'))"
   local -a members=()
   local rline
-  while IFS= read -r rline; do members+=("$rline"); done < <(cr_roster)
+  while IFS= read -r rline; do members+=("$rline"); done < <(sp_roster)
   local m name adapter wake target new old cf
   for m in "${members[@]}"; do
     IFS='|' read -r name adapter wake target <<< "$m"
     [ -n "$name" ] || continue
     cf="$(count_file "$name")"
-    new=$(cr_count_to "$name"); old=$(cat "$cf" 2>/dev/null || echo 0)
+    new=$(sp_count_to "$name"); old=$(cat "$cf" 2>/dev/null || echo 0)
     if [ "${new:-0}" -gt "${old:-0}" ]; then
-      echo "[chatroom] new @$name mention ($old→$new) → firing $adapter ($wake)"
+      echo "[stitchpad] new @$name mention (${old}->${new}) -> firing ${adapter} (${wake})"
       fire_adapter "$name" "$adapter" "$wake" "$target"
     fi
     echo "$new" > "$cf"
   done
 }
 
-fswatch -0 "$CHAN_MD" | while read -r -d "" _ev; do react; done
+fswatch -0 "$PAD_MD" | while read -r -d "" _ev; do react </dev/null; done

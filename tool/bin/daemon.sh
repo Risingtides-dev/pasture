@@ -1,19 +1,24 @@
 #!/usr/bin/env bash
-# Background manager for the chatroom watcher (per channel).
+# Background manager for the stitchpad watcher (per pad).
 # Usage: daemon.sh {start|stop|status|restart}
 set -uo pipefail
-source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
-cr_init_paths || { echo "no .chatroom here"; exit 1; }
+_src="${BASH_SOURCE[0]}"; while [ -h "$_src" ]; do
+  _dir="$(cd -P "$(dirname "$_src")" && pwd)"; _src="$(readlink "$_src")"
+  [ "${_src#/}" = "$_src" ] && _src="$_dir/$_src"
+done
+BIN_DIR="$(cd -P "$(dirname "$_src")" && pwd)"
+source "$BIN_DIR/lib.sh"
+sp_init_paths || { echo "no .stitchpad here"; exit 1; }
 
-PIDFILE="$CHAN_STATE/watch.pid"
-LOG="$CHAN_STATE/watch.log"
+PIDFILE="$PAD_STATE/watch.pid"
+LOG="$PAD_STATE/watch.log"
 is_running() { [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; }
 
 case "${1:-status}" in
   start)
     if is_running; then echo "running (pid $(cat "$PIDFILE"))"; exit 0; fi
-    CHANNEL_DIR="$CHAN_DIR" nohup bash "$CHATROOM_HOME/bin/watch.sh" >"$LOG" 2>&1 &
-    echo $! > "$PIDFILE"; echo "started chatroom watcher (pid $(cat "$PIDFILE")); log: $LOG" ;;
+    PAD_DIR="$PAD_DIR" nohup bash "$STITCHPAD_HOME/bin/watch.sh" >"$LOG" 2>&1 &
+    echo $! > "$PIDFILE"; echo "started stitchpad watcher (pid $(cat "$PIDFILE")); log: $LOG" ;;
   stop)
     if is_running; then kill "$(cat "$PIDFILE")" && echo "stopped"; else echo "not running"; fi
     rm -f "$PIDFILE" ;;
