@@ -1,0 +1,7 @@
+.DS_Store
+*.log
+# per-project channel runtime state (when stitchpad is used somewhere)
+.stitchpad/.state/
+.stitchpad/stitchpad-git/
+.chatroom/.state/
+.chatroom/channel-git/

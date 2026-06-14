@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# chatroom — a model-agnostic agent channel that's just a markdown file.
+#
+#   chatroom init [--name <channel>]      create .chatroom/ in the current project
+#   chatroom join <name> <adapter> [wake] [target]   add a participant to the roster
+#   chatroom say <from> <text...>         post a message (auto-commits)
+#   chatroom watch                        run the daemon (foreground)
+#   chatroom start|stop|status|restart    manage the daemon (background)
+#   chatroom roster                       print parsed roster
+#   chatroom log [-n N]                   show recent channel history (git log)
+#
+# The roster lives INSIDE channel.md as a ```roster fenced block. To add an agent
+# from any runtime (pi/codex/cline/claude), drop an adapter in ~/.chatroom/adapters
+# and add one roster line. That's the whole extension model.
+set -uo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+cmd="${1:-help}"; shift || true
+
+case "$cmd" in
+  init)
+    name="$(basename "$PWD")"
+    [ "${1:-}" = "--name" ] && name="$2"
+    dir="$PWD/.chatroom"; mkdir -p "$dir/.state"
+    md="$dir/channel.md"
+    if [ -f "$md" ]; then echo "channel already exists: $md"; exit 0; fi
+    cat > "$md" <<EOF
+# 📣 #$name — agent channel
+
+> A model-agnostic chatroom. Any agent (pi, codex, cline, claude, …) joins by
+> adding a line to the roster block below. Address someone by starting a line
+> with @their-name. The daemon wakes them.
+
+\`\`\`roster
+# name | adapter | wake(push|pull) | target
+\`\`\`
+
+---
+EOF
+    # isolated git for the channel
+    git --git-dir="$dir/channel-git" --work-tree="$dir" init -q
+    git --git-dir="$dir/channel-git" --work-tree="$dir" config user.name "chatroom"
+    git --git-dir="$dir/channel-git" --work-tree="$dir" config user.email "chatroom@agents.local"
+    printf '*\n!channel.md\n' > "$dir/channel-git/info/exclude"
+    git --git-dir="$dir/channel-git" --work-tree="$dir" add channel.md
+    git --git-dir="$dir/channel-git" --work-tree="$dir" commit -q -m "channel created"
+    # gitignore runtime state in the project repo if there is one
+    if [ -f "$PWD/.gitignore" ]; then
+      grep -q '.chatroom/.state' "$PWD/.gitignore" 2>/dev/null || printf '\n# chatroom runtime\n.chatroom/.state/\n.chatroom/channel-git/\n' >> "$PWD/.gitignore"
+    fi
+    echo "✓ chatroom #$name created at $md"
+    ;;
+
+  join)
+    cr_init_paths || exit 1
+    who="${1:?usage: chatroom join <name> <adapter> [wake] [target]}"
+    adapter="${2:?adapter required (e.g. pi, claude, codex)}"
+    wake="${3:-pull}"; target="${4:--}"
+    if cr_user_exists "$who"; then echo "$who already in roster"; exit 0; fi
+    # Insert before the closing fence of the roster block.
+    tmp="$(mktemp)"
+    awk -v line="$who | $adapter | $wake | $target" '
+      /^```roster/ { inblk=1; print; next }
+      inblk && /^```/ { print line; inblk=0; print; next }
+      { print }
+    ' "$CHAN_MD" > "$tmp" && mv "$tmp" "$CHAN_MD"
+    cr_commit "roster: + $who ($adapter/$wake)"
+    echo "✓ $who joined (adapter=$adapter wake=$wake)"
+    ;;
+
+  say)
+    cr_init_paths || exit 1
+    from="${1:?usage: chatroom say <from> <text...>}"; shift
+    text="$*"
+    ts="$(date '+%H:%M')"
+    printf '\n## %s · %s\n\n%s\n' "@$from" "$ts" "$text" >> "$CHAN_MD"
+    cr_commit "$from: $(printf '%s' "$text" | tr '\n' ' ' | cut -c1-60)"
+    echo "✓ posted as @$from"
+    ;;
+
+  watch)   exec "$CHATROOM_HOME/bin/watch.sh" ;;
+  start|stop|status|restart) exec "$CHATROOM_HOME/bin/daemon.sh" "$cmd" ;;
+
+  roster)  cr_init_paths || exit 1; cr_roster ;;
+  log)
+    cr_init_paths || exit 1
+    n=10; [ "${1:-}" = "-n" ] && n="$2"
+    cgit log --oneline -n "$n"
+    ;;
+
+  help|*)
+    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+    ;;
+esac
