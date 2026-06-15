@@ -152,6 +152,14 @@ sp_user_field() {
 sp_user_exists() { [ -n "$(sp_user_field "$1" adapter)" ]; }
 
 # ── @mention detection ───────────────────────────────────────────────
+# Count lines in the pad addressed TO <name> (a line starting with @name). Used
+# by the watcher to detect when a NEW mention has landed (count went up).
+sp_count_to() {
+  local who="$1" file="${2:-$PAD_MD}" n
+  n=$(grep -icE "(^|[^a-z0-9_-])@${who}([^a-z0-9_-]|$)" "$file" 2>/dev/null) || true
+  echo "${n:-0}"
+}
+
 # Index (1-based from root) of the most
 # recent message commit whose subject matches <re> — and optionally also <re2>.
 # Each say/mention is one commit with subject "<from>: <text…>", so we match that.

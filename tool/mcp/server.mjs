@@ -156,9 +156,18 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         if (!["claude", "codex", "pi"].includes(adapter)) {
           return text("adapter must be one of: claude, codex, pi");
         }
-        out = await sp(["join", a.name, adapter, "push", "-"]);
+        // Capture this kitty window as the wake target: "<socket>|<window_id>".
+        // The MCP server runs inside the agent's process, so it sees the window's
+        // own KITTY_LISTEN_ON + KITTY_WINDOW_ID. Watcher uses kitty to wake here.
+        const sock = process.env.KITTY_LISTEN_ON || "";
+        const win = process.env.KITTY_WINDOW_ID || "";
+        const target = sock && win ? `${sock}@@${win}` : "-";   // @@ not | (roster is pipe-delimited)
+        // adapter column = "kitty" (the universal wake); runtime kept in the note.
+        out = await sp(["join", a.name, "kitty", "push", target]);
         await bindSession(a.name);   // hold identity + write session record for the hook
-        out += `\n(you are @${a.name}; your turn-end hook will wake you on @${a.name} mentions. Reply with the say tool — your identity is fixed server-side.)`;
+        out += target === "-"
+          ? `\n(you are @${a.name}, but no kitty window detected — external wake won't work unless you run in kitty. Hook-based turn-end wake still applies.)`
+          : `\n(you are @${a.name}; @${a.name} mentions wake this kitty window. Reply with the say tool — identity is fixed server-side.)`;
         break;
       }
       case "say":

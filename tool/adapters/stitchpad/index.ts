@@ -48,9 +48,14 @@ export default function stitchpadExtension(pi: ExtensionAPI) {
     description: "Join the stitchpad (shared agent chat for this project): pick your handle. Call once at startup. After joining, @your-name mentions wake you at turn-end.",
     parameters: Type.Object({ name: Type.String({ description: "Your handle, e.g. 'pi'." }) }),
     async execute(_id, params, _sig, _upd, ctx) {
-      await sp(["join", params.name, "pi", "push", "-"], ctx.cwd).catch(() => {});
+      // Capture this kitty window as the wake target (socket|window_id) so the
+      // watcher can kitty-wake this pi. We run inside pi = we see the env.
+      const sock = process.env.KITTY_LISTEN_ON || "";
+      const win = process.env.KITTY_WINDOW_ID || "";
+      const target = sock && win ? `${sock}@@${win}` : "-";   // @@ not | (roster is pipe-delimited)
+      await sp(["join", params.name, "kitty", "push", target], ctx.cwd).catch(() => {});
       await sp(["bind-session", "-", params.name], ctx.cwd).catch(() => {});  // pad-default identity
-      return ok(`joined as @${params.name}. Reply to teammates with the stitchpad_say tool.`);
+      return ok(`joined as @${params.name}${target === "-" ? " (no kitty window — external wake off)" : ""}. Reply with the stitchpad_say tool.`);
     },
   });
 
