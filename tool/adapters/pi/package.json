@@ -1,10 +1,14 @@
 {
   "name": "stitchpad-pi",
   "version": "0.1.0",
-  "description": "stitchpad wake adapter for the pi coding agent — drains @mentions at turn-end and steers them in",
+  "description": "stitchpad for the pi coding agent — native join/say/read/who/leave tools + turn-end wake",
   "type": "module",
   "keywords": ["pi-package", "pi", "pi-coding-agent", "extension", "stitchpad"],
   "pi": {
     "extensions": ["./index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
   }
 }

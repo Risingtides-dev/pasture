@@ -1,35 +1,28 @@
-// stitchpad ← pi adapter (extension).
+// stitchpad ← pi extension (self-contained: tools + wake).
 //
-// Pi has no shell-hook system like claude/codex. Its equivalent is the in-process
-// extension API (the `pi` object below). This extension is the thin bridge that
-// makes pi behave like the claude/codex Stop hook: when the agent goes idle it
-// runs the shared `stitchpad wake` command and, if there are messages addressed
-// to it, delivers them back into the session as the next turn.
+// earendil pi (@earendil-works/pi-coding-agent) has NO built-in MCP — by design
+// (usage.md: "intentionally does not include built-in MCP ... build or install
+// as extensions or packages"). So unlike claude/codex (which get stitchpad via
+// the MCP server), pi gets everything from THIS extension:
+//   - registers join/say/read/who/leave as native pi tools (pi.registerTool)
+//   - wakes at agent_end by draining the pad and steering messages in
 //
-// One brain, three adapters: claude.sh / codex (Stop hook) and this file all call
-// the SAME `stitchpad wake` command. The only per-runtime part is how the result
-// is fed back in — here it's pi.sendMessage(triggerTurn, nextTurn), pi's native
-// equivalent of {"decision":"block","reason":...}.
+// Identity: pi exposes no per-session id, so we use the pad-default identity
+// (.state/whoami, written by `join`). One pi per pad — that's correct, not a
+// collision. STITCHPAD_NAME overrides if you want to pin one.
 //
-// Install (persistent):
-//   pi install <path-to-this-dir>        # registers in ~/.pi/agent/settings.json
-// Or one session:
-//   pi -e <path-to-this-dir>/index.ts
-//
-// Identity is resolved by the CLI from the pad's .state/whoami (written when the
-// agent joins via the MCP `join` tool or `stitchpad join`). No hardcoded name —
-// STITCHPAD_NAME only overrides if you choose to pin one.
+// Install:  pi install <this-dir>     ·     One session:  pi -e <this-dir>/index.ts
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 
 const exec = promisify(execFile);
 
-// Locate the stitchpad CLI: PATH first, then the standard install location.
 function stitchpadBin(): string {
   const fallback = join(homedir(), ".stitchpad", "bin", "stitchpad");
   return existsSync(fallback) ? fallback : "stitchpad";
@@ -39,40 +32,81 @@ export default function stitchpadExtension(pi: ExtensionAPI) {
   const bin = stitchpadBin();
   const pinned = process.env.STITCHPAD_NAME || "";
 
-  // The shared drain: ask the CLI for any unanswered @me messages. Empty stdout =
-  // nothing to answer → we do nothing (no turn burned), same as the Stop hook.
+  // Run a stitchpad CLI command in the session's cwd. `name` pins STITCHPAD_NAME
+  // so the CLI derives the sender from identity, never a trusted arg.
+  async function sp(args: string[], cwd: string, name?: string): Promise<string> {
+    const env = { ...process.env, ...(name ? { STITCHPAD_NAME: name } : {}) };
+    const { stdout, stderr } = await exec(bin, args, { cwd, timeout: 10_000, env });
+    return (stdout || "") + (stderr ? `\n${stderr}` : "");
+  }
+  const ok = (text: string) => ({ content: [{ type: "text" as const, text: text.trim() || "(ok)" }], details: {} });
+
+  // ── Tools (native pi, no MCP) ──────────────────────────────────────
+  pi.registerTool({
+    name: "stitchpad_join",
+    label: "stitchpad: join",
+    description: "Join the stitchpad (shared agent chat for this project): pick your handle. Call once at startup. After joining, @your-name mentions wake you at turn-end.",
+    parameters: Type.Object({ name: Type.String({ description: "Your handle, e.g. 'pi'." }) }),
+    async execute(_id, params, _sig, _upd, ctx) {
+      await sp(["join", params.name, "pi", "push", "-"], ctx.cwd).catch(() => {});
+      await sp(["bind-session", "-", params.name], ctx.cwd).catch(() => {});  // pad-default identity
+      return ok(`joined as @${params.name}. Reply to teammates with the stitchpad_say tool.`);
+    },
+  });
+
+  pi.registerTool({
+    name: "stitchpad_say",
+    label: "stitchpad: say",
+    description: "Post a message to the stitchpad as yourself. Start the text with @name to address + wake a teammate. Use this to reply when woken with an incoming message.",
+    parameters: Type.Object({ text: Type.String({ description: "The message. Start with @name to address someone." }) }),
+    async execute(_id, params, _sig, _upd, ctx) {
+      return ok(await sp(["say", params.text], ctx.cwd, pinned || undefined));
+    },
+  });
+
+  pi.registerTool({
+    name: "stitchpad_read",
+    label: "stitchpad: read",
+    description: "Read the recent stitchpad conversation.",
+    parameters: Type.Object({ lines: Type.Optional(Type.Number({ description: "Trailing lines (default 80)." })) }),
+    async execute(_id, params, _sig, _upd, ctx) {
+      return ok(await sp(["read", "-n", String(params.lines || 80)], ctx.cwd));
+    },
+  });
+
+  pi.registerTool({
+    name: "stitchpad_who",
+    label: "stitchpad: who",
+    description: "List who is in the stitchpad (the roster).",
+    parameters: Type.Object({}),
+    async execute(_id, _params, _sig, _upd, ctx) { return ok(await sp(["roster"], ctx.cwd)); },
+  });
+
+  pi.registerTool({
+    name: "stitchpad_leave",
+    label: "stitchpad: leave",
+    description: "Leave the stitchpad: remove yourself from the roster and post a departure note.",
+    parameters: Type.Object({}),
+    async execute(_id, _params, _sig, _upd, ctx) { return ok(await sp(["leave"], ctx.cwd, pinned || undefined)); },
+  });
+
+  // ── Wake (agent_end = pi's idle moment, the claude/codex Stop equivalent) ──
   async function drain(ctx: ExtensionContext) {
-    // Only deliver when the agent is actually idle — otherwise sendMessage would
-    // collide with an in-flight turn ("already processing").
-    if (!ctx.isIdle()) return;
+    if (!ctx.isIdle()) return;   // don't collide with an in-flight turn
     try {
-      // Pass our session id so `wake` resolves the MCP-bound identity (matches the
-      // Stop hook's STITCHPAD_SESSION). STITCHPAD_NAME still overrides for testing.
-      const sid = (ctx as { sessionId?: string }).sessionId || "";
-      const env = { ...process.env, ...(sid ? { STITCHPAD_SESSION: sid } : {}) };
       const args = pinned ? ["wake", pinned] : ["wake"];
-      const { stdout } = await exec(bin, args, { cwd: ctx.cwd, timeout: 10_000, env });
+      const { stdout } = await exec(bin, args, { cwd: ctx.cwd, timeout: 10_000 });
       const msg = stdout.trim();
-      if (!msg) return; // nothing addressed to me → skip
+      if (!msg) return;
       await pi.sendMessage(
         { customType: "stitchpad_message", content: msg, display: true },
         { triggerTurn: true, deliverAs: "nextTurn" }
       );
     } catch {
-      // CLI missing / no pad here / non-zero exit → silently no-op.
+      // no pad here / CLI missing / non-zero → silent no-op
     }
   }
 
-  // agent_end is pi's true-idle moment (the whole agent run finished) — the real
-  // equivalent of claude/codex "Stop". Drain there so a message starts a fresh
-  // turn cleanly rather than colliding with an in-progress one.
-  pi.on("agent_end", async (_event, ctx) => {
-    await drain(ctx);
-  });
-
-  // Also drain once at session start so a message that arrived while the agent
-  // was offline is picked up on launch.
-  pi.on("session_start", async (_event, ctx) => {
-    await drain(ctx);
-  });
+  pi.on("agent_end", async (_e, ctx) => { await drain(ctx); });
+  pi.on("session_start", async (_e, ctx) => { await drain(ctx); });
 }
