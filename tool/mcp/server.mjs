@@ -162,6 +162,11 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         const sock = process.env.KITTY_LISTEN_ON || "";
         const win = process.env.KITTY_WINDOW_ID || "";
         const target = sock && win ? `${sock}@@${win}` : "-";   // @@ not | (roster is pipe-delimited)
+        // Tag the kitty window+tab with the agent's name so you can see who's who.
+        if (sock && win) {
+          await execFileP("kitty", ["@", "--to", sock, "set-window-title", "--match", `id:${win}`, `🧵 ${a.name}`]).catch(() => {});
+          await execFileP("kitty", ["@", "--to", sock, "set-tab-title", "--match", `id:${win}`, `🧵 ${a.name}`]).catch(() => {});
+        }
         // adapter column = "kitty" (the universal wake); runtime kept in the note.
         out = await sp(["join", a.name, "kitty", "push", target]);
         await bindSession(a.name);   // hold identity + write session record for the hook

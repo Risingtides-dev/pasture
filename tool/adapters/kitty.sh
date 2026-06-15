@@ -37,8 +37,13 @@ esac
 # Short, metacharacter-free nudge; the pad holds the detail, the agent reads it.
 nudge="stitchpad: @$to you were pinged — read .stitchpad/stitchpad.md and reply with a line starting @whoever-pinged-you"
 
-# send-text to that exact window over its instance socket; trailing \r submits.
-if "$kitty_bin" @ --to "$sock" send-text --match "id:$win" -- "$nudge"$'\r' 2>>"$log"; then
+# Submit in two steps: send-text drops the line in the prompt, then a SEPARATE
+# send-key enter actually submits it. A trailing \r in send-text does NOT submit
+# in agent TUIs (claude/codex/pi use a custom keyboard mode) — it just pastes.
+# send-key enter is a real keypress and submits across all three. (verified live)
+if "$kitty_bin" @ --to "$sock" send-text --match "id:$win" -- "$nudge" 2>>"$log"; then
+  sleep 0.3   # let the TUI register the pasted text before the Enter keypress
+  "$kitty_bin" @ --to "$sock" send-key --match "id:$win" enter 2>>"$log"
   echo "[$(ts)] woke @$to via kitty (win $win @ $sock)" >>"$log"
 else
   echo "[$(ts)] kitty send-text failed for @$to (win $win @ $sock)" >>"$log"; exit 1

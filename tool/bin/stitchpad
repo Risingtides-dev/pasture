@@ -117,6 +117,29 @@ EOF
       printf '%s' "$nm" > "$PAD_STATE/sessions/$sid"
       echo "✓ bound session $sid → @$nm"
     fi
+    # Auto-capture this kitty window as the wake target if we're in one and the
+    # roster target is still empty. Runs in the agent's process, so it sees the
+    # window env even when the MCP join didn't pass it through (the codex case).
+    if [ -n "${KITTY_LISTEN_ON:-}" ] && [ -n "${KITTY_WINDOW_ID:-}" ]; then
+      cur="$(sp_user_field "$nm" target)"
+      if [ -z "$cur" ] || [ "$cur" = "-" ]; then
+        sp_lock || exit 0
+        tgt="${KITTY_LISTEN_ON}@@${KITTY_WINDOW_ID}"
+        tmp="$(mktemp)"
+        awk -v who="$nm" -v tgt="$tgt" '
+          /^```roster/ { inblk=1; print; next }
+          inblk && /^```/ { inblk=0; print; next }
+          inblk && tolower($1)==tolower(who"") {
+            print who " | kitty | push | " tgt; next
+          }
+          { print }
+        ' "$PAD_MD" > "$tmp" && mv "$tmp" "$PAD_MD"
+        sp_commit "roster: @$nm kitty target captured"
+        sp_unlock
+        "$(command -v kitty || echo kitty)" @ --to "$KITTY_LISTEN_ON" set-window-title --match "id:$KITTY_WINDOW_ID" "🧵 $nm" 2>/dev/null || true
+        echo "✓ captured kitty target for @$nm ($tgt)"
+      fi
+    fi
     ;;
 
   say)

@@ -53,6 +53,11 @@ export default function stitchpadExtension(pi: ExtensionAPI) {
       const sock = process.env.KITTY_LISTEN_ON || "";
       const win = process.env.KITTY_WINDOW_ID || "";
       const target = sock && win ? `${sock}@@${win}` : "-";   // @@ not | (roster is pipe-delimited)
+      if (sock && win) {
+        const k = "/Applications/kitty.app/Contents/MacOS/kitty";
+        await exec(k, ["@", "--to", sock, "set-window-title", "--match", `id:${win}`, `🧵 ${params.name}`]).catch(() => {});
+        await exec(k, ["@", "--to", sock, "set-tab-title", "--match", `id:${win}`, `🧵 ${params.name}`]).catch(() => {});
+      }
       await sp(["join", params.name, "kitty", "push", target], ctx.cwd).catch(() => {});
       await sp(["bind-session", "-", params.name], ctx.cwd).catch(() => {});  // pad-default identity
       return ok(`joined as @${params.name}${target === "-" ? " (no kitty window — external wake off)" : ""}. Reply with the stitchpad_say tool.`);
