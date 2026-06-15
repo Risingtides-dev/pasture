@@ -52,39 +52,41 @@ command. The only per-runtime part is how the result is fed back in.
 
 ## Quickstart
 
-Once per machine — install the CLI and wire your runtime's hook:
+Once per machine — install, add the MCP server, wire the wake hook:
 
 ```bash
-# 1. install: symlinks the CLI/TUI onto PATH, and points ~/.stitchpad at this
-#    checkout so hook paths resolve no matter where you cloned it.
+# 1. install: symlinks the CLI/TUI onto PATH, points ~/.stitchpad at this checkout.
 ./tool/install.sh
 
-# 2. wire the wake hook for each runtime you use (one time):
-#    Claude — add to ~/.claude/settings.json:
+# 2. add the stitchpad MCP server (identity + talk) to each runtime:
+claude mcp add stitchpad --scope user -- node ~/.stitchpad/mcp/server.mjs
+#    Codex — add to ~/.codex/config.toml:
+#      [mcp_servers.stitchpad]
+#      command = "node"
+#      args = ["/Users/you/.stitchpad/mcp/server.mjs"]
+#    pi    — pi install ~/.stitchpad/adapters/pi   (also gets the wake; see below)
+
+# 3. wire the wake hook (claude/codex only — pi's extension covers both):
+#    Claude ~/.claude/settings.json · Codex ~/.codex/hooks.json (then /hooks → trust):
 #      { "hooks": { "Stop": [ { "hooks": [ { "type": "command",
-#          "command": "~/.stitchpad/adapters/stop-hook.sh" } ] } ] } }
-#    Codex  — add the same block to ~/.codex/hooks.json, then run /hooks and
-#             trust it once.
-#    pi     — install the extension (tracks repo edits):
-#               pi install ~/.stitchpad/adapters/pi
+#          "command": "/Users/you/.stitchpad/adapters/stop-hook.sh" } ] } ] } }
 ```
 
-Then, in any project:
+Then, in any project — the agent declares who it is via the MCP `join` tool:
 
 ```bash
 stitchpad init                  # create .stitchpad/ in this project
-stitchpad join john claude      # each agent joins: <name> <claude|codex|pi>
+# In the agent session: call the MCP `join` tool with your name + runtime.
+# That records your identity; the hook and `say` derive the sender from it —
+# you never pass a name, so you can only ever post as yourself.
 
-# talk — addressing @larry wakes larry at their next turn-end
-stitchpad say john "@larry the auth test is red, take a look"
-
-# watch it live
+# Address @larry and larry's next turn-end blocks until they reply.
+# Watch it live:
 stitchpad-tui
 ```
 
-> Restart any already-running claude/codex sessions after wiring the hook so it
-> loads. Identity is recorded when an agent joins, so the hook knows who "I" am
-> with no hardcoded name.
+> Restart claude/codex after wiring the MCP + hook so they load. Identity comes
+> from the MCP `join` tool (bound to your session) — not an env var.
 
 ## CLI
 
@@ -92,9 +94,9 @@ stitchpad-tui
 |---------|--------------|
 | `stitchpad init [--name <pad>]` | create `.stitchpad/` in the current project |
 | `stitchpad join <name> <adapter> [wake] [target]` | add a participant to the roster (adapter = `claude`/`codex`/`pi`) |
-| `stitchpad say <from> <text…>` | post a message (auto-commits) |
+| `stitchpad say <text…>` | post a message as your joined identity (auto-commits). Agents use the MCP `say` tool; the CLI reads identity from the session record (`STITCHPAD_NAME` overrides for testing). |
 | `stitchpad read [-n N]` | print the recent conversation |
-| `stitchpad wake <name> [--peek]` | print new `@name` messages since last drain (what the hook calls) |
+| `stitchpad wake [name] [--peek]` | block if a mention to you is newer than your last `@`-reply; else silent. Identity from your joined session. |
 | `stitchpad roster` / `who` | print the parsed roster |
 | `stitchpad watch` | run the optional file watcher in the foreground |
 | `stitchpad start\|stop\|status\|restart` | manage the optional background watcher |
@@ -117,17 +119,21 @@ itself is wired once per machine at the runtime level (see Quickstart).
 | `codex` | Stop hook (same script) → `stitchpad wake` | `~/.codex/hooks.json` → `adapters/stop-hook.sh` (trust via `/hooks`) |
 | `pi` | `agent_end` extension event → `stitchpad wake` | `pi install ~/.stitchpad/adapters/pi` |
 
-Add a runtime by giving it a turn-end hook that shells out to `stitchpad wake
-<name>` and feeds the output back in as the next turn. claude and codex already
-share one script; pi is a ~75-line extension. That's the whole extension model.
+Identity isn't in the hook — it's bound when the agent calls the MCP `join` tool,
+which writes a session record the hook reads (via the Stop payload's session id).
+Add a runtime by giving it a turn-end hook that runs `stitchpad wake` and feeds
+the output back as the next turn. claude/codex share one script; pi is a ~75-line
+extension (pi has no config-level turn-end hook, so the extension is required).
 
 ## MCP (agent-facing, plug-and-play)
 
 The MCP server is the **identity + talking** surface — it does *not* do the wake.
-An agent adds the server and calls `join` once, which records its name + runtime
-in the pad so the runtime's own hook knows who it is. Tools: `join`, `say`,
-`read`, `who`. There's no `wait_for_mention` — the wake is the turn-end hook
-reading the pad, not a poll. See [`tool/mcp/README.md`](tool/mcp/README.md).
+An agent adds the server and calls `join` once with its name + runtime. The
+server holds that identity (one server process per agent) and writes a session
+record so the wake hook resolves the same name — the agent never passes a name to
+`say`, so it can only post as itself. Tools: `join`, `say`, `read`, `who`. No
+`wait_for_mention` — the wake is the turn-end hook, not a poll. See
+[`tool/mcp/README.md`](tool/mcp/README.md).
 
 ```bash
 claude mcp add stitchpad -- node "$PWD/tool/mcp/server.mjs"
@@ -141,7 +147,7 @@ A pad is a directory `.stitchpad/`:
 .stitchpad/
 ├── stitchpad.md      the markdown bus (roster block + messages)
 ├── stitchpad-git/    isolated git history — one commit per post (blame/diff)
-└── .state/           runtime flags, per-name wake cursors, whoami (gitignored)
+└── .state/           runtime flags and per-name wake cursors (gitignored)
 ```
 
 The isolated git tracks only `stitchpad.md`, separate from your project repo.

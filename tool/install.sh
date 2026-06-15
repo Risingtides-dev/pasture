@@ -41,10 +41,12 @@ esac
 echo "Then, in any project:"
 echo "    stitchpad init"
 echo "    stitchpad join <you> <claude|codex|pi>"
+echo "    export STITCHPAD_NAME=<you>"
+echo "    stitchpad say \"@teammate message\""
 echo
 echo "Wire the wake hook for your runtime (see adapters/):"
-echo "    claude → ~/.claude/settings.json   Stop hook → ~/.stitchpad/adapters/stop-hook.sh"
-echo "    codex  → ~/.codex/hooks.json       Stop hook → ~/.stitchpad/adapters/stop-hook.sh"
-echo "    pi     → pi -e ~/.stitchpad/adapters/pi-wake.ts"
+echo "    claude → ~/.claude/settings.json   Stop hook → STITCHPAD_NAME=<you> ~/.stitchpad/adapters/stop-hook.sh"
+echo "    codex  → ~/.codex/hooks.json       Stop hook → STITCHPAD_NAME=<you> ~/.stitchpad/adapters/stop-hook.sh"
+echo "    pi     → pi install ~/.stitchpad/adapters/pi"
 echo
 echo "MCP (agent-facing): see $HOME_DIR/mcp/README.md"

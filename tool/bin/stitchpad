@@ -3,9 +3,9 @@
 #
 #   stitchpad init [--name <pad>]         create .stitchpad/ in the current project
 #   stitchpad join <name> <adapter> [wake] [target]   add a participant to the roster
-#   stitchpad say <from> <text...>        post a message (auto-commits)
+#   STITCHPAD_NAME=<you> stitchpad say <text...>   post a message (auto-commits)
 #   stitchpad read [-n N]                 print the recent conversation (plain)
-#   stitchpad wake <name> [--peek]        print new @name messages since last drain
+#   stitchpad wake [name] [--peek]        print new @name messages since last drain
 #   stitchpad watch                       run the daemon (foreground)
 #   stitchpad start|stop|status|restart   manage the daemon (background)
 #   stitchpad roster                      print parsed roster
@@ -79,16 +79,29 @@ EOF
     ' "$PAD_MD" > "$tmp" && mv "$tmp" "$PAD_MD"
     sp_commit "roster: + $who ($adapter/$wake)"
     sp_unlock
-    # Record this session's identity so the wake hook knows who "I" am in this
-    # pad without any hardcoded name. The agent picks its name by joining.
-    printf '%s' "$who" > "$PAD_STATE/whoami"
     echo "✓ $who joined (adapter=$adapter wake=$wake)"
+    ;;
+
+  bind-session)
+    # Bind a session id to a name (called by the MCP `join` tool). This is what
+    # lets the separate hook process resolve the same identity the MCP holds.
+    #   stitchpad bind-session <session_id> <name>
+    sp_init_paths || exit 1
+    sid="${1:?usage: stitchpad bind-session <session_id> <name>}"
+    nm="${2:?name required}"
+    printf '%s' "$nm" > "$PAD_STATE/sessions/$sid"
+    echo "✓ bound session $sid → @$nm"
     ;;
 
   say)
     sp_init_paths || exit 1
-    from="${1:?usage: stitchpad say <from> <text...>}"; shift
+    # Sender is your pinned STITCHPAD_NAME — never an argument — so a terminal can
+    # only ever post as itself. Everything after `say` is the message.
+    #   stitchpad say <text...>
+    from="$(sp_me)"
+    [ -z "$from" ] && { echo "stitchpad: no identity — call the MCP join tool first (or set STITCHPAD_NAME for CLI/testing)" >&2; exit 1; }
     text="$*"
+    [ -z "$text" ] && { echo "usage: stitchpad say <text...>  (you are @$from)" >&2; exit 1; }
     ts="$(date '+%H:%M')"
     sp_lock || exit 1
     printf '\n## %s · %s\n\n%s\n' "@$from" "$ts" "$text" >> "$PAD_MD"
@@ -104,34 +117,52 @@ EOF
     ;;
 
   wake)
-    # The shared wake primitive every runtime adapter calls. Prints any messages
-    # addressed to <name> that are newer than that name's last-seen cursor, then
-    # advances the cursor. Empty output + exit 0 means "nothing new for you".
-    # Cursor = the pad's commit count last drained, stored per-name in .state.
-    #   stitchpad wake <name> [--peek]   (--peek: show without advancing cursor)
+    # The shared wake primitive every runtime adapter calls. Blocks (prints the
+    # message) iff a mention addressed to <name> is newer than <name>'s last
+    # addressed reply; otherwise silent. Stateless — derived from pad git history.
+    #   stitchpad wake [name] [--peek]   (name defaults to the joined identity)
     sp_init_paths || exit 1
-    # Name is optional: if omitted, use this pad's recorded identity (.state/whoami,
-    # written at join). Lets adapters call `stitchpad wake` with no hardcoded name.
     who="${1:-}"
     if [ -n "$who" ] && [ "$who" != "--peek" ]; then shift; else who=""; fi
-    if [ -z "$who" ]; then who="$(cat "$PAD_STATE/whoami" 2>/dev/null || true)"; fi
-    [ -z "$who" ] && exit 0   # nobody joined here → nothing to wake
+    # Identity: explicit arg, else this terminal's pinned STITCHPAD_NAME.
+    [ -z "$who" ] && who="$(sp_me)"
+    [ -z "$who" ] && exit 0   # unidentified → nothing to wake
     peek=0; [ "${1:-}" = "--peek" ] && peek=1
-    cur_file="$PAD_STATE/cursor.$who"
-    seen=0; [ -f "$cur_file" ] && seen="$(cat "$cur_file" 2>/dev/null || echo 0)"
-    now="$(sgit rev-list --count HEAD 2>/dev/null || echo 0)"
-    # Nothing new since last drain → silent success.
-    if [ "$now" -le "$seen" ]; then exit 0; fi
-    # Are there any lines addressed to me at all? If not, just advance & exit.
-    cnt="$(sp_count_to "$who")"
-    if [ "${cnt:-0}" -eq 0 ]; then
-      [ "$peek" -eq 0 ] && printf '%s' "$now" > "$cur_file"
-      exit 0
+    # The whole rule, one condition: I'm blocked iff a mention addressed TO me is
+    # newer than my last ADDRESSED reply. Both are commit indices (each say is one
+    # commit, subject "<from>: <text>"). No cursor file, no extra state — purely a
+    # function of the pad. An off-topic post (no @) is not a reply, so it doesn't
+    # clear the block: the hook keeps firing until I actually reply to someone.
+    last_mention_to_me="$(sp_last_commit_matching "@${who}([^a-zA-Z0-9_-]|\$)")"
+    last_reply_by_me="$(sp_last_commit_matching "^${who}: @")"
+    [ -z "$last_mention_to_me" ] && exit 0   # no one's addressed me → nothing to do
+    if [ -n "$last_reply_by_me" ] && [ "$last_reply_by_me" -gt "$last_mention_to_me" ]; then
+      exit 0   # my reply is newer than the mention → handled
     fi
-    # Emit the latest block addressed to me (sender header + body).
+    # Unanswered. Tell the agent it's NEW + route the reply through the MCP say tool.
+    printf 'NEW stitchpad message — unanswered. You are "%s" in a shared chat channel for AI agents in this project. A teammate addressed you below and you have not replied yet. To clear this, call the stitchpad MCP "say" tool with a reply that starts with @their-name — that is the only way to post, and it posts as you automatically. Then continue.\n\n' "$who"
     sp_latest_to "$who"
-    if [ "$peek" -eq 0 ]; then printf '%s' "$now" > "$cur_file"; fi
     exit 0
+    ;;
+
+  hook)
+    # The Stop-hook brain. The shim (adapters/stop-hook.sh) just pipes the
+    # runtime's stdin JSON here, so ALL logic lives in the CLI and the shim's hash
+    # never changes (trust it once in codex /hooks, edit freely forever).
+    # Claude & Codex share an identical Stop contract: stdin JSON {cwd, session_id,
+    # stop_hook_active}; reply {"decision":"block","reason":TEXT} to keep going.
+    input="$(cat 2>/dev/null || true)"
+    cwd="$(printf '%s' "$input" | sed -n 's/.*"cwd"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+    [ -n "$cwd" ] && cd "$cwd" 2>/dev/null || true
+    sid="$(printf '%s' "$input" | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+    [ -n "$sid" ] && export STITCHPAD_SESSION="$sid"
+    # Don't re-block a turn we already continued (avoids an infinite Stop loop).
+    if printf '%s' "$input" | grep -q '"stop_hook_active"[[:space:]]*:[[:space:]]*true'; then exit 0; fi
+    msgs="$("$0" wake ${STITCHPAD_NAME:+"$STITCHPAD_NAME"} 2>/dev/null || true)"
+    [ -z "$msgs" ] && exit 0   # nothing for me → stop normally
+    esc="$(printf '%s' "$msgs" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null)"
+    [ -z "$esc" ] && esc="$(printf '%s' "$msgs" | sed 's/\\/\\\\/g; s/"/\\"/g' | awk 'BEGIN{ORS="\\n"}{print}')" && esc="\"$esc\""
+    printf '{"decision":"block","reason":%s}\n' "$esc"
     ;;
 
   watch)   exec "$STITCHPAD_HOME/bin/watch.sh" ;;

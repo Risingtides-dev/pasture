@@ -40,7 +40,22 @@ sp_init_paths() {
   PAD_MD="$PAD_DIR/stitchpad.md"
   PAD_GIT="$PAD_DIR/stitchpad-git"
   PAD_STATE="$PAD_DIR/.state"
-  mkdir -p "$PAD_STATE"
+  mkdir -p "$PAD_STATE/sessions"
+}
+
+# ── Identity ─────────────────────────────────────────────────────────
+# Identity is bound to the agent's SESSION, declared once via the MCP `join` tool
+# (which calls `stitchpad bind-session <id> <name>`, writing .state/sessions/<id>).
+# Resolution order:
+#   1. explicit STITCHPAD_NAME      (the hook may pin it; tests use it)
+#   2. .state/sessions/$STITCHPAD_SESSION   (the MCP-written session record)
+# The hook exports STITCHPAD_SESSION from its Stop-payload session_id, so it
+# resolves the SAME name the MCP bound. No shared whoami → no impersonation: a
+# session can only ever resolve to the name it joined with.
+sp_me() {
+  if [ -n "${STITCHPAD_NAME:-}" ]; then echo "$STITCHPAD_NAME"; return; fi
+  local sid="${STITCHPAD_SESSION:-}"
+  [ -n "$sid" ] && cat "$PAD_STATE/sessions/$sid" 2>/dev/null || true
 }
 
 # ── Atomic pad mutation lock ─────────────────────────────────────────
@@ -125,24 +140,32 @@ sp_user_field() {
 
 sp_user_exists() { [ -n "$(sp_user_field "$1" adapter)" ]; }
 
-# ── @mention detection (a TASK line STARTS with @name) ───────────────
-# Count lines addressed TO <name> — line begins with @name (allow md punctuation).
-sp_count_to() {
-  local who="$1"
-  local n
-  n=$(grep -icE "^[ >*_-]*@${who}([^a-z0-9_-]|$)" "$PAD_MD" 2>/dev/null) || true
-  echo "${n:-0}"
+# ── @mention detection ───────────────────────────────────────────────
+# Index (1-based from root) of the most
+# recent message commit whose subject matches <re> — and optionally also <re2>.
+# Each say/mention is one commit with subject "<from>: <text…>", so we match that.
+# Returns "" if none. Used by the engagement gate: last mention-to-me vs last
+# reply-by-me, both as commit indices.
+sp_last_commit_matching() {
+  local re="$1" re2="${2:-}"
+  # Oldest→newest, numbered; keep matches; last match wins → its index.
+  sgit log --reverse --format='%s' 2>/dev/null | nl -ba -w1 -s$'\t' | awk -F'\t' -v re="$re" -v re2="$re2" '
+    $2 ~ re && (re2=="" || $2 ~ re2) { idx=$1 }
+    END { if (idx) print idx }
+  '
 }
 
-# Extract the latest message block addressed to <name>: from the last "## " header
-# owning an @name line, through EOF.
+# Extract the latest message block addressed to <name>: from the last "## "
+# header owning an @name mention, up to the next "## " header. Mentions can be
+# inline ("dale @larry ..."), but must respect handle boundaries.
 sp_latest_to() {
   local who="$1"
   awk -v who="$who" '
-    /^##/ { sub_start=NR }
+    BEGIN { mention = "(^|[^a-z0-9_-])@" tolower(who) "([^a-z0-9_-]|$)" }
+    /^##/ { sub_start=NR; if (last && !end) end=NR-1 }
     { lines[NR]=$0 }
-    tolower($0) ~ ("^[ >*_-]*@" tolower(who)) { last=sub_start }
-    END { if (last) for (i=last;i<=NR;i++) print lines[i] }
+    tolower($0) ~ mention { last=sub_start; end=0 }
+    END { if (!end) end=NR; if (last) for (i=last;i<=end;i++) print lines[i] }
   ' "$PAD_MD"
 }
 

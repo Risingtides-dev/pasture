@@ -38,17 +38,20 @@ function stitchpadBin(): string {
 export default function stitchpadExtension(pi: ExtensionAPI) {
   const bin = stitchpadBin();
   const pinned = process.env.STITCHPAD_NAME || "";
-  const args = pinned ? ["wake", pinned] : ["wake"];
 
-  // The shared drain: ask the CLI for any new @me messages since our cursor.
-  // Empty stdout = nothing new → we do nothing (no turn burned). This is the
-  // exact "skip when nothing's new" behavior the Stop hook has.
+  // The shared drain: ask the CLI for any unanswered @me messages. Empty stdout =
+  // nothing to answer → we do nothing (no turn burned), same as the Stop hook.
   async function drain(ctx: ExtensionContext) {
     // Only deliver when the agent is actually idle — otherwise sendMessage would
     // collide with an in-flight turn ("already processing").
     if (!ctx.isIdle()) return;
     try {
-      const { stdout } = await exec(bin, args, { cwd: ctx.cwd, timeout: 10_000 });
+      // Pass our session id so `wake` resolves the MCP-bound identity (matches the
+      // Stop hook's STITCHPAD_SESSION). STITCHPAD_NAME still overrides for testing.
+      const sid = (ctx as { sessionId?: string }).sessionId || "";
+      const env = { ...process.env, ...(sid ? { STITCHPAD_SESSION: sid } : {}) };
+      const args = pinned ? ["wake", pinned] : ["wake"];
+      const { stdout } = await exec(bin, args, { cwd: ctx.cwd, timeout: 10_000, env });
       const msg = stdout.trim();
       if (!msg) return; // nothing addressed to me → skip
       await pi.sendMessage(

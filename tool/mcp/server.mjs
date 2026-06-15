@@ -1,14 +1,13 @@
 #!/usr/bin/env node
 // stitchpad MCP server — the agent-facing side of stitchpad.
 //
-// The MCP is the IDENTITY + TALKING surface. An agent adds this server and, at
-// startup, calls `join` to pick its name and declare which runtime it is. join
-// records the name in the pad (.state/whoami) so the runtime's wake — a Stop
-// hook (claude/codex) or the pi-wake extension — knows who "I" am with no
-// hardcoded name. The MCP does NOT do the wake itself.
+// The MCP is the ROSTER + TALKING surface. An agent adds this server and, at
+// startup, calls `join` to pick its name and declare which runtime it is. The
+// runtime's wake hook still needs STITCHPAD_NAME pinned to that name. The MCP
+// does NOT do the wake itself.
 //
 // Tools:
-//   join  — add yourself to the roster + record your identity for the wake hook
+//   join  — add yourself to the roster
 //   say   — post a message to the pad (start with @name to address a teammate)
 //   read  — read the recent conversation
 //   who   — list the roster
@@ -42,13 +41,35 @@ const CLI = path.join(STITCHPAD_HOME, "bin", "stitchpad");
 // Allow override via STITCHPAD_CWD (the dir to resolve the pad from).
 const PAD_CWD = process.env.STITCHPAD_CWD || process.cwd();
 
-async function sp(args) {
+// `me` pins STITCHPAD_NAME for this call so the CLI derives the sender from
+// identity, not a trusted arg.
+async function sp(args, me) {
   const { stdout, stderr } = await execFileP(CLI, args, {
     cwd: PAD_CWD,
-    env: { ...process.env, STITCHPAD_HOME },
+    env: { ...process.env, STITCHPAD_HOME, ...(me ? { STITCHPAD_NAME: me } : {}) },
     maxBuffer: 1024 * 1024,
   });
   return (stdout || "") + (stderr ? `\n${stderr}` : "");
+}
+
+// ── Identity, server-side ─────────────────────────────────────────────
+// This server process serves exactly ONE agent session. The agent declares its
+// name once via join(); we hold it here in memory so say/reply derive the sender
+// — the agent never passes a name, so it cannot post as anyone else. We also
+// write .state/sessions/<session_id> = name so the (separate) Stop-hook process
+// can resolve the same identity from its payload's session_id.
+let ME = null;                                   // the joined name; null until join
+const SESSION_ID =
+  process.env.STITCHPAD_SESSION ||
+  process.env.CLAUDE_CODE_SESSION_ID ||
+  process.env.CODEX_SESSION_ID ||
+  "";
+
+async function bindSession(name) {
+  ME = name;
+  if (!SESSION_ID) return;                        // no id → hook falls back (see CLI)
+  // Ask the CLI where the pad's .state is, then write the session record there.
+  await sp(["bind-session", SESSION_ID, name], name).catch(() => {});
 }
 
 const server = new Server(
@@ -61,10 +82,10 @@ const TOOLS = [
     name: "join",
     description:
       "Join the stitchpad: pick your handle and declare your runtime. Call once " +
-      "at startup. This records your identity so your runtime's wake hook (the " +
-      "Stop hook for claude/codex, or the pi-wake extension) knows to deliver " +
-      "messages addressed to @you. After joining, you'll be woken at each " +
-      "turn-end whenever someone posts a line starting with @your-name.",
+      "at startup. Your runtime's wake hook must also be pinned with " +
+      "STITCHPAD_NAME=<your-name> so it knows to deliver messages addressed to " +
+      "@you. After joining, you'll be woken at each turn-end whenever someone " +
+      "posts a line starting with @your-name.",
     inputSchema: {
       type: "object",
       properties: {
@@ -74,7 +95,7 @@ const TOOLS = [
           enum: ["claude", "codex", "pi"],
           description:
             "Which runtime you are — selects how you get woken: claude/codex via " +
-            "their Stop hook, pi via the pi-wake extension. All read the pad at " +
+            "their Stop hook, pi via the pi adapter extension. All read the pad at " +
             "turn-end; no keystrokes are sent to your terminal.",
         },
       },
@@ -84,15 +105,16 @@ const TOOLS = [
   {
     name: "say",
     description:
-      "Post a message to the stitchpad. To address a teammate (and wake them), " +
-      "start your text with @their-name.",
+      "Post a message to the stitchpad as yourself (the name you joined as — the " +
+      "server knows who you are, you cannot post as anyone else). To address a " +
+      "teammate and wake them, start your text with @their-name. This is also how " +
+      "you reply when the wake hook blocks you with an incoming message.",
     inputSchema: {
       type: "object",
       properties: {
-        from: { type: "string", description: "Your handle (the name you joined as)." },
         text: { type: "string", description: "The message. Start with @name to address+wake someone." },
       },
-      required: ["from", "text"],
+      required: ["text"],
     },
   },
   {
@@ -124,13 +146,14 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         if (!["claude", "codex", "pi"].includes(adapter)) {
           return text("adapter must be one of: claude, codex, pi");
         }
-        // wake=push: the runtime's turn-end hook delivers messages addressed to you.
         out = await sp(["join", a.name, adapter, "push", "-"]);
-        out += `\n(addressable as @${a.name}; you'll be woken at turn-end via the ${adapter} hook)`;
+        await bindSession(a.name);   // hold identity + write session record for the hook
+        out += `\n(you are @${a.name}; your turn-end hook will wake you on @${a.name} mentions. Reply with the say tool — your identity is fixed server-side.)`;
         break;
       }
       case "say":
-        out = await sp(["say", a.from, a.text]);
+        if (!ME) return text("call join first — you have no identity in this stitchpad yet.", true);
+        out = await sp(["say", a.text], ME);   // sender derived from server memory, never the agent
         break;
       case "read":
         out = await sp(["read", "-n", String(a.lines || 80)]);
