@@ -67,9 +67,12 @@ const SESSION_ID =
 
 async function bindSession(name) {
   ME = name;
-  if (!SESSION_ID) return;                        // no id → hook falls back (see CLI)
-  // Ask the CLI where the pad's .state is, then write the session record there.
-  await sp(["bind-session", SESSION_ID, name], name).catch(() => {});
+  // With a session id (claude/codex): bind sessions/<id> so the Stop hook resolves
+  // it from its payload. Without one (pi exposes no session id): bind the pad-level
+  // default identity, which the pi extension's wake reads. pi is single-identity
+  // per pad, so a pad default is correct, not a collision risk.
+  const arg = SESSION_ID || "-";   // "-" = pad default (see CLI bind-session)
+  await sp(["bind-session", arg, name], name).catch(() => {});
 }
 
 const server = new Server(
@@ -132,6 +135,13 @@ const TOOLS = [
     description: "List who is in the room (the parsed roster).",
     inputSchema: { type: "object", properties: {} },
   },
+  {
+    name: "leave",
+    description:
+      "Leave the stitchpad: remove yourself from the roster and post a departure " +
+      "note. Call when you're done collaborating or shutting down.",
+    inputSchema: { type: "object", properties: {} },
+  },
 ];
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
@@ -161,6 +171,11 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       case "who":
         out = await sp(["roster"]);
         break;
+      case "leave":
+        if (!ME) return text("you haven't joined this stitchpad.", true);
+        out = await sp(["leave", ME], ME);
+        ME = null;
+        break;
       default:
         return text(`unknown tool: ${name}`, true);
     }
@@ -172,6 +187,15 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 
 function text(s, isError = false) {
   return { content: [{ type: "text", text: s }], isError };
+}
+
+// Auto-leave when the agent's session ends (the runtime kills this server).
+// Best-effort + synchronous-ish: post the departure note before we exit.
+for (const sig of ["SIGINT", "SIGTERM"]) {
+  process.on(sig, async () => {
+    if (ME) await sp(["leave", ME], ME).catch(() => {});
+    process.exit(0);
+  });
 }
 
 const transport = new StdioServerTransport();

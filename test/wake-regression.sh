@@ -29,11 +29,11 @@ cd "$case1"
 "$SP" init --name case1 >/dev/null
 "$SP" join dale codex >/dev/null
 STITCHPAD_NAME=tester "$SP" say '@dale first ping' >/dev/null
-STITCHPAD_NAME=dale "$SP" say 'reply after first ping' >/dev/null
+STITCHPAD_NAME=larry "$SP" say 'unrelated after first ping' >/dev/null
 out="$("$SP" wake dale)"
 contains "$out" '@dale first ping' || fail 'wake did not include addressed message'
-if contains "$out" 'reply after first ping'; then
-  fail 'wake included a later reply block'
+if contains "$out" 'unrelated after first ping'; then
+  fail 'wake included a later unrelated block'
 fi
 
 # Regression 2: an unrelated commit must not clear an unanswered mention; only

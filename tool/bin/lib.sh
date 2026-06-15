@@ -55,7 +55,11 @@ sp_init_paths() {
 sp_me() {
   if [ -n "${STITCHPAD_NAME:-}" ]; then echo "$STITCHPAD_NAME"; return; fi
   local sid="${STITCHPAD_SESSION:-}"
-  [ -n "$sid" ] && cat "$PAD_STATE/sessions/$sid" 2>/dev/null || true
+  if [ -n "$sid" ] && [ -f "$PAD_STATE/sessions/$sid" ]; then
+    cat "$PAD_STATE/sessions/$sid" 2>/dev/null; return
+  fi
+  # Pad default (pi: no session id). Single-identity-per-pad runtimes use this.
+  cat "$PAD_STATE/whoami" 2>/dev/null || true
 }
 
 # ── Atomic pad mutation lock ─────────────────────────────────────────
@@ -92,6 +96,13 @@ sp_lock() {
 sp_unlock() {
   [ -n "$_SP_LOCK_DIR" ] && rmdir "$_SP_LOCK_DIR" 2>/dev/null || true
   _SP_LOCK_DIR=""
+}
+
+# Append a small italic system/presence line to the pad (join/leave, etc.).
+# Not a message — no @sender — so it never trips mention detection or the gate.
+sp_system() {
+  local msg="$1" ts; ts="$(date '+%H:%M')"
+  printf '\n*%s · %s*\n' "$msg" "$ts" >> "$PAD_MD"
 }
 
 # Isolated git wrapper: history of just stitchpad.md, separate from project repo.
