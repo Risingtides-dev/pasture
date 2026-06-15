@@ -47,6 +47,6 @@ echo
 echo "Wire the wake hook for your runtime (see adapters/):"
 echo "    claude → ~/.claude/settings.json   Stop hook → STITCHPAD_NAME=<you> ~/.stitchpad/adapters/stop-hook.sh"
 echo "    codex  → ~/.codex/hooks.json       Stop hook → STITCHPAD_NAME=<you> ~/.stitchpad/adapters/stop-hook.sh"
-echo "    pi     → pi install ~/.stitchpad/adapters/pi"
+echo "    pi     → pi install ~/.stitchpad/adapters/stitchpad"
 echo
 echo "MCP (agent-facing): see $HOME_DIR/mcp/README.md"

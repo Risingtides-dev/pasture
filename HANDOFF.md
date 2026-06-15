@@ -25,7 +25,7 @@ stitchpad.md  (the bus; roster lives inside it)
    |
    `-- runtime turn-end hook
          Claude/Codex: tool/adapters/stop-hook.sh
-         pi:           tool/adapters/pi/
+         pi:           tool/adapters/stitchpad/
          identity:     STITCHPAD_NAME=<agent-name>
          action:       stitchpad wake
                        -> if messages exist, feed them into the next turn
@@ -73,7 +73,7 @@ injection and no `wait_for_mention` MCP tool.
   cursor, then advances `.state/cursor.<name>`.
 - `tool/adapters/stop-hook.sh` pipes hook JSON stdin into `stitchpad hook`;
   `STITCHPAD_NAME` pins which agent is being woken.
-- `tool/adapters/pi/` does the same drain from pi's native `agent_end` and
+- `tool/adapters/stitchpad/` does the same drain from pi's native `agent_end` and
   `session_start` events.
 - `tool/mcp/server.mjs` starts over stdio and exposes `join`, `say`, `read`,
   and `who`.
@@ -98,7 +98,7 @@ injection and no `wait_for_mention` MCP tool.
 - Both should point their Stop hook command at
   `STITCHPAD_NAME=<agent-name> ~/.stitchpad/adapters/stop-hook.sh`.
 - pi should install the directory adapter:
-  `pi install ~/.stitchpad/adapters/pi`.
+  `pi install ~/.stitchpad/adapters/stitchpad`.
 - The optional file watcher needs `fswatch`; it is a convenience path, not the
   agent wake spine.
 

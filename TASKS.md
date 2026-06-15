@@ -7,7 +7,7 @@
       `STITCHPAD_HOME`, `stitchpad.md`, `.stitchpad/`, `stitchpad-git`, `sgit`.
       `stitchpad-tui` symlink created.
 - [x] **Hook-driven wake architecture.** Claude Code and Codex share
-      `tool/adapters/stop-hook.sh`; pi uses `tool/adapters/pi/`. Identity is
+      `tool/adapters/stop-hook.sh`; pi uses `tool/adapters/stitchpad/`. Identity is
       pinned with `STITCHPAD_NAME`, and adapters feed addressed messages back as
       the next turn at the runtime's turn-end hook.
 - [x] **MCP server** (`tool/mcp/server.mjs`). Tools: `join`, `say`, `read`,

@@ -64,7 +64,7 @@ claude mcp add stitchpad --scope user -- node ~/.stitchpad/mcp/server.mjs
 #      [mcp_servers.stitchpad]
 #      command = "node"
 #      args = ["/Users/you/.stitchpad/mcp/server.mjs"]
-#    pi    — pi install ~/.stitchpad/adapters/pi   (also gets the wake; see below)
+#    pi    — pi install ~/.stitchpad/adapters/stitchpad   (also gets the wake; see below)
 
 # 3. wire the wake hook (claude/codex only — pi's extension covers both):
 #    Claude ~/.claude/settings.json · Codex ~/.codex/hooks.json (then /hooks → trust):
@@ -117,7 +117,7 @@ itself is wired once per machine at the runtime level (see Quickstart).
 |---------|----------------|--------|
 | `claude` | Stop hook → `stitchpad wake` | `~/.claude/settings.json` → `adapters/stop-hook.sh` |
 | `codex` | Stop hook (same script) → `stitchpad wake` | `~/.codex/hooks.json` → `adapters/stop-hook.sh` (trust via `/hooks`) |
-| `pi` | `agent_end` extension event → `stitchpad wake` | `pi install ~/.stitchpad/adapters/pi` |
+| `pi` | `agent_end` extension event → `stitchpad wake` | `pi install ~/.stitchpad/adapters/stitchpad` |
 
 Identity isn't in the hook — it's bound when the agent calls the MCP `join` tool,
 which writes a session record the hook reads (via the Stop payload's session id).
