@@ -5,6 +5,7 @@
 #   stitchpad join <name> <adapter> [wake] [target]   add a participant to the roster
 #   STITCHPAD_NAME=<you> stitchpad say <text...>   post a message (auto-commits)
 #   stitchpad read [-n N]                 print the recent conversation (plain)
+#   stitchpad dnd on|off [--drain]|status silence/resume wake delivery
 #   stitchpad wake [name] [--peek]        print new @name messages since last drain
 #   stitchpad watch                       run the daemon (foreground)
 #   stitchpad start|stop|status|restart   manage the daemon (background)
@@ -185,6 +186,44 @@ EOF
     tail -n "$n" "$PAD_MD"
     ;;
 
+  dnd)
+    # Local wake suppression for the current agent.
+    #   stitchpad dnd on
+    #   stitchpad dnd off [--drain]
+    #   stitchpad dnd status [name]
+    # While DND is on, wake delivery is silent and .state/seen.<name> is not
+    # advanced, so unread mentions queue behind the existing seen cursor.
+    sp_init_paths || exit 1
+    sub="${1:-status}"; shift || true
+    case "$sub" in
+      on)
+        who="$(sp_me)"
+        [ -z "$who" ] && { echo "stitchpad: no identity — call the MCP join tool first (or set STITCHPAD_NAME for CLI/testing)" >&2; exit 1; }
+        touch "$(sp_dnd_file "$who")"
+        echo "✓ DND on for @$who"
+        ;;
+      off)
+        drain=0
+        if [ "${1:-}" = "--drain" ]; then drain=1; shift || true; fi
+        who="$(sp_me)"
+        [ -z "$who" ] && { echo "stitchpad: no identity — call the MCP join tool first (or set STITCHPAD_NAME for CLI/testing)" >&2; exit 1; }
+        rm -f "$(sp_dnd_file "$who")"
+        echo "✓ DND off for @$who"
+        [ "$drain" -eq 1 ] && "$0" wake "$who"
+        ;;
+      status)
+        who="${1:-}"
+        [ -z "$who" ] && who="$(sp_me)"
+        [ -z "$who" ] && { echo "stitchpad: no identity — call the MCP join tool first (or set STITCHPAD_NAME for CLI/testing)" >&2; exit 1; }
+        if sp_dnd_is_on "$who"; then echo "on"; else echo "off"; fi
+        ;;
+      *)
+        echo "usage: stitchpad dnd on|off [--drain]|status [name]" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+
   wake)
     # The shared wake primitive every runtime adapter calls. Blocks (prints the
     # message) iff a mention addressed to <name> is newer than <name>'s last
@@ -224,6 +263,9 @@ EOF
     seen=0; [ -f "$seen_file" ] && seen="$(cat "$seen_file" 2>/dev/null || echo 0)"
     if [ "$last_mention_to_me" -le "${seen:-0}" ]; then
       exit 0   # already delivered this mention; not nagging
+    fi
+    if sp_dnd_is_on "$who"; then
+      exit 0   # muted locally; leave seen untouched so the mention queues
     fi
     # Unanswered → hand the agent the message. One short line: who you are + the
     # untrusted-data caveat (pad is shared/writable, sender is claimed-not-proven,
@@ -293,6 +335,48 @@ EOF
     echo "Results: $passed passed, $failed failed, $total total"
     [ "$failed" -gt 0 ] && exit 1
     exit 0
+    ;;
+
+  color)
+    # Collision-aware color assignment for a roster member.
+    #   stitchpad color <name>   prints the 256-color index for <name>
+    #   stitchpad color --all    prints all members and their colors
+    # Palette of 20 curated distinct hues; collision-aware via linear probe.
+    sp_init_paths || exit 1
+    PALETTE=(39 208 76 170 214 51 199 220 123 141 203 82 205 114 177 226 87 213 155 159)
+    plist=${#PALETTE[@]}
+    # Hash function: sum of char codes mod palette size
+    color_hash() {
+      local name="$1" sum=0
+      for (( i=0; i<${#name}; i++ )); do
+        printf -v ch '%d' "'${name:$i:1}"
+        (( sum += ch ))
+      done
+      echo $(( sum % plist ))
+    }
+    # Get the full roster as array of names
+    mapfile -t _names < <(sp_roster | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/, "", $1); print $1}')
+    # Collision-aware assignment: walk names, each gets hashed slot, skip collisions
+    declare -A _taken=()
+    declare -A _color_map=()
+    for _n in "${_names[@]}"; do
+      h=$(color_hash "$_n")
+      idx=$h
+      while [ -n "${_taken[$idx]+x}" ]; do
+        idx=$(( (idx + 1) % plist ))
+        if [ "$idx" -eq "$h" ]; then break; fi
+      done
+      _taken[$idx]=1
+      _color_map[$_n]=${PALETTE[$idx]}
+    done
+    if [ "${1:-}" = "--all" ]; then
+      for _n in "${_names[@]}"; do
+        printf '%s %d\n' "$_n" "${_color_map[$_n]}"
+      done
+    else
+      who="${1:?usage: stitchpad color <name> | --all}"
+      echo "${_color_map[$who]:-7}"
+    fi
     ;;
 
   roster|who)  sp_init_paths || exit 1; sp_roster ;;

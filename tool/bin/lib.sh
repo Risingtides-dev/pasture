@@ -62,6 +62,12 @@ sp_me() {
   cat "$PAD_STATE/whoami" 2>/dev/null || true
 }
 
+# ── Do Not Disturb ──────────────────────────────────────────────────
+# DND is a local wake-suppression flag. It never mutates the pad or seen cursor:
+# mentions accumulate behind .state/seen.<name> and can be drained on return.
+sp_dnd_file() { printf '%s/dnd.%s\n' "$PAD_STATE" "$1"; }
+sp_dnd_is_on() { [ -f "$(sp_dnd_file "$1")" ]; }
+
 # ── Atomic pad mutation lock ─────────────────────────────────────────
 # Multiple agents may say/join the same pad concurrently. stitchpad.md is mutated
 # by bare appends (say) and read-rewrite (join); without serialization those race

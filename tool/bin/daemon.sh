@@ -17,7 +17,13 @@ is_running() { [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; }
 case "${1:-status}" in
   start)
     if is_running; then echo "running (pid $(cat "$PIDFILE"))"; exit 0; fi
-    PAD_DIR="$PAD_DIR" nohup bash "$STITCHPAD_HOME/bin/watch.sh" >"$LOG" 2>&1 &
+    # Supervisor wrapper: restarts the watcher if it dies
+    ( while true; do
+        PAD_DIR="$PAD_DIR" bash "$STITCHPAD_HOME/bin/watch.sh" >>"$LOG" 2>&1
+        echo "[stitchpad] watcher exited (code $?), restarting in 2s..." >>"$LOG"
+        sleep 2
+      done
+    ) &
     echo $! > "$PIDFILE"; echo "started stitchpad watcher (pid $(cat "$PIDFILE")); log: $LOG" ;;
   stop)
     if is_running; then kill "$(cat "$PIDFILE")" && echo "stopped"; else echo "not running"; fi

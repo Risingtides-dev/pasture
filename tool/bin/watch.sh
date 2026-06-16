@@ -46,7 +46,7 @@ fire_adapter() {
   local name="$1" adapter="$2" wake="$3" target="$4"
   local script="$ADAPTER_DIR/$adapter.sh"
   if [ ! -f "$script" ]; then
-    echo "[stitchpad] no adapter '$adapter' for @$name (looked in $ADAPTER_DIR)"; return 1
+    echo "[stitchpad] no adapter '$adapter' for @$name (looked in $ADAPTER_DIR)"; return 0
   fi
   local taskfile; taskfile="$(mktemp)"
   sp_latest_to "$name" > "$taskfile"
@@ -54,6 +54,7 @@ fire_adapter() {
     bash "$script" mention "$name" "$PAD_MD" "$taskfile" </dev/null \
     || echo "[stitchpad] adapter $adapter failed for @$name"
   rm -f "$taskfile"
+  return 0
 }
 
 # react() takes NO stdin — everything inside redirects from /dev/null where it
@@ -78,5 +79,8 @@ react() {
     fi
   done
 }
+
+# Trap errors in the main loop so the watcher doesn't die on a single adapter failure.
+trap 'echo "[stitchpad] watcher error at line $LINENO — continuing" >&2' ERR
 
 fswatch -0 "$PAD_MD" | while read -r -d "" _ev; do react </dev/null; done
