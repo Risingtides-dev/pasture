@@ -51,7 +51,13 @@ fire_adapter() {
   local taskfile; taskfile="$(mktemp)"
   sp_latest_to "$name" > "$taskfile"
   local rc=0
-  SP_WAKE="$wake" SP_TARGET="$target" SP_PAD_DIR="$PAD_DIR" SP_PAD_MD="$PAD_MD" \
+  # Per-agent force-wake: if .state/forcewake.<name> exists, bypass the adapter's
+  # focus-guard for this agent (wake even when its window is focused). Used for the
+  # orchestrator (randy), whose window is often the focused one the human is typing
+  # in — without this, pad mentions to randy chronically defer and never land.
+  local force=0
+  [ -f "$PAD_STATE/forcewake.$name" ] && force=1
+  SP_WAKE="$wake" SP_TARGET="$target" SP_PAD_DIR="$PAD_DIR" SP_PAD_MD="$PAD_MD" STITCHPAD_FORCE_WAKE="$force" \
     bash "$script" mention "$name" "$PAD_MD" "$taskfile" </dev/null || rc=$?
   rm -f "$taskfile"
   # Return the adapter's exit code so the caller can distinguish DELIVERED (0) from
