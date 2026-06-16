@@ -57,7 +57,7 @@ export default {
     }
     if (url.pathname === "/pad.colors" && req.method === "GET") {
       const v = await env.STITCHPAD.get(padKey);
-      const colors = v ? (JSON.parse(v).colors || []) : [];
+      const colors = v ? (JSON.parse(v).colors || {}) : {};
       return json(colors);
     }
     if (url.pathname === "/say" && req.method === "POST") {

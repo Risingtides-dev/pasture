@@ -36,8 +36,8 @@ while :; do
         -not -path '*/.git/*' -not -path '*/.stitchpad/*' -not -path '*/node_modules/*' \
         -not -path '*/target/*' -not -path '*/.*/*' 2>/dev/null \
         | sed 's|^\./||' | sort | head -500 | jq -R . | jq -sc .)"
-    # collect single-source color map from the pad
-    colors="$(cd "$proj" && "$SP" color --all 2>/dev/null | jq -R 'split(" ") | {name:.[0], color:.[1]}' | jq -sc . 2>/dev/null || echo '[]')"
+    # collect single-source color map from the pad (flat object: {name: hex})
+    colors="$(cd "$proj" && "$SP" color --all 2>/dev/null | jq -R 'split(" ") | {(.[0]): .[1]}' | jq -sc 'add // {}' 2>/dev/null || echo '{}')"
     # push this pad up (markdown + roster + files + colors)
     jq -nc --arg pad "$md" --argjson roster "[${roster}]" --argjson files "${files:-[]}" --argjson colors "${colors}" \
       '{pad:$pad, roster:$roster, files:$files, colors:$colors}' 2>/dev/null \
