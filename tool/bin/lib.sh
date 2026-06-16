@@ -190,19 +190,28 @@ sp_latest_to() {
 sp_engagement() {
   local who="$1"
   awk -v who="$(printf '%s' "$1" | tr 'A-Z' 'a-z')" '
-    function body_mentions(name,   re) { re="(^|[^a-z0-9_-])@" name "([^a-z0-9_-]|$)"; return (buf ~ re) }
+    # An ADDRESS is "@name" at line-start or after whitespace — NOT after punctuation
+    # like / ` " (), so a quoted/referenced "@name" (e.g. "the @john/@dale discussion")
+    # or a backticked `@name` does not count as addressing someone. buf joins lines with
+    # a leading space, so (^|[ \t]) covers block-start, every line-start, and mid-sentence.
+    function body_mentions(name,   re) { re="(^|[ \t])@" name "([^a-z0-9_-]|$)"; return (buf ~ re) }
     function flush() {
       if (author=="") return
       n++
       if (author==who) {                                                          # my own block:
-        if (silent || buf ~ /(^|[^a-z0-9_-])@[a-z0-9_-]/) last_reply=n           # a silent ack OR a real @-reply clears my gate
-      } else if (!silent && body_mentions(who)) last_mention=n                    # a silent post by another never wakes me; a real mention does
+        if (silent || buf ~ /(^|[ \t])@[a-z0-9_-]/) last_reply=n                 # a silent ack OR a real @-address reply clears my gate
+      } else if (!silent && body_mentions(who)) last_mention=n                    # a silent post by another never wakes me; a real address does
     }
     /^## @/ {
       flush()
-      a=$2; sub(/^@/,"",a); author=tolower(a); buf=""; silent=0; seen_body=0
+      a=$2; sub(/^@/,"",a); author=tolower(a); buf=""; silent=0; seen_body=0; infence=0
       next
     }
+    # A fenced code block (``` toggles) is never an address — doctor output, diffs and
+    # code paste "@name" listings (e.g. "✓ @dale — healthy") must not wake anyone. The
+    # fence lines themselves and their contents are excluded from the mention buffer.
+    /^[[:space:]]*```/ { infence = !infence; next }
+    infence { next }
     # first non-empty content line decides silent-ack (leading "." or "[ack]")
     !seen_body && /[^[:space:]]/ { seen_body=1; if ($0 ~ /^[[:space:]]*(\.|\[ack\])/) silent=1 }
     { buf = buf " " tolower($0) }

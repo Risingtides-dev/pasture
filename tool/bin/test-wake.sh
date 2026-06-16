@@ -87,6 +87,53 @@ check "normal mention still wakes (control)" "2 1" '## @mark
 ## @dale
 @mark thanks.'
 
+# ── P4: quoted/referenced @name is NOT an address ──────────────
+# a @name inside referenced text (after punctuation like / ` ") must not wake them.
+check "quoted-mention reference does not wake" "0 1" '## @mark
+@dale hi.
+
+## @dale
+recapping the @larry/@mark/@dale discussion for context.'
+
+check "backticked @mention does not wake" "0 1" '## @mark
+@dale hi.
+
+## @dale
+the gate matched `@mark` literally in code.'
+
+# real addresses must still fire after the tightening (controls)
+check "address chain still wakes (@larry @mark)" "2 1" '## @mark
+@dale earlier.
+
+## @dale
+@larry @mark both look.'
+
+check "mid-sentence address still wakes" "2 0" '## @larry
+@mark hi.
+
+## @larry
+hey @mark can you check this?'
+
+# ── P5: @name inside a fenced code block is NOT an address ──────
+# doctor output / diffs / code pastes list "@name" but address nobody.
+check "fenced-code @mention does not wake" "0 0" '## @dale
+roster doctor:
+```
+  ✓ @mark (kitty/push) — healthy
+  ✓ @dale (kitty/push) — healthy
+```
+all good.'
+
+# a real address OUTSIDE the fence in the same block still wakes
+check "address outside fence still wakes despite fenced listing" "2 1" '## @mark
+@dale earlier.
+
+## @dale
+@mark see the report:
+```
+  ✓ @mark — healthy
+```'
+
 echo
 echo "RESULT: $pass passed, $fail failed"
 rm -rf "$T"
