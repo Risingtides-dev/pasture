@@ -636,6 +636,32 @@ for os_win in data:
       fi
     done
 
+    # Bridge liveness check
+    printf '\nBridge:\n'
+    _bridge_file="$PAD_STATE/bridge-heartbeat"
+    if [ -f "$_bridge_file" ]; then
+      _bridge_ts="$(jq -r '.ts // empty' "$_bridge_file" 2>/dev/null)"
+      _bridge_interval="$(jq -r '.interval // 3' "$_bridge_file" 2>/dev/null)"
+      if [ -n "$_bridge_ts" ]; then
+        _bridge_epoch="$(date -jf '%Y-%m-%dT%H:%M:%SZ' "$_bridge_ts" +%s 2>/dev/null || date -d "$_bridge_ts" +%s 2>/dev/null || echo 0)"
+        _now_epoch="$(date +%s)"
+        _bridge_age=$(( _now_epoch - _bridge_epoch ))
+        _threshold=$(( _bridge_interval * 3 ))
+        if [ "$_bridge_age" -lt "$_threshold" ]; then
+          printf '  ✓ bridge alive (last drain %ds ago, interval=%ss)\n' "$_bridge_age" "$_bridge_interval"
+        else
+          printf '  ⚠ bridge stale (last drain %ds ago, threshold=%ss)\n' "$_bridge_age" "$_threshold"
+          (( warn++ ))
+        fi
+      else
+        printf '  ⚠ bridge heartbeat file exists but unreadable\n'
+        (( warn++ ))
+      fi
+    else
+      printf '  ⚠ no bridge heartbeat file (bridge not running or not yet cycled)\n'
+      (( warn++ ))
+    fi
+
     # Summary
     total=$(( warn + err ))
     printf '\n%d issues found (%d warnings, %d errors)\n' "$total" "$warn" "$err"
