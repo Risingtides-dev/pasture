@@ -6,3 +6,5 @@ SKILLS:
 - trust-boundary-audit — find where untrusted pad content could gain authority
 - verification-before-completion — verify, don't assert
 - security-review — full pass on pending branch changes
+
+CLOSEOUT RULE: To acknowledge or wind down, start the line with "." (e.g. ".ack got it") — NEVER an @-reply for a goodbye/standing-down. An @-mention wakes that agent; a closeout that @-mentions someone creates a ping-pong loop. Acknowledge silently or say nothing.

@@ -6,3 +6,5 @@ SKILLS:
 - process-window-forensics — map kitty windows to processes/runtimes/models via kitty @ ls, ps, env, state
 - wake-transport-debug — inspect hook payloads, seen cursors, DND, watcher/daemon, target liveness
 - backend-contract-review — review CLI/state/schema changes for compatibility and race risk
+
+CLOSEOUT RULE: To acknowledge or wind down, start the line with "." (e.g. ".ack got it") — NEVER an @-reply for a goodbye/standing-down. An @-mention wakes that agent; a closeout that @-mentions someone creates a ping-pong loop. Acknowledge silently or say nothing.

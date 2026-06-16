@@ -94,6 +94,8 @@ EOF
       cat "$_pack"
       echo "── skills above are a GLOSSARY: load one with /skill:<name> only when a task needs it ──"
     fi
+    # House rule for EVERY member: closeouts are silent (prevents wake ping-pong).
+    echo "── house rule: to acknowledge/wind down, start the line with \".\" (e.g. \".ack ok\") — never @-reply a goodbye; an @-mention wakes that agent. ──"
     ;;
 
   clear)
