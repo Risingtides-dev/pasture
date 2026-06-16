@@ -339,12 +339,26 @@ EOF
 
   color)
     # Collision-aware color assignment for a roster member.
-    #   stitchpad color <name>   prints the 256-color index for <name>
+    #   stitchpad color <name>   prints the RGB hex for <name>
     #   stitchpad color --all    prints all members and their colors
-    # Palette of 20 curated distinct hues; collision-aware via linear probe.
+    # Single source of truth: kitty windows + TUI both shell out to this.
     sp_init_paths || exit 1
-    PALETTE=(39 208 76 170 214 51 199 220 123 141 203 82 205 114 177 226 87 213 155 159)
-    plist=${#PALETTE[@]}
+
+    # Per-name overrides (john-set window colors). These win over palette.
+    declare -A _overrides=(
+      [Jill]='#ff1493'    # pure pink
+      [ernie]='#5f2f8f'   # dark violet
+    )
+
+    # 20-color palette (256-index → hex). Used when no override exists.
+    declare -a _pidx=(39 208 76 170 214 51 199 220 123 141 203 82 205 114 177 226 87 213 155 159)
+    declare -a _phex=(
+      '#00afff' '#ff8700' '#5fff00' '#d75fff' '#ffaf00' '#00ffff' '#ff00af' '#ffd700'
+      '#87ffff' '#af87ff' '#ff5faf' '#5fff5f' '#ff5fff' '#87d787' '#d7af5f' '#ffff00'
+      '#5fffff' '#ff87ff' '#afffaf' '#afffff'
+    )
+    plist=${#_pidx[@]}
+
     # Hash function: sum of char codes mod palette size
     color_hash() {
       local name="$1" sum=0
@@ -360,6 +374,11 @@ EOF
     declare -A _taken=()
     declare -A _color_map=()
     for _n in "${_names[@]}"; do
+      # Check override first
+      if [ -n "${_overrides[$_n]+x}" ]; then
+        _color_map[$_n]="${_overrides[$_n]}"
+        continue
+      fi
       h=$(color_hash "$_n")
       idx=$h
       while [ -n "${_taken[$idx]+x}" ]; do
@@ -367,15 +386,15 @@ EOF
         if [ "$idx" -eq "$h" ]; then break; fi
       done
       _taken[$idx]=1
-      _color_map[$_n]=${PALETTE[$idx]}
+      _color_map[$_n]="${_phex[$idx]}"
     done
     if [ "${1:-}" = "--all" ]; then
       for _n in "${_names[@]}"; do
-        printf '%s %d\n' "$_n" "${_color_map[$_n]}"
+        printf '%s %s\n' "$_n" "${_color_map[$_n]}"
       done
     else
       who="${1:?usage: stitchpad color <name> | --all}"
-      echo "${_color_map[$who]:-7}"
+      echo "${_color_map[$who]:-#808080}"
     fi
     ;;
 
