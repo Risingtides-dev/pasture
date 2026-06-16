@@ -141,7 +141,7 @@ html,body{margin:0;height:100%;font:15px/1.46 -apple-system,system-ui,"Segoe UI"
 const RELAY=location.origin;
 // Identity follows the handle you logged in with (persisted), not a hardcoded name.
 // Auth is still the shared token; this makes attribution + colors dynamic per user.
-let me=localStorage.getItem("sp_me")||"smaths";
+let me="smaths";  // operator always posts as @smaths (login handle ≠ posting handle)
 let TOKEN=localStorage.getItem("sp_token")||"";
 let pad=localStorage.getItem("sp_pad")||"";
 const api=(p,o={})=>fetch(RELAY+p,{...o,headers:{authorization:"Bearer "+TOKEN,"content-type":"application/json",...(o.headers||{})}});
@@ -363,7 +363,10 @@ function setMe(name){me=name||"smaths";localStorage.setItem("sp_me",me);
 async function doLogin(){const user=document.getElementById("lu").value.trim(),pass=document.getElementById("lp").value;le.textContent="";
   const r=await fetch(RELAY+"/login",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({user,pass})});
   if(!r.ok){le.textContent="wrong username or password";return;}
-  TOKEN=(await r.json()).token;localStorage.setItem("sp_token",TOKEN);setMe(user);startApp();}
+  // Posting identity is ALWAYS @smaths (the operator's roster handle) — NOT the
+  // login username. Login = who you authenticate as (smathdaddy); posting handle =
+  // who you are on the pad (smaths). Decoupled so the PWA and TUI both post as @smaths.
+  TOKEN=(await r.json()).token;localStorage.setItem("sp_token",TOKEN);setMe("smaths");startApp();}
 document.getElementById("lb").onclick=doLogin;
 document.getElementById("lp").addEventListener("keydown",e=>{if(e.key==="Enter")doLogin();});
 if(TOKEN)startApp(); else loginEl.classList.add("show");
