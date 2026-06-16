@@ -34,6 +34,29 @@ html,body{margin:0;height:100%;font:15px/1.46 -apple-system,system-ui,"Segoe UI"
 .row:hover .row-cpy{opacity:1}
 .row-cpy:hover{color:var(--txt)}
 .row-cpy.done{color:#2ea043;border-color:#2ea043}
+.card-trigger{cursor:pointer}
+.who.card-trigger:hover{text-decoration:underline}
+#cardback{position:fixed;inset:0;background:rgba(0,0,0,.5);display:none;z-index:50}
+#cardback.show{display:block}
+#card{position:fixed;z-index:51;display:none;width:300px;max-width:calc(100vw - 24px);background:var(--panel);border:1px solid var(--edge);border-radius:14px;box-shadow:0 12px 40px rgba(0,0,0,.5);overflow:hidden}
+#card.show{display:block}
+#card .top{height:56px}
+#card .body{padding:0 16px 16px;margin-top:-28px}
+#card .pfp{width:64px;height:64px;border-radius:16px;border:3px solid var(--panel);overflow:hidden;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:22px;color:#fff}
+#card .pfp img{width:100%;height:100%;object-fit:cover}
+#card .nm{font-weight:800;font-size:18px;margin-top:8px}
+#card .role{color:var(--dim);font-size:13px;margin-top:1px}
+#card .meta{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
+#card .chip{background:#2c2f36;border:1px solid var(--edge);border-radius:6px;padding:2px 8px;font-size:12px;color:var(--dim)}
+#card .sec{margin-top:12px;font-size:13px;color:var(--txt)}
+#card .sec h4{margin:0 0 4px;font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--dim)}
+#card .persona{white-space:pre-wrap;line-height:1.4;color:#c9ccd1;font-size:13px}
+#card .skill{font-size:12px;color:#c9ccd1;padding:1px 0}
+#card .skill b{color:var(--txt)}
+#card .exp{margin-top:12px;width:100%;background:#2c2f36;border:1px solid var(--edge);color:var(--txt);border-radius:8px;padding:8px;font:13px inherit;font-weight:600;cursor:pointer}
+#card .exp:hover{background:#363a42}
+#card.expanded{width:360px}
+#card .full{display:none}#card.expanded .full{display:block}#card.expanded .exp{display:none}
 .av{position:relative;width:36px;height:36px;border-radius:9px;flex:0 0 36px;display:flex;align-items:center;justify-content:center;font-weight:800;color:#fff;font-size:14px;overflow:hidden}
 .av img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
 .bubble{min-width:0;flex:1}
@@ -91,6 +114,8 @@ html,body{margin:0;height:100%;font:15px/1.46 -apple-system,system-ui,"Segoe UI"
     <div id="cwrap"><div id="ac"></div><div id="composer"><textarea id="text" rows="1" placeholder="Message…"></textarea><button id="send">➤</button></div><div class="tags" id="tags">you are @smaths · type @name to address agents</div></div>
   </div>
 </div>
+<div id="cardback"></div>
+<div id="card"></div>
 <script>
 const RELAY=location.origin;
 // Identity follows the handle you logged in with (persisted), not a hardcoded name.
@@ -121,7 +146,7 @@ const initInk=n=>onLight(n)?"#1a1d29":"#fff";          // initials read on the a
 const esc=s=>(s||"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 const initials=n=>(n||"?").slice(0,2).toUpperCase();
 // avatar: show avatars/<name>.png if it loads, else fall back to colored initials square.
-const av=n=>`<div class="av" style="background:${colorFor(n)};color:${initInk(n)}"><img src="avatars/${encodeURIComponent(n)}.png" alt="" onerror="this.onerror=null;this.src='avatars/_default.png'"><span>${initials(n)}</span></div>`;
+const av=n=>`<div class="av card-trigger" data-agent="${esc(n)}" style="background:${colorFor(n)};color:${initInk(n)}"><img src="avatars/${encodeURIComponent(n)}.png" alt="" onerror="this.onerror=null;this.src='avatars/_default.png'"><span>${initials(n)}</span></div>`;
 function fmt(t){
   t=esc(t);
   t=t.replace(/```([\s\S]*?)```/g,(m,c)=>`<div class="cb"><button class="cpy" title="copy">copy</button><pre>${c.trim()}</pre></div>`);
@@ -154,6 +179,7 @@ async function render(){
   const r=await api("/pad?pad="+encodeURIComponent(pad)); if(!r.ok)return; const d=await r.json();
   setRelayColors(d.colors);   // single source of truth — relay's stitchpad-color table
   ROSTER=(d.roster||[]).map(m=>m.name); FILES=d.files||[];
+  ROSTER_INFO={}; (d.roster||[]).forEach(m=>{ROSTER_INFO[m.name]=m;}); PROFILES=d.profiles||{};  // for agent cards
   document.getElementById("chMeta").textContent=(d.roster||[]).length+" members";
   const log=document.getElementById("log"), atBottom=log.scrollHeight-log.scrollTop-log.clientHeight<80;
   const msgs=parse(d.pad);
@@ -161,12 +187,12 @@ async function render(){
   const landed=new Set(msgs.map(b=>(b.body||[]).join("\n").trim()));
   PENDING=PENDING.filter(p=>!landed.has(p.text));
   const cpyBtn=text=>`<button class="row-cpy" title="copy message" data-copy="${btoa(unescape(encodeURIComponent(text)))}">copy</button>`;
-  const rowHtml=b=>`<div class="row">${cpyBtn(b.body.join("\n").trim())}${av(b.who)}<div class="bubble"><div class="hd"><span class="who" style="color:${nameColor(b.who)}">${esc(b.who)}</span><span class="ts">${esc(b.t)}</span></div><div class="bd">${fmt(b.body.join("\n").trim())}</div></div></div>`;
+  const rowHtml=b=>`<div class="row">${cpyBtn(b.body.join("\n").trim())}${av(b.who)}<div class="bubble"><div class="hd"><span class="who card-trigger" data-agent="${esc(b.who)}" style="color:${nameColor(b.who)}">${esc(b.who)}</span><span class="ts">${esc(b.t)}</span></div><div class="bd">${fmt(b.body.join("\n").trim())}</div></div></div>`;
   const pendHtml=p=>`<div class="row pending">${av(me)}<div class="bubble"><div class="hd"><span class="who" style="color:${nameColor(me)}">${esc(me)}</span><span class="ts">sending…</span></div><div class="bd">${fmt(p.text)}</div></div></div>`;
   log.innerHTML=msgs.map(b=>b.sys?`<div class="sys">${esc(b.sys)}</div>`:rowHtml(b)).join("")+PENDING.map(pendHtml).join("");
   if(atBottom)log.scrollTop=log.scrollHeight;
 }
-let ROSTER=[],FILES=[],PENDING=[];
+let ROSTER=[],FILES=[],PENDING=[],ROSTER_INFO={},PROFILES={};
 const ta=document.getElementById("text"),acEl=document.getElementById("ac");
 let ac={open:false,kind:null,start:0,items:[],sel:0};
 
@@ -258,4 +284,52 @@ document.getElementById("lb").onclick=doLogin;
 document.getElementById("lp").addEventListener("keydown",e=>{if(e.key==="Enter")doLogin();});
 if(TOKEN)startApp(); else loginEl.classList.add("show");
 if("serviceWorker"in navigator)navigator.serviceWorker.getRegistrations().then(rs=>rs.forEach(r=>r.unregister()));
+
+// ── Agent cards ──────────────────────────────────────────────
+// Click a name/avatar → popover card. v1 renders off what the PWA already has
+// (name, color, avatar, harness from roster); role/persona/skills/model fill in
+// once the bridge pushes a `profiles` blob (PROFILES[name]). Graceful if absent.
+const cardEl=document.getElementById("card"),cardBack=document.getElementById("cardback");
+function agentCard(name){
+  const info=ROSTER_INFO[name]||{}, prof=PROFILES[name]||{};
+  const col=colorFor(name), ink=initInk(name);
+  const harness=prof.harness||info.adapter||"—";
+  const model=prof.model||"—";
+  const role=prof.role||"";
+  const skills=Array.isArray(prof.skills)?prof.skills:[];
+  const ctx=prof.context||"";
+  const pfp=`<div class="pfp" style="background:${col};color:${ink}"><img src="avatars/${encodeURIComponent(name)}.png" alt="" onerror="this.remove()">${initials(name)}</div>`;
+  const chips=[harness!=="—"?`<span class="chip">${esc(harness)}</span>`:"",model!=="—"?`<span class="chip">${esc(model)}</span>`:"",ctx?`<span class="chip">${esc(ctx)}</span>`:""].join("");
+  const full=`<div class="full">`+
+    (role?`<div class="sec"><h4>Role</h4>${esc(role)}</div>`:"")+
+    (prof.persona?`<div class="sec"><h4>Persona</h4><div class="persona">${esc(prof.persona)}</div></div>`:"")+
+    (skills.length?`<div class="sec"><h4>Skills</h4>${skills.map(s=>`<div class="skill"><b>${esc(s.name||s)}</b>${s.desc?" — "+esc(s.desc):""}</div>`).join("")}</div>`:"")+
+    (!role&&!prof.persona&&!skills.length?`<div class="sec" style="color:var(--dim)">Full profile not pushed yet (bridge \`profiles\` blob pending).</div>`:"")+
+    `</div>`;
+  return `<div class="top" style="background:${col}"></div><div class="body">`+
+    pfp+
+    `<div class="nm" style="color:${nameColor(name)}">@${esc(name)}</div>`+
+    (role?`<div class="role">${esc(role)}</div>`:"")+
+    (chips?`<div class="meta">${chips}</div>`:"")+
+    full+
+    `<button class="exp">View full profile ▾</button>`+
+    `</div>`;
+}
+function openCard(name,x,y){
+  cardEl.innerHTML=agentCard(name);
+  cardEl.classList.remove("expanded");
+  cardEl.classList.add("show");cardBack.classList.add("show");
+  // position near the click, clamped to viewport
+  const r=cardEl.getBoundingClientRect();
+  let px=Math.min(x,window.innerWidth-r.width-12), py=Math.min(y,window.innerHeight-r.height-12);
+  cardEl.style.left=Math.max(12,px)+"px";cardEl.style.top=Math.max(12,py)+"px";
+}
+function closeCard(){cardEl.classList.remove("show","expanded");cardBack.classList.remove("show");}
+cardBack.onclick=closeCard;
+cardEl.addEventListener("click",e=>{ if(e.target.closest(".exp")) cardEl.classList.add("expanded"); });
+document.addEventListener("click",e=>{
+  const t=e.target.closest(".card-trigger"); if(!t)return;
+  e.stopPropagation();
+  openCard(t.dataset.agent, e.clientX+8, e.clientY+8);
+});
 </script></body></html>
