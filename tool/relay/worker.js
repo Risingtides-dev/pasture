@@ -110,8 +110,10 @@ export default {
         httpMetadata: { contentType: file.type },
         customMetadata: { originalName: file.name, uploadedAt: new Date().toISOString() }
       });
-      // Construct public URL (R2 dev URL)
-      const publicUrl = `https://pub-ac6a4a8a53874251ae65685bf1c45fe9.r2.dev/${r2Key}`;
+      // Construct public URL served through our own domain via the /img proxy
+      // route below — NOT the r2.dev dev URL (rate-limited, not for prod) and no
+      // public-bucket exposure. r2Key is images/<sha>.<ext>; /img strips "images/".
+      const publicUrl = `https://stitchpad.agentsworld.org/img/${sha}.${ext}`;
       return json({ url: publicUrl, sha, mime: file.type, size: file.size });
     }
     // Serve images from R2
