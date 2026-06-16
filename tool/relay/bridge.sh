@@ -30,8 +30,15 @@ while :; do
     name="$(basename "$(dirname "$padd")")"            # pad name = project dir
     md="$(cat "$padd/stitchpad.md")"
     roster="$(cd "$(dirname "$padd")" && "$SP" roster 2>/dev/null | awk -F'|' '{printf "%s{\"name\":\"%s\",\"adapter\":\"%s\"}", (NR>1?",":""), $1, $2}')"
-    # push this pad up (markdown + roster)
-    jq -nc --arg pad "$md" --argjson roster "[${roster}]" '{pad:$pad, roster:$roster}' 2>/dev/null \
+    # file list for the `>` attach dropdown: project files, relative paths, skip junk/dotdirs
+    proj="$(dirname "$padd")"
+    files="$(cd "$proj" && find . -maxdepth 3 -type f \
+        -not -path '*/.git/*' -not -path '*/.stitchpad/*' -not -path '*/node_modules/*' \
+        -not -path '*/target/*' -not -path '*/.*/*' 2>/dev/null \
+        | sed 's|^\./||' | sort | head -500 | jq -R . | jq -sc .)"
+    # push this pad up (markdown + roster + files)
+    jq -nc --arg pad "$md" --argjson roster "[${roster}]" --argjson files "${files:-[]}" \
+      '{pad:$pad, roster:$roster, files:$files}' 2>/dev/null \
       | api -X POST "$RELAY/push?pad=$name" --data-binary @- >/dev/null || true
     # drain phone→pad messages for this pad, inject via stitchpad say
     out="$(api "$RELAY/outbox?pad=$name" 2>/dev/null || echo '{"messages":[]}')"
@@ -40,6 +47,8 @@ while :; do
       ( cd "$(dirname "$padd")" && STITCHPAD_NAME="$from" "$SP" say "$text" >/dev/null 2>&1 ) || true
       echo "[bridge] $name ← @$from: ${text:0:50}"
     done
+    # Write heartbeat after successful push+drain for this pad
+    printf '{"ts":"%s","pad":"%s","interval":%s}' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$name" "$INTERVAL" > "$padd/.state/bridge-heartbeat" 2>/dev/null || true
   done < <(find_pads)
   sleep "$INTERVAL"
 done
