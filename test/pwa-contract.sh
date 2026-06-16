@@ -116,6 +116,11 @@ QUEUED_AFTER="$(echo "$OUTBOX_AFTER" | jq '.messages | length')"
 assert_eq "visibility: /say returns queued count (0→1)" "1" "$QUEUED_AFTER"
 assert_eq "visibility: queue was empty before say" "0" "$QUEUED_BEFORE"
 
+# /pad.colors response shape: [{name, color}, ...]
+COLORS_JSON='[{"name":"dale","color":"#00d000"},{"name":"dennis","color":"#ff8c00"}]'
+check "pad.colors schema: array of {name,color}" \
+  bash -c 'echo "[{\"name\":\"dale\",\"color\":\"#00d000\"}]" | jq -e ".[0].name == \"dale\" and .[0].color == \"#00d000\"" >/dev/null'
+
 # /pad.health.queueDepth reflects queue before drain
 # NOTE: current /outbox is destructive (drain removes messages).
 # This is a known risk until claim/ack lands — documented here per larry's contract spec.

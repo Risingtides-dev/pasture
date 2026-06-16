@@ -3,8 +3,9 @@
 // pads and picks one. The bash CLI stays the source of truth; this just mirrors.
 //
 //   GET  /pads               → [{name, at}]  list of known stitchpads
-//   POST /push?pad=NAME      (Mac bridge)  body {pad, roster} → store under NAME
-//   GET  /pad?pad=NAME       (PWA)         → that pad's markdown + roster
+//   POST /push?pad=NAME      (Mac bridge)  body {pad, roster, files, colors} → store under NAME
+//   GET  /pad?pad=NAME       (PWA)         → that pad's markdown + roster + files + colors
+//   GET  /pad.colors?pad=NAME (PWA)        → [{name, color}, ...] single-source colors
 //   POST /say?pad=NAME       (PWA)         body {from,text} → queued for NAME
 //   GET  /outbox?pad=NAME    (Mac/tunnel)  → drain NAME's queued phone messages
 //
@@ -25,7 +26,7 @@ export default {
     }
 
     // Non-API paths → serve the PWA static assets (index.html, manifest).
-    const API = ["/login", "/pads", "/pad", "/push", "/say", "/outbox"];
+    const API = ["/login", "/pads", "/pad", "/pad.colors", "/push", "/say", "/outbox"];
     if (!API.includes(url.pathname)) {
       return env.ASSETS ? env.ASSETS.fetch(req) : json({ error: "no assets" }, 404);
     }
@@ -53,6 +54,11 @@ export default {
     if (url.pathname === "/pad" && req.method === "GET") {
       const v = await env.STITCHPAD.get(padKey);
       return json(v ? JSON.parse(v) : { pad: "", roster: [], name: pad, at: 0 });
+    }
+    if (url.pathname === "/pad.colors" && req.method === "GET") {
+      const v = await env.STITCHPAD.get(padKey);
+      const colors = v ? (JSON.parse(v).colors || []) : [];
+      return json(colors);
     }
     if (url.pathname === "/say" && req.method === "POST") {
       const { from, text } = await req.json();

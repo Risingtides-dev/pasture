@@ -36,9 +36,11 @@ while :; do
         -not -path '*/.git/*' -not -path '*/.stitchpad/*' -not -path '*/node_modules/*' \
         -not -path '*/target/*' -not -path '*/.*/*' 2>/dev/null \
         | sed 's|^\./||' | sort | head -500 | jq -R . | jq -sc .)"
-    # push this pad up (markdown + roster + files)
-    jq -nc --arg pad "$md" --argjson roster "[${roster}]" --argjson files "${files:-[]}" \
-      '{pad:$pad, roster:$roster, files:$files}' 2>/dev/null \
+    # collect single-source color map from the pad
+    colors="$(cd "$proj" && "$SP" color --all 2>/dev/null | jq -R 'split(" ") | {name:.[0], color:.[1]}' | jq -sc . 2>/dev/null || echo '[]')"
+    # push this pad up (markdown + roster + files + colors)
+    jq -nc --arg pad "$md" --argjson roster "[${roster}]" --argjson files "${files:-[]}" --argjson colors "${colors}" \
+      '{pad:$pad, roster:$roster, files:$files, colors:$colors}' 2>/dev/null \
       | api -X POST "$RELAY/push?pad=$name" --data-binary @- >/dev/null || true
     # drain phone→pad messages for this pad, inject via stitchpad say
     out="$(api "$RELAY/outbox?pad=$name" 2>/dev/null || echo '{"messages":[]}')"
