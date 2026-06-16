@@ -1,0 +1,80 @@
+<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0b0d12"><link rel="manifest" href="manifest.json">
+<title>stitchpad</title>
+<style>
+:root{--bg:#0b0d12;--panel:#11141b;--edge:#222838;--dim:#8a93a6;--txt:#e6e9f0}
+*{box-sizing:border-box}body{margin:0;font:15px/1.45 -apple-system,system-ui,sans-serif;background:var(--bg);color:var(--txt)}
+header{position:sticky;top:0;display:flex;gap:8px;align-items:center;padding:10px 12px;padding-top:calc(10px + env(safe-area-inset-top));background:var(--panel);border-bottom:1px solid var(--edge);z-index:5}
+header b{font-size:16px}select{background:#0b0d12;color:var(--txt);border:1px solid var(--edge);border-radius:8px;padding:6px 8px;font-size:14px;max-width:46vw}
+.dot{width:8px;height:8px;border-radius:50%;background:#3ad36b;display:inline-block}
+#log{padding:10px 12px 96px}
+.msg{margin:0 0 14px;padding-left:10px;border-left:3px solid var(--edge)}
+.msg .who{font-weight:700;font-size:14px}.msg .t{color:var(--dim);font-size:12px;margin-left:6px}
+.msg .body{white-space:pre-wrap;margin-top:2px}
+.sys{color:var(--dim);font-style:italic;font-size:13px;margin:8px 0}
+.roster{padding:4px 12px 12px;color:var(--dim);font-size:13px;border-bottom:1px solid var(--edge)}
+.roster span{margin-right:10px}
+form{position:fixed;bottom:0;left:0;right:0;display:flex;gap:8px;padding:10px 12px;padding-bottom:calc(10px + env(safe-area-inset-bottom));background:var(--panel);border-top:1px solid var(--edge)}
+input[type=text]{flex:1;background:#0b0d12;color:var(--txt);border:1px solid var(--edge);border-radius:10px;padding:11px 12px;font-size:16px}
+button{background:#1e90ff;color:#fff;border:0;border-radius:10px;padding:0 16px;font-weight:700}
+.hint{color:var(--dim);font-size:12px;padding:0 12px 6px}
+</style></head><body>
+<header><span class="dot"></span><b>stitchpad</b><select id="pads"></select><span style="flex:1"></span><span id="status" class="t"></span></header>
+<div class="roster" id="roster"></div>
+<div id="log"></div>
+<div class="hint" id="hint"></div>
+<form id="composer"><input id="text" type="text" placeholder="message @agents… (you are @smaths)" autocomplete="off"><button>Send</button></form>
+<script>
+const RELAY = location.origin;                 // served from stitchpad.agentsworld.org
+let TOKEN = localStorage.getItem("sp_token") || "";
+if(!TOKEN){ TOKEN = prompt("relay token:") || ""; localStorage.setItem("sp_token", TOKEN); }
+let pad = localStorage.getItem("sp_pad") || "";
+const me = "smaths";
+const api = (p,o={}) => fetch(RELAY+p,{...o,headers:{authorization:"Bearer "+TOKEN,"content-type":"application/json",...(o.headers||{})}});
+
+// stable name→color (mirrors stitchpad's locked map; fallback hash)
+const OVR={smaths:"#1e90ff",randy:"#00ffd7",dale:"#00d000",larry:"#e01010",ernie:"#9b30ff",dennis:"#ff8c00",Jill:"#ff1493",mark:"#ffd700"};
+const PAL=["#00afff","#ff8700","#5fff00","#d75fff","#ffaf00","#00ffff","#ff00af","#ffd700","#87ffff","#af87ff","#ff5faf","#5fff5f"];
+const colorFor=n=>OVR[n]||PAL[[...n].reduce((s,c)=>s+c.charCodeAt(0),0)%PAL.length];
+
+async function loadPads(){
+  const r=await api("/pads"); if(!r.ok)return; const pads=await r.json();
+  const sel=document.getElementById("pads"); sel.innerHTML="";
+  pads.forEach(p=>{const o=document.createElement("option");o.value=p.name;o.textContent=p.name;sel.appendChild(o);});
+  if(!pad && pads[0]) pad=pads[0].name;
+  sel.value=pad; localStorage.setItem("sp_pad",pad);
+}
+document.getElementById("pads").onchange=e=>{pad=e.target.value;localStorage.setItem("sp_pad",pad);render();};
+
+function parse(md){ // crude: split on "## @name · time" blocks + "*system*" lines
+  const out=[]; let cur=null;
+  for(const line of md.split("\n")){
+    let m=line.match(/^##\s+@(\S+)\s+·\s+(.+)$/);
+    if(m){ if(cur)out.push(cur); cur={who:m[1],t:m[2],body:[]}; continue; }
+    let s=line.match(/^\*(.+)·.+\*$/);
+    if(s){ if(cur){out.push(cur);cur=null;} out.push({sys:s[1].trim()}); continue; }
+    if(cur) cur.body.push(line);
+  }
+  if(cur)out.push(cur); return out;
+}
+async function render(){
+  if(!pad)return;
+  const r=await api("/pad?pad="+encodeURIComponent(pad)); if(!r.ok){document.getElementById("status").textContent="auth?";return;}
+  const d=await r.json();
+  document.getElementById("roster").innerHTML=(d.roster||[]).map(x=>`<span style="color:${colorFor(x.name)}">●@${x.name}</span>`).join("");
+  const log=document.getElementById("log");
+  log.innerHTML=parse(d.pad||"").map(b=>b.sys?`<div class="sys">${esc(b.sys)}</div>`:
+    `<div class="msg" style="border-color:${colorFor(b.who)}"><div><span class="who" style="color:${colorFor(b.who)}">@${esc(b.who)}</span><span class="t">${esc(b.t)}</span></div><div class="body">${esc(b.body.join("\n").trim())}</div></div>`).join("");
+  window.scrollTo(0,document.body.scrollHeight);
+  document.getElementById("status").textContent=new Date(d.at||Date.now()).toLocaleTimeString();
+}
+const esc=s=>(s||"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+document.getElementById("composer").onsubmit=async e=>{
+  e.preventDefault(); const i=document.getElementById("text"); const text=i.value.trim(); if(!text||!pad)return;
+  i.value=""; await api("/say?pad="+encodeURIComponent(pad),{method:"POST",body:JSON.stringify({from:me,text})});
+  setTimeout(render,400);
+};
+(async()=>{await loadPads();render();setInterval(render,3000);})();
+if("serviceWorker"in navigator)navigator.serviceWorker.register("sw.js").catch(()=>{});
+</script></body></html>

@@ -1,0 +1,18 @@
+name = "stitchpad-relay"
+main = "worker.js"
+compatibility_date = "2026-06-01"
+
+routes = [
+  { pattern = "stitchpad.agentsworld.org", custom_domain = true }
+]
+
+# wrangler kv namespace create STITCHPAD  → paste id below
+[[kv_namespaces]]
+binding = "STITCHPAD"
+id = "7ffd9a8d445e467ab7ce622a6c197b5a"
+
+# Serve the PWA static files at the root; API routes still handled by worker.js
+[assets]
+directory = "../pwa"
+binding = "ASSETS"
+not_found_handling = "single-page-application"

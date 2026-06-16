@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# stitchpad relay bridge — runs on the Mac. Mirrors EVERY local stitchpad up to
+# the Cloudflare relay (keyed by pad name = directory basename), and drains each
+# pad's phone→pad queue back into the real pad via `stitchpad say` (which the
+# watcher then wakes agents from). The CLI stays the source of truth.
+#
+#   STITCHPAD_RELAY=https://stitchpad.agentsworld.org \
+#   STITCHPAD_TOKEN=<secret> \
+#   stitchpad-bridge [roots...]      # roots to scan for .stitchpad dirs (default: ~ )
+set -uo pipefail
+RELAY="${STITCHPAD_RELAY:?set STITCHPAD_RELAY}"
+TOKEN="${STITCHPAD_TOKEN:?set STITCHPAD_TOKEN}"
+ROOTS=("${@:-$HOME}")
+SP="$(command -v stitchpad || echo "$HOME/.stitchpad/bin/stitchpad")"
+INTERVAL="${STITCHPAD_BRIDGE_INTERVAL:-3}"
+
+api() { curl -fsS -H "authorization: Bearer $TOKEN" -H "content-type: application/json" "$@"; }
+
+# find all .stitchpad pads under the roots (skip the ~/.stitchpad install symlink)
+find_pads() {
+  for r in "${ROOTS[@]}"; do
+    find "$r" -maxdepth 4 -type d -name .stitchpad 2>/dev/null
+  done | grep -v "/.stitchpad/.stitchpad" | sort -u
+}
+
+echo "[bridge] relay=$RELAY  interval=${INTERVAL}s  scanning: ${ROOTS[*]}"
+while :; do
+  while IFS= read -r padd; do
+    [ -f "$padd/stitchpad.md" ] || continue
+    name="$(basename "$(dirname "$padd")")"            # pad name = project dir
+    md="$(cat "$padd/stitchpad.md")"
+    roster="$(cd "$(dirname "$padd")" && "$SP" roster 2>/dev/null | awk -F'|' '{printf "%s{\"name\":\"%s\",\"adapter\":\"%s\"}", (NR>1?",":""), $1, $2}')"
+    # push this pad up (markdown + roster)
+    jq -nc --arg pad "$md" --argjson roster "[${roster}]" '{pad:$pad, roster:$roster}' 2>/dev/null \
+      | api -X POST "$RELAY/push?pad=$name" --data-binary @- >/dev/null || true
+    # drain phone→pad messages for this pad, inject via stitchpad say
+    out="$(api "$RELAY/outbox?pad=$name" 2>/dev/null || echo '{"messages":[]}')"
+    echo "$out" | jq -c '.messages[]?' 2>/dev/null | while IFS= read -r m; do
+      from="$(echo "$m" | jq -r '.from')"; text="$(echo "$m" | jq -r '.text')"
+      ( cd "$(dirname "$padd")" && STITCHPAD_NAME="$from" "$SP" say "$text" >/dev/null 2>&1 ) || true
+      echo "[bridge] $name ← @$from: ${text:0:50}"
+    done
+  done < <(find_pads)
+  sleep "$INTERVAL"
+done
