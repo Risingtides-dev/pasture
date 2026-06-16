@@ -249,8 +249,10 @@ function renderClaimBar(){
 function renderDMList(){
   const el=document.getElementById("dmlist"); if(!el)return;
   el.innerHTML=ROSTER.filter(n=>n!==me).map(n=>{
-    const st=ROSTER_INFO[n]||{}, online=(st.status==="online"||st.live==="online");
-    const dot=`<span class="sdot" style="background:${online?"#2ea043":"#6b7280"}"></span>`;
+    // status vocab is working|available|dnd (from the profiles blob), not "online"
+    const pst=(PROFILES[n]||{}).status||"available";
+    const dotcol = pst==="working" ? "#2ea043" : pst==="dnd" ? "#d29922" : "#6b7280";
+    const dot=`<span class="sdot" style="background:${dotcol}"></span>`;
     return `<div class="chan dm-item${dmWith===n?" on":""}" data-dm="${esc(n)}">`+
       `<div class="dmav" style="background:${colorFor(n)};color:${initInk(n)}"><img src="avatars/${encodeURIComponent(n)}.png" alt="" onerror="this.remove()"><span>${initials(n)}</span></div>`+
       `${dot}${esc(n)}</div>`;
