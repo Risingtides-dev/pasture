@@ -1,1 +1,32 @@
-tui.sh
+#!/usr/bin/env bash
+# stitchpad-tui — launches the Ratatui (Rust) client. Builds it on first run /
+# when stale, falls back to the legacy bash TUI (tui.sh) if cargo/rust is missing
+# or the build fails. Run from a pad dir (it reads ./.stitchpad/stitchpad.md).
+set -uo pipefail
+_src="${BASH_SOURCE[0]}"; while [ -h "$_src" ]; do
+  _dir="$(cd -P "$(dirname "$_src")" && pwd)"; _src="$(readlink "$_src")"
+  [ "${_src#/}" = "$_src" ] && _src="$_dir/$_src"
+done
+BIN_DIR="$(cd -P "$(dirname "$_src")" && pwd)"
+HOME_DIR="$(cd -P "$BIN_DIR/.." && pwd)"          # tool/
+RS_DIR="$HOME_DIR/tui-rs"
+RS_BIN="$RS_DIR/target/debug/stitchpad-tui"
+
+fallback() { exec bash "$BIN_DIR/tui.sh" "$@"; }
+
+# No rust toolchain → legacy.
+command -v cargo >/dev/null 2>&1 || fallback "$@"
+[ -d "$RS_DIR" ] || fallback "$@"
+
+# Build if missing or sources newer than the binary (cheap incremental).
+need_build=0
+[ -x "$RS_BIN" ] || need_build=1
+if [ -x "$RS_BIN" ] && [ -n "$(find "$RS_DIR/src" "$RS_DIR/Cargo.toml" -newer "$RS_BIN" 2>/dev/null)" ]; then
+  need_build=1
+fi
+if [ "$need_build" -eq 1 ]; then
+  echo "stitchpad-tui: building ratatui client…" >&2
+  ( cd "$RS_DIR" && cargo build 2>&1 | tail -3 >&2 ) || { echo "stitchpad-tui: rust build failed → legacy TUI" >&2; fallback "$@"; }
+fi
+[ -x "$RS_BIN" ] || fallback "$@"
+exec "$RS_BIN" "$@"
