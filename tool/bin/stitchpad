@@ -5,6 +5,7 @@
 #   stitchpad join <name> <adapter> [wake] [target]   add a participant to the roster
 #   STITCHPAD_NAME=<you> stitchpad say <text...>   post a message (auto-commits)
 #   stitchpad read [-n N]                 print the recent conversation (plain)
+#   stitchpad meta set|get <name> <key> [value] runtime/model metadata
 #   stitchpad dnd on|off [--drain]|status silence/resume wake delivery
 #   stitchpad wake [name] [--peek]        print new @name messages since last drain
 #   stitchpad watch                       run the daemon (foreground)
@@ -178,6 +179,42 @@ EOF
     sp_commit "$from: $(printf '%s' "$text" | tr '\n' ' ' | cut -c1-60)"
     sp_unlock
     echo "✓ posted as @$from"
+    ;;
+
+  meta)
+    # Runtime/model metadata used by TUI clients.
+    #   stitchpad meta set <name> <runtime|harness|model> <value...>
+    #   stitchpad meta get <name> <runtime|harness|model>
+    sp_init_paths || exit 1
+    sub="${1:-}"; shift || true
+    case "$sub" in
+      set)
+        who="${1:?usage: stitchpad meta set <name> <runtime|harness|model> <value...>}"
+        key="${2:?metadata key required}"
+        shift 2 || true
+        case "$key" in
+          runtime|harness|model) ;;
+          *) echo "stitchpad: metadata key must be runtime, harness, or model" >&2; exit 1 ;;
+        esac
+        value="$*"
+        [ -n "$value" ] || { echo "stitchpad: metadata value required" >&2; exit 1; }
+        printf '%s' "$value" > "$PAD_STATE/$key.$who"
+        echo "✓ @$who $key=$value"
+        ;;
+      get)
+        who="${1:?usage: stitchpad meta get <name> <runtime|harness|model>}"
+        key="${2:?metadata key required}"
+        case "$key" in
+          runtime|harness|model) ;;
+          *) echo "stitchpad: metadata key must be runtime, harness, or model" >&2; exit 1 ;;
+        esac
+        cat "$PAD_STATE/$key.$who" 2>/dev/null || true
+        ;;
+      *)
+        echo "usage: stitchpad meta set|get <name> <runtime|harness|model> [value]" >&2
+        exit 1
+        ;;
+    esac
     ;;
 
   read)
@@ -504,9 +541,23 @@ for os_win in data:
         (( err++ ))
       fi
 
+      # Detect harness (runtime + model) from kitty window
+      _harness=""
+      if [ "$_adapter" = "kitty" ] && [ "$_target" != "-" ] && [ -n "$_target" ]; then
+        _sock="${_target%%@@*}"; _win="${_target##*@@}"
+        _sock="${_sock#unix:}"
+        if [ -n "$_sock" ] && [ -n "$_win" ]; then
+          _harness="$("$STITCHPAD_HOME/bin/stitchpad-harness" "unix:$_sock" "$_win" 2>/dev/null || echo "unknown")"
+        fi
+      fi
+
       # Report
       if [ ${#issues[@]} -eq 0 ]; then
-        printf '  ✓ @%s (%s/%s) — healthy\n' "$_name" "$_adapter" "$_wake"
+        if [ -n "$_harness" ]; then
+          printf '  ✓ @%s (%s/%s) %s — healthy\n' "$_name" "$_adapter" "$_wake" "$_harness"
+        else
+          printf '  ✓ @%s (%s/%s) — healthy\n' "$_name" "$_adapter" "$_wake"
+        fi
       else
         for _issue in "${issues[@]}"; do
           if [[ "$_issue" == *"stale"* ]] || [[ "$_issue" == *"duplicate"* ]]; then
