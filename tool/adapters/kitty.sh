@@ -74,8 +74,29 @@ except: print(False)' "$win" 2>/dev/null)"
   fi
 fi
 
-# Short, metacharacter-free nudge; the pad holds the detail, the agent reads it.
-nudge="stitchpad: @$to you were pinged — read .stitchpad/stitchpad.md and reply with a line starting @whoever-pinged-you"
+# Context-rich nudge: carry WHO pinged + WHAT they said, so the wake is a
+# notification not a blind bell. Pull the latest block addressed to @$to from the
+# pad, take its author + a short snippet. Sanitize hard (strip anything that could
+# break send-text: quotes, backticks, newlines, control chars) and truncate. Falls
+# back to the generic line if extraction yields nothing.
+ctx="$(awk -v who="$to" '
+  function flush(){ if(author!="" && author!=who && hit){ la=author; lb=buf } }
+  BEGIN{ mention="(^|[^a-z0-9_-])@" tolower(who) "([^a-z0-9_-]|$)" }
+  /^## @/{ flush(); a=$2; sub(/^@/,"",a); author=tolower(a); buf=""; hit=0; next }
+  {
+    if (tolower($0) ~ mention) hit=1
+    if (buf=="" && $0 ~ /[^ \t]/) buf=$0   # first non-empty body line of the block
+  }
+  END{ flush(); if(la!="") print la "\t" lb }
+' "$pad_md" 2>/dev/null)"
+sender="${ctx%%$'\t'*}"; snip="${ctx#*$'\t'}"
+# sanitize snippet: collapse whitespace, drop chars that break send-text, cap length
+snip="$(printf '%s' "$snip" | tr -d '\r\n`"'"'"'\\' | tr -s ' ' | cut -c1-120)"
+if [ -n "$sender" ] && [ -n "$snip" ]; then
+  nudge="stitchpad: NEW from @$sender — $snip — reply with @$sender (read .stitchpad/stitchpad.md for full context)"
+else
+  nudge="stitchpad: @$to you were pinged — read .stitchpad/stitchpad.md and reply with a line starting @whoever-pinged-you"
+fi
 
 # Submit in two steps: send-text drops the line in the prompt, then a SEPARATE
 # send-key enter actually submits it. A trailing \r in send-text does NOT submit
