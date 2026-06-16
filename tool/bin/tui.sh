@@ -13,13 +13,9 @@ BIN_DIR="$(cd -P "$(dirname "$_src")" && pwd)"
 source "$BIN_DIR/lib.sh"
 sp_init_paths || { echo "no .stitchpad here"; exit 1; }
 
-# 256-color palette assigned per author deterministically.
-declare -a PALETTE=(39 208 76 170 214 51 199 220 123 141 203 80)
-color_for() {  # stable color from name hash
-  local s="$1" sum=0 i
-  for ((i=0; i<${#s}; i++)); do printf -v o '%d' "'${s:i:1}"; sum=$((sum + o)); done
-  echo "${PALETTE[$((sum % ${#PALETTE[@]}))]}"
-}
+# Author colors: use the SHARED collision-aware sp_color_for from lib.sh so the
+# pad and the kitty windows always agree (one source of truth, all-distinct).
+color_for() { sp_color_for "$1"; }
 c()    { printf '\033[38;5;%sm' "$1"; }
 dim()  { printf '\033[2m'; }
 bold() { printf '\033[1m'; }
