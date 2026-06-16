@@ -1,80 +1,113 @@
 <!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="theme-color" content="#0b0d12"><link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#1a1d29"><link rel="manifest" href="manifest.json">
 <title>stitchpad</title>
 <style>
-:root{--bg:#0b0d12;--panel:#11141b;--edge:#222838;--dim:#8a93a6;--txt:#e6e9f0}
-*{box-sizing:border-box}body{margin:0;font:15px/1.45 -apple-system,system-ui,sans-serif;background:var(--bg);color:var(--txt)}
-header{position:sticky;top:0;display:flex;gap:8px;align-items:center;padding:10px 12px;padding-top:calc(10px + env(safe-area-inset-top));background:var(--panel);border-bottom:1px solid var(--edge);z-index:5}
-header b{font-size:16px}select{background:#0b0d12;color:var(--txt);border:1px solid var(--edge);border-radius:8px;padding:6px 8px;font-size:14px;max-width:46vw}
-.dot{width:8px;height:8px;border-radius:50%;background:#3ad36b;display:inline-block}
-#log{padding:10px 12px 96px}
-.msg{margin:0 0 14px;padding-left:10px;border-left:3px solid var(--edge)}
-.msg .who{font-weight:700;font-size:14px}.msg .t{color:var(--dim);font-size:12px;margin-left:6px}
-.msg .body{white-space:pre-wrap;margin-top:2px}
-.sys{color:var(--dim);font-style:italic;font-size:13px;margin:8px 0}
-.roster{padding:4px 12px 12px;color:var(--dim);font-size:13px;border-bottom:1px solid var(--edge)}
-.roster span{margin-right:10px}
-form{position:fixed;bottom:0;left:0;right:0;display:flex;gap:8px;padding:10px 12px;padding-bottom:calc(10px + env(safe-area-inset-bottom));background:var(--panel);border-top:1px solid var(--edge)}
-input[type=text]{flex:1;background:#0b0d12;color:var(--txt);border:1px solid var(--edge);border-radius:10px;padding:11px 12px;font-size:16px}
-button{background:#1e90ff;color:#fff;border:0;border-radius:10px;padding:0 16px;font-weight:700}
-.hint{color:var(--dim);font-size:12px;padding:0 12px 6px}
+:root{
+  --sidebar:#19171d;--sidebar-2:#3f0e40;--col:#1a1d29;--panel:#222529;--hover:#27292e;
+  --edge:#2c2f36;--txt:#e8e8e9;--dim:#9a9ca1;--active:#1164a3;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%;font:15px/1.46 -apple-system,system-ui,"Segoe UI",sans-serif;background:var(--col);color:var(--txt);overflow:hidden}
+#app{display:flex;height:100dvh}
+#side{width:64px;flex:0 0 64px;background:var(--sidebar);display:flex;flex-direction:column;align-items:center;padding-top:env(safe-area-inset-top)}
+#side .ws{width:40px;height:40px;border-radius:12px;background:#611f69;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:800;margin:12px 0}
+#chans{flex:0 0 230px;width:230px;background:var(--sidebar-2);display:flex;flex-direction:column;color:#cfc3d0;padding-top:env(safe-area-inset-top)}
+#chans h1{font-size:18px;font-weight:800;color:#fff;padding:14px 16px 10px;margin:0;border-bottom:1px solid #532753;display:flex;align-items:center;gap:6px}
+.sect{color:#b29fb3;font-size:13px;font-weight:600;padding:14px 16px 4px}
+.chan{display:flex;align-items:center;gap:8px;padding:5px 16px;cursor:pointer;font-size:15px;color:#cfc3d0}
+.chan:hover{background:#4a214b}
+.chan.on{background:var(--active);color:#fff;font-weight:600}
+.chan .h{opacity:.65;font-weight:400}
+#main{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--col)}
+#top{display:flex;align-items:center;gap:8px;padding:12px 16px;padding-top:calc(12px + env(safe-area-inset-top));border-bottom:1px solid var(--edge)}
+#top .name{font-weight:800;font-size:17px}#top .meta{color:var(--dim);font-size:13px}
+#log{flex:1;overflow-y:auto;padding:12px 0 8px}
+.row{display:flex;gap:10px;padding:7px 16px}
+.row:hover{background:var(--hover)}
+.av{width:36px;height:36px;border-radius:9px;flex:0 0 36px;display:flex;align-items:center;justify-content:center;font-weight:800;color:#fff;font-size:14px}
+.bubble{min-width:0;flex:1}
+.bubble .hd{display:flex;align-items:baseline;gap:8px}
+.bubble .who{font-weight:800}.bubble .ts{color:var(--dim);font-size:12px}
+.bubble .bd{white-space:pre-wrap;word-wrap:break-word;margin-top:1px}
+.bubble .bd a{color:#1d9bd1}
+.bubble code{background:#1e2129;border:1px solid var(--edge);border-radius:5px;padding:1px 5px;font-size:13px}
+.bubble pre{background:#1e2129;border:1px solid var(--edge);border-radius:8px;padding:10px;overflow:auto;font-size:13px;margin:6px 0}
+.sys{color:var(--dim);font-style:italic;font-size:13px;padding:4px 16px}
+#cwrap{padding:8px 16px;padding-bottom:calc(8px + env(safe-area-inset-bottom))}
+#composer{border:1px solid #565a60;border-radius:10px;background:#222529;display:flex;align-items:flex-end}
+#composer textarea{flex:1;background:transparent;border:0;color:var(--txt);font:15px/1.4 inherit;padding:12px;resize:none;max-height:120px;outline:none}
+#composer button{background:#007a5a;color:#fff;border:0;border-radius:8px;margin:6px;padding:8px 14px;font-weight:700}
+.tags{padding:6px 2px 0;color:var(--dim);font-size:12px}
+#hamb{display:none;font-size:20px;background:0;border:0;color:var(--txt)}
+@media(max-width:560px){#side{display:none}#chans{position:absolute;z-index:9;height:100%;flex-basis:0;width:0;overflow:hidden;transition:width .2s}#chans.open{width:80vw}#hamb{display:block}}
 </style></head><body>
-<header><span class="dot"></span><b>stitchpad</b><select id="pads"></select><span style="flex:1"></span><span id="status" class="t"></span></header>
-<div class="roster" id="roster"></div>
-<div id="log"></div>
-<div class="hint" id="hint"></div>
-<form id="composer"><input id="text" type="text" placeholder="message @agents… (you are @smaths)" autocomplete="off"><button>Send</button></form>
+<div id="app">
+  <div id="side"><div class="ws">🧵</div></div>
+  <div id="chans">
+    <h1>🧵 stitchpad</h1>
+    <div class="sect">Stitchpads</div>
+    <div id="chanlist"></div>
+  </div>
+  <div id="main">
+    <div id="top"><button id="hamb">☰</button><span class="name" id="chTitle"># …</span><span class="meta" id="chMeta"></span></div>
+    <div id="log"></div>
+    <div id="cwrap"><div id="composer"><textarea id="text" rows="1" placeholder="Message…"></textarea><button id="send">➤</button></div><div class="tags" id="tags">you are @smaths · type @name to address agents</div></div>
+  </div>
+</div>
 <script>
-const RELAY = location.origin;                 // served from stitchpad.agentsworld.org
-let TOKEN = localStorage.getItem("sp_token") || "";
-if(!TOKEN){ TOKEN = prompt("relay token:") || ""; localStorage.setItem("sp_token", TOKEN); }
-let pad = localStorage.getItem("sp_pad") || "";
-const me = "smaths";
-const api = (p,o={}) => fetch(RELAY+p,{...o,headers:{authorization:"Bearer "+TOKEN,"content-type":"application/json",...(o.headers||{})}});
-
-// stable name→color (mirrors stitchpad's locked map; fallback hash)
+const RELAY=location.origin, me="smaths";
+let TOKEN=localStorage.getItem("sp_token")||""; if(!TOKEN){TOKEN=prompt("relay token:")||"";localStorage.setItem("sp_token",TOKEN);}
+let pad=localStorage.getItem("sp_pad")||"";
+const api=(p,o={})=>fetch(RELAY+p,{...o,headers:{authorization:"Bearer "+TOKEN,"content-type":"application/json",...(o.headers||{})}});
 const OVR={smaths:"#1e90ff",randy:"#00ffd7",dale:"#00d000",larry:"#e01010",ernie:"#9b30ff",dennis:"#ff8c00",Jill:"#ff1493",mark:"#ffd700"};
 const PAL=["#00afff","#ff8700","#5fff00","#d75fff","#ffaf00","#00ffff","#ff00af","#ffd700","#87ffff","#af87ff","#ff5faf","#5fff5f"];
-const colorFor=n=>OVR[n]||PAL[[...n].reduce((s,c)=>s+c.charCodeAt(0),0)%PAL.length];
-
+const colorFor=n=>OVR[n]||PAL[[...(n||"")].reduce((s,c)=>s+c.charCodeAt(0),0)%PAL.length];
+const esc=s=>(s||"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+const initials=n=>(n||"?").slice(0,2).toUpperCase();
+function fmt(t){
+  t=esc(t);
+  t=t.replace(/```([\s\S]*?)```/g,(m,c)=>`<pre>${c.trim()}</pre>`);
+  t=t.replace(/`([^`]+)`/g,'<code>$1</code>');
+  t=t.replace(/\*\*([^*]+)\*\*/g,'<b>$1</b>');
+  t=t.replace(/(https?:\/\/[^\s]+)/g,'<a href="$1" target="_blank" rel="noopener">$1</a>');
+  t=t.replace(/(^|[\s(])@([a-zA-Z0-9_-]+)/g,(m,p,n)=>`${p}<b style="color:${colorFor(n)}">@${n}</b>`);
+  return t;
+}
 async function loadPads(){
-  const r=await api("/pads"); if(!r.ok)return; const pads=await r.json();
-  const sel=document.getElementById("pads"); sel.innerHTML="";
-  pads.forEach(p=>{const o=document.createElement("option");o.value=p.name;o.textContent=p.name;sel.appendChild(o);});
-  if(!pad && pads[0]) pad=pads[0].name;
-  sel.value=pad; localStorage.setItem("sp_pad",pad);
+  const r=await api("/pads"); if(!r.ok){document.getElementById("chMeta").textContent="auth?";return;}
+  const pads=await r.json(); const cl=document.getElementById("chanlist"); cl.innerHTML="";
+  if(!pad&&pads[0])pad=pads[0].name;
+  pads.forEach(p=>{const d=document.createElement("div");d.className="chan"+(p.name===pad?" on":"");
+    d.innerHTML=`<span class="h">#</span>${esc(p.name)}`;
+    d.onclick=()=>{pad=p.name;localStorage.setItem("sp_pad",pad);document.getElementById("chans").classList.remove("open");render();loadPads();};
+    cl.appendChild(d);});
 }
-document.getElementById("pads").onchange=e=>{pad=e.target.value;localStorage.setItem("sp_pad",pad);render();};
-
-function parse(md){ // crude: split on "## @name · time" blocks + "*system*" lines
-  const out=[]; let cur=null;
-  for(const line of md.split("\n")){
+function parse(md){const out=[];let cur=null;
+  for(const line of (md||"").split("\n")){
     let m=line.match(/^##\s+@(\S+)\s+·\s+(.+)$/);
-    if(m){ if(cur)out.push(cur); cur={who:m[1],t:m[2],body:[]}; continue; }
-    let s=line.match(/^\*(.+)·.+\*$/);
-    if(s){ if(cur){out.push(cur);cur=null;} out.push({sys:s[1].trim()}); continue; }
-    if(cur) cur.body.push(line);
-  }
-  if(cur)out.push(cur); return out;
-}
+    if(m){if(cur)out.push(cur);cur={who:m[1],t:m[2],body:[]};continue;}
+    let s=line.match(/^\*(.+?)·.+\*$/);
+    if(s){if(cur){out.push(cur);cur=null;}out.push({sys:s[1].trim()});continue;}
+    if(cur)cur.body.push(line);
+  } if(cur)out.push(cur); return out;}
 async function render(){
   if(!pad)return;
-  const r=await api("/pad?pad="+encodeURIComponent(pad)); if(!r.ok){document.getElementById("status").textContent="auth?";return;}
-  const d=await r.json();
-  document.getElementById("roster").innerHTML=(d.roster||[]).map(x=>`<span style="color:${colorFor(x.name)}">●@${x.name}</span>`).join("");
-  const log=document.getElementById("log");
-  log.innerHTML=parse(d.pad||"").map(b=>b.sys?`<div class="sys">${esc(b.sys)}</div>`:
-    `<div class="msg" style="border-color:${colorFor(b.who)}"><div><span class="who" style="color:${colorFor(b.who)}">@${esc(b.who)}</span><span class="t">${esc(b.t)}</span></div><div class="body">${esc(b.body.join("\n").trim())}</div></div>`).join("");
-  window.scrollTo(0,document.body.scrollHeight);
-  document.getElementById("status").textContent=new Date(d.at||Date.now()).toLocaleTimeString();
+  document.getElementById("chTitle").textContent="# "+pad;
+  const r=await api("/pad?pad="+encodeURIComponent(pad)); if(!r.ok)return; const d=await r.json();
+  document.getElementById("chMeta").textContent=(d.roster||[]).length+" members";
+  const log=document.getElementById("log"), atBottom=log.scrollHeight-log.scrollTop-log.clientHeight<80;
+  log.innerHTML=parse(d.pad).map(b=>b.sys?`<div class="sys">${esc(b.sys)}</div>`:
+    `<div class="row"><div class="av" style="background:${colorFor(b.who)}">${initials(b.who)}</div><div class="bubble"><div class="hd"><span class="who" style="color:${colorFor(b.who)}">${esc(b.who)}</span><span class="ts">${esc(b.t)}</span></div><div class="bd">${fmt(b.body.join("\n").trim())}</div></div></div>`).join("");
+  if(atBottom)log.scrollTop=log.scrollHeight;
 }
-const esc=s=>(s||"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
-document.getElementById("composer").onsubmit=async e=>{
-  e.preventDefault(); const i=document.getElementById("text"); const text=i.value.trim(); if(!text||!pad)return;
-  i.value=""; await api("/say?pad="+encodeURIComponent(pad),{method:"POST",body:JSON.stringify({from:me,text})});
-  setTimeout(render,400);
-};
-(async()=>{await loadPads();render();setInterval(render,3000);})();
+const ta=document.getElementById("text");
+ta.addEventListener("input",()=>{ta.style.height="auto";ta.style.height=Math.min(ta.scrollHeight,120)+"px";});
+async function send(){const text=ta.value.trim();if(!text||!pad)return;ta.value="";ta.style.height="auto";
+  await api("/say?pad="+encodeURIComponent(pad),{method:"POST",body:JSON.stringify({from:me,text})});setTimeout(render,400);}
+document.getElementById("send").onclick=send;
+ta.addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();send();}});
+document.getElementById("hamb").onclick=()=>document.getElementById("chans").classList.toggle("open");
+(async()=>{await loadPads();render();setInterval(render,3000);setInterval(loadPads,15000);})();
 if("serviceWorker"in navigator)navigator.serviceWorker.register("sw.js").catch(()=>{});
 </script></body></html>
