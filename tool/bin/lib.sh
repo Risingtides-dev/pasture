@@ -219,7 +219,12 @@ sp_engagement() {
     /^[[:space:]]*```/ { infence = !infence; next }
     infence { next }
     # first non-empty content line decides silent-ack (leading "." or "[ack]")
-    !seen_body && /[^[:space:]]/ { seen_body=1; if ($0 ~ /^[[:space:]]*(\.|\[ack\])/) silent=1 }
+    !seen_body && /[^[:space:]]/ {
+      seen_body=1
+      b=tolower($0); sub(/^[ \t]*/,"",b); sub(/^(@[a-z0-9_-]+[ \t]*)+/,"",b); sub(/[ \t]+$/,"",b)
+      if (b ~ /^(\.|\[ack\])/) silent=1
+      if (b ~ /^(ack|read|noted|got it|standing down|standing by|stand by|will do|understood|done here|copy|sounds good)[. !]*$/) silent=1
+    }
     # Strip inline code (`...`) before appending to buffer — prevents `@name` in code
     # snippets from counting as an address. Real addresses survive because only the
     # backtick-delimited content is blanked, not the surrounding text.
