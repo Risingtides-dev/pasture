@@ -19,7 +19,9 @@ case "${1:-status}" in
     if is_running; then echo "running (pid $(cat "$PIDFILE"))"; exit 0; fi
     # Supervisor wrapper: restarts the watcher if it dies
     ( while true; do
-        PAD_DIR="$PAD_DIR" bash "$STITCHPAD_HOME/bin/watch.sh" >>"$LOG" 2>&1
+        # Pin the watcher to THIS pad regardless of cwd (STITCHPAD_PAD_DIR), so a
+        # daemon launched from any directory still watches the right stitchpad.md.
+        STITCHPAD_PAD_DIR="$PAD_DIR" bash "$STITCHPAD_HOME/bin/watch.sh" >>"$LOG" 2>&1
         echo "[stitchpad] watcher exited (code $?), restarting in 2s..." >>"$LOG"
         sleep 2
       done

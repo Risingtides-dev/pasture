@@ -36,7 +36,13 @@ sp_find_pad() {
 }
 
 sp_init_paths() {
-  PAD_DIR="$(sp_find_pad "${1:-$PWD}")" || { echo "no .stitchpad found (run: stitchpad init)" >&2; return 1; }
+  # Resolution order for which pad we operate on:
+  #   1. explicit arg ($1)            — caller passed a dir
+  #   2. STITCHPAD_PAD_DIR env        — pin a pad regardless of cwd (daemons/hooks)
+  #   3. $PWD                         — the pad under the current directory
+  # Without #2, a watcher/daemon launched from the wrong cwd silently watched the
+  # wrong pad (ocean-os's watcher latched onto stitchpad-live). Honor the pin.
+  PAD_DIR="$(sp_find_pad "${1:-${STITCHPAD_PAD_DIR:-$PWD}}")" || { echo "no .stitchpad found (run: stitchpad init)" >&2; return 1; }
   PAD_MD="$PAD_DIR/stitchpad.md"
   PAD_GIT="$PAD_DIR/stitchpad-git"
   PAD_STATE="$PAD_DIR/.state"

@@ -96,6 +96,13 @@ EOF
     fi
     # House rule for EVERY member: closeouts are silent (prevents wake ping-pong).
     echo "── house rule: to acknowledge/wind down, start the line with \".\" (e.g. \".ack ok\") — never @-reply a goodbye; an @-mention wakes that agent. ──"
+    # AUTO-WATCHER: joining a pad should make wakes work out of the box. Ensure THIS
+    # pad's watcher is running (idempotent — daemon.sh no-ops if already up). Pinned
+    # to this pad via PAD_DIR so it watches the right stitchpad.md, not $PWD's.
+    if ! (STITCHPAD_PAD_DIR="$PAD_DIR" "$STITCHPAD_HOME/bin/daemon.sh" status 2>/dev/null | grep -q running); then
+      STITCHPAD_PAD_DIR="$PAD_DIR" "$STITCHPAD_HOME/bin/daemon.sh" start >/dev/null 2>&1 \
+        && echo "── wake watcher started for this pad ──"
+    fi
     ;;
 
   clear)
@@ -134,8 +141,20 @@ EOF
     ' "$PAD_MD" > "$tmp" && mv "$tmp" "$PAD_MD"
     sp_system "@$who left the stitchpad"
     sp_commit "roster: - $who"
+    # also release any file claims and wake state this agent held
+    rm -f "$PAD_STATE/seen.$who" "$PAD_STATE/forcewake.$who" 2>/dev/null
+    for _ld in "$PAD_STATE"/claims/*.d; do
+      [ -d "$_ld" ] && read -r _h _ < "$_ld/holder" 2>/dev/null && [ "$_h" = "$who" ] && rm -rf "$_ld"
+    done
     sp_unlock
     echo "✓ $who left"
+    # AUTO-WATCHER: stop this pad's watcher once the roster is empty — no members,
+    # nothing to wake. (Counts non-operator roster lines.)
+    _remaining="$(sp_roster | grep -cv '^[[:space:]]*$' 2>/dev/null || echo 0)"
+    if [ "${_remaining:-0}" -le 0 ]; then
+      STITCHPAD_PAD_DIR="$PAD_DIR" "$STITCHPAD_HOME/bin/daemon.sh" stop >/dev/null 2>&1 \
+        && echo "── last member left — wake watcher stopped ──"
+    fi
     ;;
 
   bind-session)
