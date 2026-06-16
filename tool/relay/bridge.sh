@@ -47,8 +47,13 @@ while :; do
       _persona=""
       _skills='[]'
       _role=''
-      # Try to read persona from stitchpad install (not pad dir)
-      _persona_dir="${STITCHPAD_HOME:-$HOME/.stitchpad}/tool/personas"
+      # Try to read persona from stitchpad install (not pad dir). NOTE: ~/.stitchpad
+      # is itself a symlink to the repo's tool/ dir, so the personas live at
+      # ~/.stitchpad/personas — NOT ~/.stitchpad/tool/personas (that doubles tool/).
+      # If STITCHPAD_HOME points at the repo root, it needs /tool/personas; support both.
+      _persona_dir="${STITCHPAD_HOME:+$STITCHPAD_HOME/tool/personas}"
+      [ -z "$_persona_dir" ] || [ ! -d "$_persona_dir" ] && _persona_dir="$HOME/.stitchpad/personas"
+      [ -d "$_persona_dir" ] || _persona_dir="$HOME/.stitchpad/tool/personas"  # last-resort
       _persona_file="$_persona_dir/$(echo "$_name" | tr '[:upper:]' '[:lower:]').md"
       if [ -f "$_persona_file" ]; then
         _role="$(grep -m1 '^ROLE:' "$_persona_file" | sed 's/^ROLE:[[:space:]]*//')"
