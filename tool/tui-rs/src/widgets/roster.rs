@@ -101,11 +101,16 @@ impl RosterRail {
         let mut members = Vec::new();
 
         for line in output.lines() {
+            // Stop at "Session files:" — that's a separate section, not roster members
+            let trimmed = line.trim();
+            if trimmed.starts_with("Session files:") {
+                break;
+            }
+
             // Parse lines like:
             //   ✓ @dale (kitty/push) — healthy
             //   ⚠ @larry (kitty/push) — target '-' (no wake target, unreachable)
             //   ✗ @old-agent (kitty/push) — stale target — kitty window gone
-            let trimmed = line.trim();
             if !trimmed.starts_with("✓") && !trimmed.starts_with("⚠") && !trimmed.starts_with("✗") && !trimmed.starts_with("?") {
                 continue;
             }
