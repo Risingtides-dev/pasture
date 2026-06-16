@@ -7,3 +7,6 @@
 .stitchpad/stitchpad-git/
 .chatroom/.state/
 .chatroom/channel-git/
+
+# rust build artifacts
+tool/tui-rs/target/

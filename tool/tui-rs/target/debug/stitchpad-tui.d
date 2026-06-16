@@ -1,1 +1,0 @@
-/Users/risingtidesdev/stitchpad/tool/tui-rs/target/debug/stitchpad-tui: /Users/risingtidesdev/stitchpad/tool/tui-rs/src/main.rs /Users/risingtidesdev/stitchpad/tool/tui-rs/src/widgets/messages.rs /Users/risingtidesdev/stitchpad/tool/tui-rs/src/widgets/mod.rs /Users/risingtidesdev/stitchpad/tool/tui-rs/src/widgets/roster.rs

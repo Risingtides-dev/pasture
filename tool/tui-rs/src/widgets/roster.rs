@@ -7,8 +7,34 @@ use ratatui::{
     widgets::{Block, Borders, Widget},
 };
 
-/// Health status of a roster member
+/// Live status of a roster member
 #[derive(Debug, Clone)]
+pub enum LiveStatus {
+    Online,
+    Offline,
+    Dnd,
+}
+
+impl LiveStatus {
+    fn icon(&self) -> &str {
+        match self {
+            LiveStatus::Online => "●",
+            LiveStatus::Offline => "○",
+            LiveStatus::Dnd => "◌",
+        }
+    }
+
+    fn color(&self) -> Color {
+        match self {
+            LiveStatus::Online => Color::Green,
+            LiveStatus::Offline => Color::DarkGray,
+            LiveStatus::Dnd => Color::Yellow,
+        }
+    }
+}
+
+/// Health status of a roster member
+#[derive(Debug, Clone, PartialEq)]
 pub enum Health {
     Healthy,
     Untargeted,
@@ -39,13 +65,14 @@ impl Health {
     }
 }
 
-/// A roster member with health status
+/// A roster member with health and live status
 #[derive(Debug, Clone)]
 pub struct RosterMember {
     pub name: String,
     pub adapter: String,
     pub wake: String,
     pub health: Health,
+    pub live_status: LiveStatus,
     pub issue: Option<String>,
 }
 
@@ -126,7 +153,16 @@ impl RosterRail {
                 (Health::Unknown, Some(rest.to_string()))
             };
 
-            members.push(RosterMember { name, adapter, wake, health, issue });
+            // Determine live status (DND flag, then kitty window liveness)
+            let live_status = if std::path::Path::new(&format!(".state/dnd/{}", name)).exists() {
+                LiveStatus::Dnd
+            } else if health == Health::Healthy {
+                LiveStatus::Online
+            } else {
+                LiveStatus::Offline
+            };
+
+            members.push(RosterMember { name, adapter, wake, health, live_status, issue });
         }
 
         members
@@ -188,9 +224,11 @@ impl Widget for &RosterRail {
             };
 
             let icon_style = Style::default().fg(member.health.color());
+            let live_style = Style::default().fg(member.live_status.color());
 
             let line = Line::from(vec![
-                Span::styled(format!(" {} ", member.health.icon()), icon_style),
+                Span::styled(format!(" {} ", member.live_status.icon()), live_style),
+                Span::styled(format!("{} ", member.health.icon()), icon_style),
                 Span::styled(format!("@{}", member.name), style),
             ]);
 
