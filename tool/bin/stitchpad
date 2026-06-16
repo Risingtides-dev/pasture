@@ -235,6 +235,95 @@ EOF
     echo "✓ posted as @$from"
     ;;
 
+  claim)
+    # File-write lease: agents share one worktree, so a PreToolUse hook calls this
+    # before Edit/Write to stop two agents clobbering the same file.
+    #   stitchpad claim <file>     try to lease <file> for the current identity
+    #   stitchpad release [file]   release one file (or all my claims if omitted)
+    #   stitchpad claims           print the live who-holds-what map
+    # Lease = .state/claims/<encoded-path> holding "<name> <epoch>". A claim by ME or
+    # an UNHELD/STALE (>600s) file succeeds (exit 0); a fresh claim by someone else
+    # fails (exit 1) and auto-queues a pad ping so the holder knows to release.
+    sp_init_paths || exit 1
+    me="$(sp_me)"
+    [ -z "$me" ] && { echo "stitchpad: no identity (set STITCHPAD_NAME or join)" >&2; exit 2; }
+    file="${1:?usage: stitchpad claim <file>}"
+    # normalize to an absolute path, then encode to a flat filename
+    abs="$(cd "$(dirname "$file")" 2>/dev/null && pwd)/$(basename "$file")" || abs="$file"
+    enc="$(printf '%s' "$abs" | tr '/' '_' | tr -cd '[:alnum:]_.-')"
+    cdir="$PAD_STATE/claims"; mkdir -p "$cdir"
+    # The lease is a per-file LOCK DIR (mkdir is atomic on every POSIX fs), with the
+    # holder/ts/path written INSIDE after the acquire wins. This closes the TOCTOU
+    # that a plain `[ -f ] then > file` had — two agents can't both create the dir.
+    # (mark/larry's catch: the earlier read-then-write was racy; this is the fix.)
+    # NOTE: still ADVISORY — it only serializes writers that go through `claim`; the
+    # PreToolUse hook is the actual enforcement, git is the backstop.
+    lockd="$cdir/$enc.d"; meta="$lockd/holder"
+    now="$(date +%s)"; stale=600
+    # peek current holder (for the refresh / deny / steal decision)
+    holder=""; ts=0; _hpath=""
+    # holder file has 3 fields "name ts path" — read all 3 so the path doesn't
+    # bleed into $ts (which then breaks the arithmetic below under set -u).
+    [ -f "$meta" ] && read -r holder ts _hpath < "$meta" 2>/dev/null || true
+    if [ "$holder" = "$me" ]; then
+      printf '%s %s %s\n' "$me" "$now" "$abs" > "$meta"   # refresh my own lease
+      echo "✓ @$me holds $(basename "$abs")"; exit 0
+    fi
+    age=$(( now - ${ts:-0} ))
+    if [ -n "$holder" ] && [ "$age" -lt "$stale" ]; then
+      echo "✗ @$holder holds $(basename "$abs") (${age}s ago) — denied" >&2
+      STITCHPAD_NAME="$me" "$BIN_DIR/stitchpad" say "@$holder heads up — @$me is waiting on \`$(basename "$abs")\`; ping me when you release it." >/dev/null 2>&1 || true
+      exit 1
+    fi
+    # unheld or stale → ATOMIC acquire via mkdir. If a stale dir exists, clear it first.
+    [ -n "$holder" ] && { echo "(stealing stale lease from @$holder, ${age}s idle)" >&2; rm -rf "$lockd"; }
+    if mkdir "$lockd" 2>/dev/null; then
+      printf '%s %s %s\n' "$me" "$now" "$abs" > "$meta"
+      echo "✓ @$me claimed $(basename "$abs")"; exit 0
+    else
+      # lost the race to a concurrent claimer — re-read and deny
+      [ -f "$meta" ] && read -r holder _ < "$meta" 2>/dev/null || holder="another agent"
+      echo "✗ @$holder won the race for $(basename "$abs") — denied" >&2
+      exit 1
+    fi
+    ;;
+
+  release)
+    sp_init_paths || exit 1
+    me="$(sp_me)"; [ -z "$me" ] && exit 0
+    cdir="$PAD_STATE/claims"; [ -d "$cdir" ] || exit 0
+    if [ -n "${1:-}" ]; then
+      abs="$(cd "$(dirname "$1")" 2>/dev/null && pwd)/$(basename "$1")" || abs="$1"
+      enc="$(printf '%s' "$abs" | tr '/' '_' | tr -cd '[:alnum:]_.-')"
+      lockd="$cdir/$enc.d"
+      [ -f "$lockd/holder" ] && read -r h _ < "$lockd/holder" && [ "$h" = "$me" ] && rm -rf "$lockd" && echo "✓ released $(basename "$abs")"
+    else
+      # release ALL files I hold (called from the Stop hook at turn end)
+      for lockd in "$cdir"/*.d; do
+        [ -d "$lockd" ] || continue
+        read -r h _ < "$lockd/holder" 2>/dev/null || continue
+        [ "$h" = "$me" ] && rm -rf "$lockd"
+      done
+      echo "✓ released all @$me claims"
+    fi
+    exit 0
+    ;;
+
+  claims)
+    # Live who-holds-what map (for TUI/PWA telemetry + debugging).
+    sp_init_paths || exit 1
+    cdir="$PAD_STATE/claims"; [ -d "$cdir" ] || { echo "(no active claims)"; exit 0; }
+    now="$(date +%s)"; any=0
+    for lockd in "$cdir"/*.d; do
+      [ -d "$lockd" ] || continue
+      read -r h ts path < "$lockd/holder" 2>/dev/null || continue
+      any=1; age=$(( now - ${ts:-0} ))
+      printf '  @%-8s %4ss ago  %s\n' "$h" "$age" "${path:-$(basename "$lockd" .d | tr '_' '/')}"
+    done
+    [ "$any" -eq 0 ] && echo "(no active claims)"
+    exit 0
+    ;;
+
   meta)
     # Runtime/model metadata used by TUI clients.
     #   stitchpad meta set <name> <runtime|harness|model> <value...>
