@@ -186,15 +186,26 @@ impl MessageList {
             }
             lines.push(Line::from(header));
 
-            // body: word-wrap to width, hanging-indented under the author.
+            // body: inline-markdown → styled spans, word-wrapped, hanging-indented.
+            // an `!img: <path>` line renders as a muted placeholder (kitty icat is a
+            // later enhancement; the placeholder keeps it legible everywhere now).
             let avail = (width as usize).saturating_sub(INDENT.len()).max(8);
             for raw in &m.body {
                 if raw.trim().is_empty() {
                     lines.push(Line::from(""));
                     continue;
                 }
-                for wrapped in wrap_words(raw, avail) {
-                    lines.push(Line::from(Span::raw(format!("{}{}", INDENT, wrapped))));
+                if let Some(path) = super::markdown::image_path(raw) {
+                    lines.push(Line::from(Span::styled(
+                        format!("{}[image: {}]", INDENT, path),
+                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                    )));
+                    continue;
+                }
+                let spans = super::markdown::parse_line(raw);
+                for mut row in wrap_spans(spans, avail) {
+                    row.insert(0, Span::raw(INDENT));
+                    lines.push(Line::from(row));
                 }
             }
             // read-receipt: quiet "seen by @x @y" under the message, only if anyone has.
@@ -248,9 +259,77 @@ impl Widget for &MessageList {
     }
 }
 
+/// Wrap a styled span run to `width`, preserving each span's style. Words keep their
+/// style; wrapping happens on whitespace boundaries between styled words. An overlong
+/// single word is hard-broken (style preserved). Returns one Vec<Span> per visual row.
+fn wrap_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Vec<Span<'static>>> {
+    let width = width.max(1);
+    // explode spans into (word, style) units, splitting on whitespace within each span.
+    let mut words: Vec<(String, Style)> = Vec::new();
+    for s in spans {
+        let style = s.style;
+        let text = s.content.into_owned();
+        let mut first = true;
+        for w in text.split(' ') {
+            // split(' ') keeps empties for runs of spaces; collapse to single spacing.
+            if w.is_empty() {
+                continue;
+            }
+            // re-introduce a leading space marker by not joining — handled at pack time.
+            let _ = first;
+            first = false;
+            words.push((w.to_string(), style));
+        }
+    }
+
+    let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut row: Vec<Span<'static>> = Vec::new();
+    let mut len = 0usize;
+    for (word, style) in words {
+        let wlen = word.chars().count();
+        if wlen > width {
+            if !row.is_empty() {
+                rows.push(std::mem::take(&mut row));
+                len = 0;
+            }
+            // hard-break the long word, preserving style
+            let chars: Vec<char> = word.chars().collect();
+            let mut i = 0;
+            while i < chars.len() {
+                let end = (i + width).min(chars.len());
+                let chunk: String = chars[i..end].iter().collect();
+                rows.push(vec![Span::styled(chunk, style)]);
+                i = end;
+            }
+            continue;
+        }
+        let need = if row.is_empty() { wlen } else { len + 1 + wlen };
+        if need > width {
+            rows.push(std::mem::take(&mut row));
+            row.push(Span::styled(word, style));
+            len = wlen;
+        } else {
+            if !row.is_empty() {
+                row.push(Span::raw(" "));
+                len += 1;
+            }
+            row.push(Span::styled(word, style));
+            len += wlen;
+        }
+    }
+    if !row.is_empty() {
+        rows.push(row);
+    }
+    if rows.is_empty() {
+        rows.push(vec![Span::raw(String::new())]);
+    }
+    rows
+}
+
 /// Word-aware wrap to `width` columns. Keeps words intact; a single word longer
 /// than the line (e.g. a URL) is hard-broken so it never overflows. (char count,
 /// not grapheme — fine for chat prose.)
+#[allow(dead_code)]
 fn wrap_words(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut out: Vec<String> = Vec::new();
