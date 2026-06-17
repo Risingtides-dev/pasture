@@ -30,6 +30,20 @@
 #   RELAY_WATCH_INTERVAL   poll seconds (default 5)
 #
 # Needs only: curl, python3, kitty. Crash-safe: a bad poll logs and continues.
+
+# bash 4+ required: this script embeds python heredocs inside $(...), which bash
+# 3.2 (the macOS default /bin/bash) mis-parses (backtick/quote tracking inside a
+# $()-nested heredoc → "unexpected EOF"). Stock-macOS coworkers hit a silent
+# no-wake otherwise (henry's find). Re-exec under a modern bash if we're on 3.x.
+if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+  for _b in /opt/homebrew/bin/bash /usr/local/bin/bash "$(command -v bash 2>/dev/null)"; do
+    if [ -x "$_b" ] && "$_b" -c '[ "${BASH_VERSINFO[0]}" -ge 4 ]' 2>/dev/null; then
+      exec "$_b" "$0" "$@"
+    fi
+  done
+  echo "relay-watch: needs bash 4+ (macOS ships 3.2). Install one: brew install bash" >&2
+  exit 1
+fi
 set -uo pipefail
 
 # ── config ───────────────────────────────────────────────────────────
@@ -231,7 +245,13 @@ for i, (author, text) in enumerate(blocks, start=1):
     first = next((l for l in text.splitlines() if l.strip()), "")
     if first.strip().startswith(".") or first.strip().lower().startswith("[ack]"):
         continue
-    snip = re.sub(r'[\r\n`"\'\\]', '', first)
+    # Strip chars that break the kitty send-text nudge. Build the set with chr()
+    # so no literal backtick or quote appears in this heredoc: bash 3.2 (macOS
+    # default) mis-parses a backtick inside a dollar-paren-nested heredoc as a
+    # command substitution and dies with unexpected-EOF, causing a silent no-wake.
+    # (henry caught this from a real stock-macOS connect.)
+    _bad = set('\r\n\\' + chr(96) + chr(34) + chr(39))   # backtick, dquote, squote
+    snip = ''.join(c for c in first if c not in _bad)
     snip = re.sub(r'\s+', ' ', snip).strip()[:120]
     print(f"{i}\t{author}\t{snip}")
 print(f"MAX {maxord}")
