@@ -464,11 +464,13 @@ if (RELAY_MODE && myHandle && relayToken) {
       STITCHPAD_NAME: myHandle,
       STITCHPAD_PAD: padName,
     },
-    stdio: "ignore",
+    stdio: ["ignore", "pipe", "pipe"],
     detached: true,
-    // Don't inherit cwd — watch.sh resolves paths from env
   });
-  child.unref();  // detach — survives MCP server exit
+  child.stderr.on("data", (d) => console.error(`[relay-watch] ${d.toString().trim()}`));
+  child.on("error", (e) => console.error(`[relay-watch] spawn failed: ${e.message}`));
+  child.on("exit", (code) => console.error(`[relay-watch] exited with code ${code}`));
+  child.unref();
   console.error(`[stitchpad-mcp] relay-watch poller spawned (pid ${child.pid})`);
 }
 
