@@ -80,24 +80,33 @@ fire_adapter() {
 # react() takes NO stdin — everything inside redirects from /dev/null where it
 # might otherwise read the fswatch pipe.
 react() {
-  # Self-exit check: if ALL agents' heartbeats are stale (terminal closed), remove
-  # the lock and exit so we don't zombie. This is what keeps the 'terminal alive →
-  # watcher alive' contract.
-  local _any_alive=0
-  for _heart in "$PAD_STATE"/alive.*; do
-    [ -f "$_heart" ] || continue
-    local _hts _hpid _hage
-    _hts=$(stat -f %m "$_heart" 2>/dev/null || stat -c %Y "$_heart" 2>/dev/null || echo 0)
-    _hage=$(( $(date +%s) - _hts ))
-    [ "$_hage" -lt 90 ] || continue
-    _hpid=$(grep -o '"pid":[0-9]*' "$_heart" 2>/dev/null | head -1 | cut -d: -f2)
-    [ -n "$_hpid" ] && kill -0 "$_hpid" 2>/dev/null && { _any_alive=1; break; }
-  done
-  if [ "$_any_alive" -eq 0 ]; then
-    echo "[stitchpad] all heartbeats stale — watcher exiting"
-    rm -rf "$PAD_STATE/watch.lock.d" 2>/dev/null || true
-    exit 0
+  # KEEP-ALIVE self-exit — SAFE version. The earlier logic suicided whenever no
+  # FRESH heartbeat existed, which killed working pads whose agents predate the
+  # ticker (ocean-os, stitchpad-live both died this way). Corrected rule:
+  #   - If there are NO alive.* files at all → heartbeat system isn't populated for
+  #     this pad → DO NOT exit (absent ≠ dead). Keep running; agents still wake.
+  #   - Only exit if heartbeats EXIST but every one is stale/dead.
+  shopt -s nullglob 2>/dev/null || true
+  local _hearts=( "$PAD_STATE"/alive.* )
+  if [ "${#_hearts[@]}" -gt 0 ]; then
+    local _any_alive=0
+    for _heart in "${_hearts[@]}"; do
+      [ -f "$_heart" ] || continue
+      local _hts _hpid _hage
+      _hts=$(stat -f %m "$_heart" 2>/dev/null || stat -c %Y "$_heart" 2>/dev/null || echo 0)
+      _hage=$(( $(date +%s) - _hts ))
+      [ "$_hage" -lt 90 ] || continue
+      _hpid=$(grep -o '"pid":[0-9]*' "$_heart" 2>/dev/null | head -1 | cut -d: -f2)
+      # a heartbeat with no pid still counts as alive if its mtime is fresh
+      if [ -z "$_hpid" ] || kill -0 "$_hpid" 2>/dev/null; then _any_alive=1; break; fi
+    done
+    if [ "$_any_alive" -eq 0 ]; then
+      echo "[stitchpad] all heartbeats stale — watcher exiting"
+      rm -rf "$PAD_STATE/watch.lock.d" 2>/dev/null || true
+      exit 0
+    fi
   fi
+  # else: no heartbeat files → system not in use here → keep watching (safe default)
 
   sp_commit "update ($(date '+%H:%M:%S'))"
   local -a members=()

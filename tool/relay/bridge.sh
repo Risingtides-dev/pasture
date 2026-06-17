@@ -48,7 +48,7 @@ while :; do
       _level="$(cat "$padd/.state/level.$_name" 2>/dev/null || echo '')"
       _persona=""
       _skills='[]'
-      _role=''
+      # (do NOT blank _role here — it was just read from .state/role.<name> above)
       # Try to read persona from stitchpad install (not pad dir). NOTE: ~/.stitchpad
       # is itself a symlink to the repo's tool/ dir, so the personas live at
       # ~/.stitchpad/personas — NOT ~/.stitchpad/tool/personas (that doubles tool/).
@@ -110,8 +110,8 @@ print(json.dumps(skills))
           [ -n "$_alive_pid" ] && kill -0 "$_alive_pid" 2>/dev/null && _online="true"
         fi
       fi
-      profiles="$(echo "$profiles" | jq --arg n "$_name" --arg m "$_model" --arg r "$_role" --arg lv "$_level" --arg p "$_persona" --argjson s "${_skills:-[]}" --arg h "$_adapter" --arg st "$_status" --arg on "$_online"\
-        '. + {($n): {role:$r, level:$lv, persona:$p, skills:$s, model:$m, harness:$h, status:$st, online:$on}})')"
+      profiles="$(echo "$profiles" | jq --arg n "$_name" --arg m "$_model" --arg r "$_role" --arg lv "$_level" --arg p "$_persona" --argjson s "${_skills:-[]}" --arg h "$_adapter" --arg st "$_status" --argjson on "$_online"\
+        '. + {($n): {role:$r, level:$lv, persona:$p, skills:$s, model:$m, harness:$h, status:$st, online:$on}}')"
     done
     # push this pad up (markdown + roster + files + colors + profiles)
     jq -nc --arg pad "$md" --argjson roster "[${roster}]" --argjson files "${files:-[]}" --argjson colors "${colors}" --argjson profiles "${profiles}" \
