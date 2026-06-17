@@ -82,6 +82,12 @@ case "$cmd" in
 # name | adapter | wake(push|pull) | target
 \`\`\`
 
+## Tasks
+
+\`\`\`tasks
+# id | title | assignee | status | created
+\`\`\`
+
 ---
 EOF
     # isolated git for the pad
