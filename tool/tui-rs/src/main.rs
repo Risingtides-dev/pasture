@@ -27,6 +27,12 @@ fn main() -> io::Result<()> {
     // Create roster rail + message list
     let mut roster = widgets::roster::RosterRail::from_doctor();
     let mut messages = widgets::messages::MessageList::from_pad();
+    let mut board = widgets::tasks::TaskBoard::from_pad();
+
+    // Top-level tabs: 0=Chat (roster+messages+compose), 1=Tasks (kanban board).
+    // 't' toggles; 1/2 jump directly.
+    let mut tab: u8 = 0;
+    let tab_labels = ["Chat", "Tasks"];
 
     // Compose mode state (wires 'a' compose key; @mark builds the compose widget)
     let mut composing = false;
@@ -73,60 +79,91 @@ fn main() -> io::Result<()> {
             use ratatui::style::{Color, Style};
             use ratatui::widgets::{Block, Borders, Paragraph};
 
-            // top = main area, bottom = thin hint footer
+            // top = tab bar, middle = main area, bottom = thin hint footer
             let main_chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(3), Constraint::Length(1)])
+                .constraints([
+                    Constraint::Length(1),
+                    Constraint::Min(3),
+                    Constraint::Length(1),
+                ])
                 .split(f.area());
 
-            // left = messages, right = roster column (rail + compose box stacked)
-            let chunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
-                .split(main_chunks[0]);
+            // Tab bar: [ Chat ] [ Tasks ] — active one highlighted.
+            let tab_spans: Vec<ratatui::text::Span> = tab_labels
+                .iter()
+                .enumerate()
+                .flat_map(|(i, label)| {
+                    let style = if i as u8 == tab {
+                        Style::default().fg(Color::Black).bg(Color::Cyan)
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    };
+                    vec![
+                        ratatui::text::Span::styled(format!(" {} ", label), style),
+                        ratatui::text::Span::raw(" "),
+                    ]
+                })
+                .collect();
+            f.render_widget(
+                Paragraph::new(ratatui::text::Line::from(tab_spans)),
+                main_chunks[0],
+            );
 
-            // right column: roster on top, PROMPT box pinned to the bottom.
-            let right = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(10), Constraint::Length(8)])
-                .split(chunks[1]);
-
-            // Message list (live-tail, scrollable)
-            f.render_widget(&messages, chunks[0]);
-            // Roster rail
-            f.render_widget(&roster, right[0]);
-
-            // Prompt box — under the roster. Type @names to address agents, Enter sends.
-            let (title, body, border) = if composing {
-                (
-                    " Prompt  Enter=send  Esc=cancel ",
-                    format!("{}\n_", compose_buf),
-                    Color::Cyan,
-                )
+            if tab == 1 {
+                // Tasks tab: full-width kanban board.
+                f.render_widget(&board, main_chunks[1]);
             } else {
-                (
-                    " Prompt ",
-                    "Press a to compose\nStart with @name to wake agents\n\n".to_string(),
-                    Color::DarkGray,
-                )
-            };
-            let compose = Paragraph::new(body)
-                .style(Style::default().fg(if composing { Color::White } else { Color::Gray }))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(title)
-                        .border_style(Style::default().fg(border)),
-                )
-                .wrap(ratatui::widgets::Wrap { trim: false });
-            f.render_widget(compose, right[1]);
+                // Chat tab: left = messages, right = roster column (rail + compose).
+                let chunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+                    .split(main_chunks[1]);
+
+                let right = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(10), Constraint::Length(8)])
+                    .split(chunks[1]);
+
+                f.render_widget(&messages, chunks[0]);
+                f.render_widget(&roster, right[0]);
+
+                // Prompt box — under the roster. Type @names to address agents, Enter sends.
+                let (title, body, border) = if composing {
+                    (
+                        " Prompt  Enter=send  Esc=cancel ",
+                        format!("{}\n_", compose_buf),
+                        Color::Cyan,
+                    )
+                } else {
+                    (
+                        " Prompt ",
+                        "Press a to compose\nStart with @name to wake agents\n\n".to_string(),
+                        Color::DarkGray,
+                    )
+                };
+                let compose = Paragraph::new(body)
+                    .style(Style::default().fg(if composing { Color::White } else { Color::Gray }))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(title)
+                            .border_style(Style::default().fg(border)),
+                    )
+                    .wrap(ratatui::widgets::Wrap { trim: false });
+                f.render_widget(compose, right[1]);
+            }
 
             // thin bottom hint
-            let footer = Paragraph::new(format!(
-                "q:quit  a:compose  Tab:focus[{}]  j/k:nav  r:refresh",
-                focus_labels[focus as usize]
-            ));
-            f.render_widget(footer, main_chunks[1]);
+            let footer = Paragraph::new(if tab == 1 {
+                "q:quit  t/1/2:tab  j/k:nav  r:refresh".to_string()
+            } else {
+                format!(
+                    "q:quit  t/1/2:tab  a:compose  Tab:focus[{}]  j/k:nav  r:refresh",
+                    focus_labels[focus as usize]
+                )
+            });
+            f.render_widget(footer, main_chunks[2]);
         })?;
 
         // Handle input
@@ -160,37 +197,47 @@ fn main() -> io::Result<()> {
                     } else {
                         match key.code {
                             KeyCode::Char('q') => break,
-                            KeyCode::Char('a') => {
+                            // Tab switching: 't' toggles, 1/2 jump direct.
+                            KeyCode::Char('t') => tab = (tab + 1) % tab_labels.len() as u8,
+                            KeyCode::Char('1') => tab = 0,
+                            KeyCode::Char('2') => tab = 1,
+                            KeyCode::Char('a') if tab == 0 => {
                                 composing = true;
                                 compose_buf.clear();
                             }
-                            KeyCode::Tab => focus = (focus + 1) % focus_labels.len() as u8,
-                            KeyCode::BackTab => {
+                            KeyCode::Tab if tab == 0 => {
+                                focus = (focus + 1) % focus_labels.len() as u8
+                            }
+                            KeyCode::BackTab if tab == 0 => {
                                 focus = (focus + focus_labels.len() as u8 - 1)
                                     % focus_labels.len() as u8
                             }
                             KeyCode::Char('j') => {
-                                if focus == 0 {
+                                if tab == 1 {
+                                    board.next()
+                                } else if focus == 0 {
                                     roster.next()
                                 } else {
                                     messages.scroll_down()
                                 }
                             }
                             KeyCode::Char('k') => {
-                                if focus == 0 {
+                                if tab == 1 {
+                                    board.previous()
+                                } else if focus == 0 {
                                     roster.previous()
                                 } else {
                                     messages.scroll_up()
                                 }
                             }
-                            KeyCode::Up => messages.scroll_up(),
-                            KeyCode::Down => messages.scroll_down(),
-                            KeyCode::PageUp => {
+                            KeyCode::Up if tab == 0 => messages.scroll_up(),
+                            KeyCode::Down if tab == 0 => messages.scroll_down(),
+                            KeyCode::PageUp if tab == 0 => {
                                 for _ in 0..10 {
                                     messages.scroll_up()
                                 }
                             }
-                            KeyCode::PageDown => {
+                            KeyCode::PageDown if tab == 0 => {
                                 for _ in 0..10 {
                                     messages.scroll_down()
                                 }
@@ -199,6 +246,7 @@ fn main() -> io::Result<()> {
                                 color::invalidate();
                                 roster.refresh();
                                 messages.refresh();
+                                board.refresh();
                             }
                             _ => {}
                         }
