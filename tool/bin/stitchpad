@@ -84,8 +84,17 @@ case "$cmd" in
 
 ## Tasks
 
-\`\`\`tasks
-# id | title | assignee | status | created
+\`\`\`task TASK-1
+# key:value per-ticket block. Status: backlog|todo|in_progress|in_review|done|canceled
+# Priority: none|low|medium|high|urgent. Assignee is a bare roster name.
+title: example task
+created: 06-17 00:00
+status: todo
+priority: none
+assignee:
+labels:
+---
+Example description body. Multi-line is fine.
 \`\`\`
 
 ---
