@@ -381,7 +381,19 @@ async function doLogin(){const user=document.getElementById("lu").value.trim(),p
   const auth=await r.json();TOKEN=auth.token;localStorage.setItem("sp_token",TOKEN);setMe(auth.handle||"smaths");startApp();}
 document.getElementById("lb").onclick=doLogin;
 document.getElementById("lp").addEventListener("keydown",e=>{if(e.key==="Enter")doLogin();});
-if(TOKEN)startApp(); else loginEl.classList.add("show");
+// Invite auto-redeem: ?invite=inv_xxx → POST /join-request, store relay token+handle+pad, skip login.
+async function redeemInvite(inv){
+  try{
+    const r=await fetch(RELAY+"/join-request",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({token:inv})});
+    if(!r.ok)throw 0;
+    const j=await r.json();TOKEN=j.token;localStorage.setItem("sp_token",TOKEN);
+    setMe(j.handle||"smaths");pad=j.pad||pad;if(pad)localStorage.setItem("sp_pad",pad);
+    history.replaceState(null,"",location.pathname);   // strip ?invite so refresh doesn't re-redeem
+    startApp();
+  }catch(_){le.textContent="invite invalid or expired";loginEl.classList.add("show");}
+}
+const INVITE=new URLSearchParams(location.search).get("invite");
+if(INVITE)redeemInvite(INVITE); else if(TOKEN)startApp(); else loginEl.classList.add("show");
 if("serviceWorker"in navigator)navigator.serviceWorker.getRegistrations().then(rs=>rs.forEach(r=>r.unregister()));
 
 // ── Agent cards ──────────────────────────────────────────────

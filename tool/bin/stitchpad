@@ -9,6 +9,8 @@
 #   stitchpad dnd on|off [--drain]|status silence/resume wake delivery
 #   stitchpad wake [name] [--peek]        print new @name messages since last drain
 #   stitchpad watch                       run the daemon (foreground)
+#   stitchpad invite [--name <handle>] [--ttl 1h|30m|7d|never]   make a remote-join invite
+#   stitchpad invite --revoke <token>     revoke an invite token
 #   stitchpad start|stop|status|restart   manage the daemon (background)
 #   stitchpad roster                      print parsed roster
 #   stitchpad who                         alias for roster
@@ -829,6 +831,81 @@ except: print("")' 2>/dev/null)"
         ;;
       *) echo "usage: stitchpad bridge {install|uninstall|status}" >&2; exit 1 ;;
     esac
+    ;;
+
+  invite)
+    # Mint a remote-join invite token for the CURRENT pad via the relay, so an agent
+    # anywhere can join with just a link — no clone, no local pad.
+    #   stitchpad invite [--name <handle>] [--ttl 1h|30m|7d|never]   create an invite
+    #   stitchpad invite --revoke <token>   revoke an invite
+    #   stitchpad invite --list             (not supported yet)
+    sp_init_paths || exit 1
+    relay="${STITCHPAD_RELAY:-https://stitchpad.agentsworld.org}"
+    token="${STITCHPAD_TOKEN:-}"
+    if [ -z "$token" ]; then
+      for tf in "$HOME/.stitchpad/.state/relay-token" "$PAD_STATE/relay-token"; do
+        [ -f "$tf" ] && { token="$(cat "$tf" 2>/dev/null | tr -d '[:space:]')"; [ -n "$token" ] && break; }
+      done
+    fi
+    [ -z "$token" ] && { echo "stitchpad: set STITCHPAD_TOKEN (the relay bearer token) — or write it to ~/.stitchpad/.state/relay-token — and re-run" >&2; exit 1; }
+
+    handle="guest"
+    ttl_arg="1h"
+    revoke=""
+    do_list=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --name)   shift; handle="${1:-}"; [ -n "$handle" ] || { echo "usage: stitchpad invite --name <handle>" >&2; exit 1; } ;;
+        --ttl)    shift; ttl_arg="${1:-}"; [ -n "$ttl_arg" ] || { echo "usage: stitchpad invite --ttl <1h|30m|7d|never>" >&2; exit 1; } ;;
+        --revoke) shift; revoke="${1:-}"; [ -n "$revoke" ] || { echo "usage: stitchpad invite --revoke <token>" >&2; exit 1; } ;;
+        --list)   do_list=1 ;;
+        *) echo "usage: stitchpad invite [--name <handle>] [--ttl 1h|30m|7d|never] | --revoke <token>" >&2; exit 1 ;;
+      esac
+      shift
+    done
+
+    if [ -n "$do_list" ]; then
+      echo "invite listing not supported yet"
+      exit 0
+    fi
+
+    if [ -n "$revoke" ]; then
+      curl -fsS -X DELETE -H "authorization: Bearer $token" "${relay%/}/invite?revoke=$revoke" >/dev/null || {
+        echo "stitchpad: revoke failed" >&2; exit 1; }
+      echo "✓ revoked"
+      exit 0
+    fi
+
+    # human duration → seconds; "never" → 0 (permanent)
+    case "$ttl_arg" in
+      never|0)         ttl_sec=0 ;;
+      *[sS])           ttl_sec="${ttl_arg%[sS]}" ;;
+      *[mM])           ttl_sec=$(( ${ttl_arg%[mM]} * 60 )) ;;
+      *[hH])           ttl_sec=$(( ${ttl_arg%[hH]} * 3600 )) ;;
+      *[dD])           ttl_sec=$(( ${ttl_arg%[dD]} * 86400 )) ;;
+      *[0-9])          ttl_sec="$ttl_arg" ;;
+      *) echo "stitchpad: bad --ttl '$ttl_arg' (use e.g. 30m, 1h, 7d, never)" >&2; exit 1 ;;
+    esac
+    case "$ttl_sec" in ''|*[!0-9]*) echo "stitchpad: bad --ttl '$ttl_arg'" >&2; exit 1 ;; esac
+
+    pad_name="$(basename "$(dirname "$PAD_DIR")")"
+    resp="$(curl -fsS -X POST -H "authorization: Bearer $token" -H "content-type: application/json" \
+      -d "{\"handle\":\"$handle\",\"ttlSec\":$ttl_sec}" "${relay%/}/invite?pad=$pad_name")" || {
+        echo "stitchpad: invite request failed (relay $relay, pad $pad_name)" >&2; exit 1; }
+
+    new_token="$(printf '%s' "$resp" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("token",""))' 2>/dev/null || true)"
+    [ -n "$new_token" ] || { echo "stitchpad: relay returned no token: $resp" >&2; exit 1; }
+    if [ "$ttl_sec" -eq 0 ]; then
+      when="never"
+    else
+      expires="$(printf '%s' "$resp" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("expires",""))' 2>/dev/null || true)"
+      when="${expires:-in ${ttl_sec}s}"
+    fi
+
+    echo "✓ invite created for #$pad_name as @$handle (expires $when)"
+    echo "Share this link:"
+    echo "  ${relay%/}/?invite=$new_token"
+    echo "Or the token: $new_token"
     ;;
 
   test)
