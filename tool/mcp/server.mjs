@@ -38,6 +38,19 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STITCHPAD_HOME = path.resolve(__dirname, "..");
 const CLI = path.join(STITCHPAD_HOME, "bin", "stitchpad");
 
+// ── Mode detection: local pad vs remote relay ───────────────────────────
+const RELAY_URL = process.env.STITCHPAD_RELAY || "";
+const RELAY_TOKEN = process.env.STITCHPAD_TOKEN || "";
+const RELAY_PAD = process.env.STITCHPAD_PAD || "";
+const RELAY_HANDLE = process.env.STITCHPAD_HANDLE || "";
+const IS_RELAY = !!(RELAY_URL && RELAY_TOKEN);
+
+if (IS_RELAY) {
+  // Validate that RELAY_URL is a real URL
+  try { new URL(RELAY_URL); } catch { console.error("STITCHPAD_RELAY is not a valid URL"); process.exit(1); }
+  console.error(`[stitchpad-mcp] relay mode → ${RELAY_URL} (pad: ${RELAY_PAD || 'from join'})`);
+}
+
 // Where is the pad? An agent's cwd is the project; the CLI walks up for .stitchpad.
 // Allow override via STITCHPAD_CWD (the dir to resolve the pad from).
 const PAD_CWD = process.env.STITCHPAD_CWD || process.cwd();
@@ -45,12 +58,81 @@ const PAD_CWD = process.env.STITCHPAD_CWD || process.cwd();
 // `me` pins STITCHPAD_NAME for this call so the CLI derives the sender from
 // identity, not a trusted arg.
 async function sp(args, me, extraEnv = {}) {
+  // Relay mode: route through HTTP relay instead of local CLI
+  if (IS_RELAY) return relayCall(args, me);
+
   const { stdout, stderr } = await execFileP(CLI, args, {
     cwd: PAD_CWD,
     env: { ...process.env, STITCHPAD_HOME, ...extraEnv, ...(me ? { STITCHPAD_NAME: me } : {}) },
     maxBuffer: 1024 * 1024,
   });
   return (stdout || "") + (stderr ? `\n${stderr}` : "");
+}
+
+// ── Relay HTTP client (remote-agent mode) ───────────────────────────────
+let relayPad = RELAY_PAD;
+let relayHandle = RELAY_HANDLE;
+let relayAuthToken = RELAY_TOKEN;   // starts as invite token, replaced after join
+
+async function relayCall(args, me) {
+  const op = args[0];
+  switch (op) {
+    case "join": {
+      const handle = args.length > 1 ? args[1] : RELAY_HANDLE;
+      relayHandle = handle;
+      // POST /join-request with invite token → get relay token + pad + handle
+      const r = await fetch(`${RELAY_URL}/join-request`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: RELAY_TOKEN }),
+      });
+      const j = await r.json();
+      if (j.error) return `join failed: ${j.error}`;
+      relayAuthToken = j.token || RELAY_TOKEN;
+      relayPad = j.pad || relayPad;
+      relayHandle = j.handle || relayHandle;
+      return `${relayHandle} joined ${relayPad}`;
+    }
+    case "say": {
+      const textArgs = args.slice(1).filter(a => a !== "--image" && !a.startsWith("/"));
+      const text = textArgs.join(" ");
+      if (!text) return "nothing to say";
+      const r = await fetch(`${RELAY_URL}/say`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${relayAuthToken}`,
+        },
+        body: JSON.stringify({ pad: relayPad, handle: relayHandle, text }),
+      });
+      const j = await r.json();
+      return j.error ? `say failed: ${j.error}` : "posted";
+    }
+    case "read": {
+      const reqLines = parseInt(args.length > 1 ? args[1] : 80, 10) || 80;
+      const r = await fetch(`${RELAY_URL}/pad?pad=${encodeURIComponent(relayPad)}`, {
+        headers: { Authorization: `Bearer ${relayAuthToken}` },
+      });
+      if (!r.ok) return `read failed: ${r.status}`;
+      const raw = await r.json();
+      const md = raw.md || raw.pad || "";
+      const lines = md.split("\n");
+      return lines.slice(-reqLines).join("\n");
+    }
+    case "who":
+    case "roster": {
+      const r = await fetch(`${RELAY_URL}/pad?pad=${encodeURIComponent(relayPad)}`, {
+        headers: { Authorization: `Bearer ${relayAuthToken}` },
+      });
+      if (!r.ok) return `who failed: ${r.status}`;
+      const raw = await r.json();
+      return raw.roster ? raw.roster.join("\n") : "(no roster)";
+    }
+    case "leave":
+      return "left (relay mode — noop)";
+    default:
+      return `unknown relay command: ${op}`;
+  }
 }
 
 function envValue(text, key) {
@@ -228,9 +310,10 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     let out;
     switch (name) {
       case "join": {
-        const adapter = a.adapter;
-        if (!["claude", "codex", "pi"].includes(adapter)) {
-          return text("adapter must be one of: claude, codex, pi");
+        // Relay mode: skip kitty discovery, just register handle via relay
+        if (IS_RELAY) {
+          out = await sp(["join", a.name, a.adapter, "push", "-"]);
+          return text(out);
         }
         // Capture this kitty window as the wake target. Codex may scrub KITTY_*
         // from the MCP child even when the parent Codex process is in kitty, so
