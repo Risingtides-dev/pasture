@@ -30,6 +30,39 @@ source "$BIN_DIR/lib.sh"
 
 cmd="${1:-help}"; shift || true
 
+sp_autostart_name() {
+  if [ -n "${STITCHPAD_NAME:-}" ]; then
+    printf '%s\n' "$STITCHPAD_NAME"
+    return 0
+  fi
+  if [ -n "${STITCHPAD_SESSION:-}" ] && [ -f "$PAD_STATE/sessions/$STITCHPAD_SESSION" ]; then
+    cat "$PAD_STATE/sessions/$STITCHPAD_SESSION" 2>/dev/null
+    return 0
+  fi
+  if [ -n "${KITTY_WINDOW_ID:-}" ]; then
+    sp_roster | awk -F'|' -v w="$KITTY_WINDOW_ID" '
+      { gsub(/^[ \t]+|[ \t]+$/, "", $1); gsub(/^[ \t]+|[ \t]+$/, "", $4)
+        n=$4; sub(/.*@@/, "", n)
+        if (n == w) { print $1; exit } }'
+  fi
+}
+
+sp_maybe_start_heartbeat() {
+  [ "${STITCHPAD_HEARTBEAT_AUTOSTART:-1}" = "0" ] && return 0
+  case "$cmd" in
+    init|heartbeat|hook|bind-session|leave|stop|daemon|watch|help|-h|--help) return 0 ;;
+  esac
+  sp_init_paths >/dev/null 2>&1 || return 0
+  local who
+  who="$(sp_autostart_name 2>/dev/null || true)"
+  [ -n "$who" ] || return 0
+  sp_user_exists "$who" || return 0
+  STITCHPAD_HEARTBEAT_AUTOSTART=0 STITCHPAD_NAME="$who" \
+    "$BIN_DIR/stitchpad" heartbeat start "$who" >/dev/null 2>&1 || true
+}
+
+sp_maybe_start_heartbeat
+
 case "$cmd" in
   init)
     name="$(basename "$PWD")"
@@ -488,6 +521,15 @@ PY
         kitty_window="${KITTY_WINDOW_ID:-}"
         kitty_sock="${KITTY_LISTEN_ON:-${KITTY_SOCKET:-}}"
         target="${kitty_sock:+$kitty_sock@@$kitty_window}"
+        roster_target="$(sp_user_field "$who" target 2>/dev/null || true)"
+        if { [ -z "$kitty_sock" ] || [ -z "$kitty_window" ]; } \
+          && [ -n "$roster_target" ] && [ "$roster_target" != "-" ] \
+          && [ "${roster_target#*@@}" != "$roster_target" ]; then
+          kitty_sock="${roster_target%@@*}"
+          kitty_window="${roster_target##*@@}"
+          target="$roster_target"
+          [ -z "${STITCHPAD_HEARTBEAT_PARENT_PID:-}" ] && parent=""
+        fi
         (
           ticker_pid="$BASHPID"
           echo "$ticker_pid" > "$lockd/pid"

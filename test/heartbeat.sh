@@ -46,3 +46,28 @@ if kill -0 "$pid" 2>/dev/null && ps -p "$pid" -o stat= 2>/dev/null | grep -vq 'Z
   echo "heartbeat ticker still running after --stop" >&2
   exit 1
 fi
+
+# Existing pads can have roster entries created before heartbeat tickers existed.
+# The next normal command from an explicitly identified agent should backfill the
+# ticker without requiring the agent to leave/rejoin.
+"$SP" join legacy codex push 'unix:/tmp/legacy-kitty@@77' >/dev/null
+STITCHPAD_NAME=legacy "$SP" heartbeat --stop legacy >/dev/null
+legacy_alive="$FIXTURE_DIR/.stitchpad/.state/alive.legacy"
+[ ! -e "$legacy_alive" ]
+
+(
+  unset KITTY_WINDOW_ID KITTY_LISTEN_ON KITTY_SOCKET STITCHPAD_SESSION STITCHPAD_HEARTBEAT_PARENT_PID STITCHPAD_HEARTBEAT_INTERVAL
+  export STITCHPAD_NAME=legacy
+  "$SP" read -n 1 >/dev/null
+)
+
+for _ in 1 2 3 4 5; do
+  [ -f "$legacy_alive" ] && break
+  sleep 0.2
+done
+[ -f "$legacy_alive" ]
+jq -e '.name == "legacy" and .target == "unix:/tmp/legacy-kitty@@77" and .kittyWindow == "77" and (.pid | type == "number")' "$legacy_alive" >/dev/null
+legacy_pid="$(jq -r '.pid' "$legacy_alive")"
+kill -0 "$legacy_pid"
+
+STITCHPAD_NAME=legacy "$SP" heartbeat --stop legacy >/dev/null
