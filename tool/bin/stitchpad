@@ -948,9 +948,12 @@ except: print("")' 2>/dev/null)"
     # Reports: untargeted entries, stale kitty targets, missing session identity,
     # duplicate names, orphaned session files.
     #   stitchpad doctor
+    #   stitchpad doctor --json   machine-readable roster array for TUI/widgets
     sp_init_paths || exit 1
+    _json=0; [ "${1:-}" = "--json" ] && _json=1
     warn=0; err=0
-    printf 'stitchpad doctor — roster health check\n\n'
+    declare -a _json_entries=()
+    [ "$_json" -eq 0 ] && printf 'stitchpad doctor — roster health check\n\n'
 
     # Collect roster entries
     declare -a _doc_names=()
@@ -973,7 +976,15 @@ except: print("")' 2>/dev/null)"
       # not a fault). Mark healthy and skip the agent diagnostics.
       _rt="$(cat "$PAD_STATE/runtime.$_name" 2>/dev/null || true)"
       if [ "$_rt" = "operator" ] || [ "$_rt" = "human" ]; then
-        printf '  ✓ @%s (%s) — operator\n' "$_name" "$_rt"
+        if [ "$_json" -eq 1 ]; then
+          _role="$(cat "$PAD_STATE/role.$_name" 2>/dev/null || true)"
+          _level="$(cat "$PAD_STATE/level.$_name" 2>/dev/null || true)"
+          _entry="$(printf '{"name":"%s","adapter":"%s","wake":"%s","target":"%s","harness":"%s","model":"%s","status":"%s","health":"%s","role":"%s","level":"%s"}' \
+            "$_name" "$_adapter" "$_wake" "$_target" "$_rt" "human" "operator" "ok" "$_role" "$_level")"
+          _json_entries+=("$_entry")
+        else
+          printf '  ✓ @%s (%s) — operator\n' "$_name" "$_rt"
+        fi
         continue
       fi
 
@@ -1069,24 +1080,50 @@ for os_win in data:
         fi
       fi
 
-      # Report
-      if [ ${#issues[@]} -eq 0 ]; then
-        if [ -n "$_harness" ]; then
-          printf '  ✓ @%s (%s/%s) %s — %s\n' "$_name" "$_adapter" "$_wake" "$_harness" "$_online"
-        else
-          printf '  ✓ @%s (%s/%s) — %s\n' "$_name" "$_adapter" "$_wake" "$_online"
-        fi
-      else
+      # Determine health/status
+      _health="ok"
+      if [ ${#issues[@]} -gt 0 ]; then
+        _health="warn"
         for _issue in "${issues[@]}"; do
           if [[ "$_issue" == *"stale"* ]] || [[ "$_issue" == *"duplicate"* ]]; then
-            printf '  ✗ @%s (%s/%s) — %s\n' "$_name" "$_adapter" "$_wake" "$_issue"
-            printf '     → suggested: stitchpad leave %s\n' "$_name"
-          else
-            printf '  ⚠ @%s (%s/%s) — %s\n' "$_name" "$_adapter" "$_wake" "$_issue"
+            _health="error"; break
           fi
         done
       fi
+      _harness_display="${_harness:-$_adapter}"
+      _model="$(cat "$PAD_STATE/model.$_name" 2>/dev/null || true)"
+      _role="$(cat "$PAD_STATE/role.$_name" 2>/dev/null || true)"
+      _level="$(cat "$PAD_STATE/level.$_name" 2>/dev/null || true)"
+
+      if [ "$_json" -eq 1 ]; then
+        _entry="$(printf '{"name":"%s","adapter":"%s","wake":"%s","target":"%s","harness":"%s","model":"%s","status":"%s","health":"%s","role":"%s","level":"%s"}' \
+          "$_name" "$_adapter" "$_wake" "$_target" "$_harness_display" "${_model:-}" "$_online" "$_health" "$_role" "$_level")"
+        _json_entries+=("$_entry")
+      else
+        if [ ${#issues[@]} -eq 0 ]; then
+          if [ -n "$_harness" ]; then
+            printf '  ✓ @%s (%s/%s) %s — %s\n' "$_name" "$_adapter" "$_wake" "$_harness" "$_online"
+          else
+            printf '  ✓ @%s (%s/%s) — %s\n' "$_name" "$_adapter" "$_wake" "$_online"
+          fi
+        else
+          for _issue in "${issues[@]}"; do
+            if [[ "$_issue" == *"stale"* ]] || [[ "$_issue" == *"duplicate"* ]]; then
+              printf '  ✗ @%s (%s/%s) — %s\n' "$_name" "$_adapter" "$_wake" "$_issue"
+              printf '     → suggested: stitchpad leave %s\n' "$_name"
+            else
+              printf '  ⚠ @%s (%s/%s) — %s\n' "$_name" "$_adapter" "$_wake" "$_issue"
+            fi
+          done
+        fi
+      fi
     done
+
+    # JSON output (machine-readable roster) — emit before human-only sections
+    if [ "$_json" -eq 1 ]; then
+      for _e in "${_json_entries[@]}"; do printf '%s\n' "$_e"; done | python3 -c 'import sys,json; print(json.dumps([json.loads(x) for x in sys.stdin.read().split("\n") if x.strip()]))'
+      exit 0
+    fi
 
     # Check 5: orphaned session files
     printf '\nSession files:\n'
