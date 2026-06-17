@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- stitchpad bridge — auto-starts at login, scans all of $HOME for .stitchpad pads,
+     mirrors each to the relay (so new pads appear in the PWA with zero setup), and
+     drains phone→pad messages. KeepAlive restarts it if it dies.
+     Install: `stitchpad bridge install` (fills __HOME__/__TOKEN__ and loads it). -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>org.stitchpad.bridge</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__HOME__/.stitchpad/relay/bridge.sh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>STITCHPAD_RELAY</key>
+    <string>__RELAY__</string>
+    <key>STITCHPAD_TOKEN</key>
+    <string>__TOKEN__</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>__HOME__/.stitchpad/.bridge.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.stitchpad/.bridge.log</string>
+</dict>
+</plist>

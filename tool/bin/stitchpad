@@ -63,6 +63,11 @@ EOF
       grep -q '.stitchpad/.state' "$PWD/.gitignore" 2>/dev/null || printf '\n# stitchpad runtime\n.stitchpad/.state/\n.stitchpad/stitchpad-git/\n' >> "$PWD/.gitignore"
     fi
     echo "✓ stitchpad #$name created at $md"
+    # Self-sufficient from creation: start this pad's wake watcher now so it's live
+    # the moment it exists (pinned to this pad regardless of cwd). join also ensures
+    # it; this just means a fresh pad is ready before the first agent even joins.
+    STITCHPAD_PAD_DIR="$dir" "$STITCHPAD_HOME/bin/daemon.sh" start >/dev/null 2>&1 \
+      && echo "✓ wake watcher started for #$name"
     ;;
 
   join)
@@ -538,6 +543,39 @@ EOF
   watch)   exec "$STITCHPAD_HOME/bin/watch.sh" ;;
   start|stop|status|restart) exec "$STITCHPAD_HOME/bin/daemon.sh" "$cmd" ;;
 
+  bridge)
+    # The relay bridge as a permanent login service — so EVERY pad anywhere under
+    # $HOME auto-mirrors to the PWA with zero per-pad setup, surviving reboots.
+    #   stitchpad bridge install   write+load the launchd agent (one time)
+    #   stitchpad bridge uninstall remove it
+    #   stitchpad bridge status    is it loaded/running?
+    sub="${1:-status}"
+    plist="$HOME/Library/LaunchAgents/org.stitchpad.bridge.plist"
+    tmpl="$STITCHPAD_HOME/relay/org.stitchpad.bridge.plist.template"
+    case "$sub" in
+      install)
+        relay="${STITCHPAD_RELAY:-https://stitchpad.agentsworld.org}"
+        token="${STITCHPAD_TOKEN:-}"
+        [ -z "$token" ] && { echo "set STITCHPAD_TOKEN (the relay bearer token) and re-run" >&2; exit 1; }
+        [ -f "$tmpl" ] || { echo "missing template: $tmpl" >&2; exit 1; }
+        mkdir -p "$HOME/Library/LaunchAgents"
+        sed -e "s|__HOME__|$HOME|g" -e "s|__RELAY__|$relay|g" -e "s|__TOKEN__|$token|g" "$tmpl" > "$plist"
+        launchctl unload "$plist" 2>/dev/null || true
+        launchctl load "$plist" 2>/dev/null && echo "✓ bridge installed + running (auto-starts at login, scans all of \$HOME)" || { echo "launchctl load failed" >&2; exit 1; }
+        ;;
+      uninstall)
+        launchctl unload "$plist" 2>/dev/null || true
+        rm -f "$plist" && echo "✓ bridge service removed"
+        ;;
+      status)
+        if launchctl list org.stitchpad.bridge >/dev/null 2>&1; then
+          echo "✓ bridge service loaded + auto-starts at login"; pgrep -fl "relay/bridge.sh" | head -1
+        else echo "bridge service not installed (run: stitchpad bridge install)"; fi
+        ;;
+      *) echo "usage: stitchpad bridge {install|uninstall|status}" >&2; exit 1 ;;
+    esac
+    ;;
+
   test)
     # Discover and run all test scripts in test/ and bin/test-*.sh
     passed=0; failed=0; total=0
@@ -593,6 +631,7 @@ EOF
       [dennis]='#ff8c00'   # orange
       [Jill]='#ff1493'     # pink
       [mark]='#ffd700'     # yellow
+      [nancy]='#00ffff'    # cyan
     )
 
     # 20-color palette (256-index → hex). Used when no override exists.
