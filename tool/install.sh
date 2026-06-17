@@ -87,6 +87,41 @@ if [ -f "$HOME_DIR/mcp/package.json" ] && command -v npm >/dev/null 2>&1; then
 fi
 
 echo
+
+# ─── MCP SERVER REGISTRATION (idempotent) ──────────────────────────────────
+# Same python3 merge pattern as hook wiring above — checks if already
+# registered, adds if missing. No duplicate errors, no interactive prompts.
+MCP_SERVER="$HOME_DIR/mcp/server.mjs"
+
+# Claude: ~/.claude.json  mcpServers.stitchpad
+if command -v python3 >/dev/null 2>&1; then
+  python3 - "$CLAUDE_SETTINGS" "$MCP_SERVER" <<'PY' && echo "✓ Claude MCP stitchpad registered ($CLAUDE_SETTINGS)"
+import json,sys
+p,sp=sys.argv[1],sys.argv[2]
+d=json.load(open(p))
+srv=d.setdefault("mcpServers",{})
+if "stitchpad" not in srv:
+    srv["stitchpad"]={"type":"stdio","command":"node","args":[sp],"env":{}}
+    json.dump(d,open(p,"w"),indent=2)
+PY
+
+  # Codex: ~/.codex/config.toml  [mcp_servers.stitchpad]
+  CODEX_CONFIG="$HOME/.codex/config.toml"
+  if [ -d "$HOME/.codex" ] || [ -f "$CODEX_CONFIG" ]; then
+    [ -f "$CODEX_CONFIG" ] || { mkdir -p "$HOME/.codex"; touch "$CODEX_CONFIG"; }
+    if ! grep -q '^\[mcp_servers\.stitchpad\]' "$CODEX_CONFIG" 2>/dev/null; then
+      printf '\n[mcp_servers.stitchpad]\ncommand = "node"\nargs = ["%s"]\n' "$MCP_SERVER" >> "$CODEX_CONFIG"
+      echo "✓ Codex MCP stitchpad registered ($CODEX_CONFIG)"
+    fi
+  fi
+fi
+
+# Pi: pi install the stitchpad extension (idempotent)
+if command -v pi >/dev/null 2>&1; then
+  pi install "$HOME_DIR/adapters/stitchpad" 2>/dev/null && echo "✓ Pi stitchpad extension installed" || echo "⚠  Pi extension install failed"
+fi
+
+echo
 echo "✓ install complete. In any project:"
 echo "    stitchpad init                       # creates pad + starts its watcher"
 echo "    stitchpad join <you> <claude|codex|pi>"
@@ -95,6 +130,3 @@ echo "    stitchpad say \"@teammate message\""
 echo
 echo "Optional — mirror every pad to the PWA automatically (login service):"
 echo "    STITCHPAD_RELAY=<url> STITCHPAD_TOKEN=<tok> stitchpad bridge install"
-echo
-echo "pi runtime: pi install $HOME_DIR/adapters/stitchpad"
-echo "MCP (agent-facing): register $HOME_DIR/mcp/server.mjs — see mcp/README.md"
