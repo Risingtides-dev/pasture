@@ -38,15 +38,63 @@ case ":$PATH:" in
      echo "    export PATH=\"$DEST:\$PATH\""; echo;;
 esac
 
-echo "Then, in any project:"
-echo "    stitchpad init"
+# ─── WIRE THE WAKE HOOKS AUTOMATICALLY ───────────────────────────────────────
+# The plugin must ship working hooks, not instructions to hand-edit configs.
+# Each runtime's Stop hook runs the same stable shim (adapters/stop-hook.sh →
+# `stitchpad hook`). Idempotent: only adds if missing. Needs python3 (ships on macOS).
+SHIM="$STD_HOME/adapters/stop-hook.sh"
+
+# Claude Code: ~/.claude/settings.json  hooks.Stop[]
+CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+if command -v python3 >/dev/null 2>&1; then
+  mkdir -p "$HOME/.claude"
+  [ -f "$CLAUDE_SETTINGS" ] || echo '{}' > "$CLAUDE_SETTINGS"
+  python3 - "$CLAUDE_SETTINGS" "$SHIM" <<'PY' && echo "✓ Claude Stop hook wired ($CLAUDE_SETTINGS)"
+import json,sys
+p,shim=sys.argv[1],sys.argv[2]
+d=json.load(open(p))
+hooks=d.setdefault("hooks",{}); stop=hooks.setdefault("Stop",[])
+def wired(s): return any(h.get("command")==shim for blk in s for h in blk.get("hooks",[]))
+if not wired(stop):
+    stop.append({"hooks":[{"type":"command","command":shim,"timeout":15}]})
+    json.dump(d,open(p,"w"),indent=2)
+PY
+
+  # Codex: ~/.codex/hooks.json  hooks.Stop[]
+  CODEX_HOOKS="$HOME/.codex/hooks.json"
+  if [ -d "$HOME/.codex" ] || [ -f "$CODEX_HOOKS" ]; then
+    [ -f "$CODEX_HOOKS" ] || { mkdir -p "$HOME/.codex"; echo '{}' > "$CODEX_HOOKS"; }
+    python3 - "$CODEX_HOOKS" "$SHIM" <<'PY' && echo "✓ Codex Stop hook wired ($CODEX_HOOKS)"
+import json,sys
+p,shim=sys.argv[1],sys.argv[2]
+d=json.load(open(p))
+hooks=d.setdefault("hooks",{}); stop=hooks.setdefault("Stop",[])
+def wired(s): return any(h.get("command")==shim for blk in s for h in blk.get("hooks",[]))
+if not wired(stop):
+    stop.append({"hooks":[{"type":"command","command":shim,"timeout":15}]})
+    json.dump(d,open(p,"w"),indent=2)
+PY
+  fi
+else
+  echo "⚠  python3 not found — cannot auto-wire hooks. Wire manually (see adapters/)."
+fi
+
+# MCP server deps — install so `node mcp/server.mjs` doesn't crash (-32000).
+if [ -f "$HOME_DIR/mcp/package.json" ] && command -v npm >/dev/null 2>&1; then
+  ( cd "$HOME_DIR/mcp" && npm install --silent >/dev/null 2>&1 ) \
+    && echo "✓ MCP server deps installed ($HOME_DIR/mcp)" \
+    || echo "⚠  MCP deps install failed — run: (cd $HOME_DIR/mcp && npm install)"
+fi
+
+echo
+echo "✓ install complete. In any project:"
+echo "    stitchpad init                       # creates pad + starts its watcher"
 echo "    stitchpad join <you> <claude|codex|pi>"
 echo "    export STITCHPAD_NAME=<you>"
 echo "    stitchpad say \"@teammate message\""
 echo
-echo "Wire the wake hook for your runtime (see adapters/):"
-echo "    claude → ~/.claude/settings.json   Stop hook → STITCHPAD_NAME=<you> ~/.stitchpad/adapters/stop-hook.sh"
-echo "    codex  → ~/.codex/hooks.json       Stop hook → STITCHPAD_NAME=<you> ~/.stitchpad/adapters/stop-hook.sh"
-echo "    pi     → pi install ~/.stitchpad/adapters/stitchpad"
+echo "Optional — mirror every pad to the PWA automatically (login service):"
+echo "    STITCHPAD_RELAY=<url> STITCHPAD_TOKEN=<tok> stitchpad bridge install"
 echo
-echo "MCP (agent-facing): see $HOME_DIR/mcp/README.md"
+echo "pi runtime: pi install $HOME_DIR/adapters/stitchpad"
+echo "MCP (agent-facing): register $HOME_DIR/mcp/server.mjs — see mcp/README.md"
