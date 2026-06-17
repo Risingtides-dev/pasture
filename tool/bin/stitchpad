@@ -736,6 +736,41 @@ PY
     exit 0
     ;;
 
+  claim-hook)
+    # The PreToolUse-hook brain (Claude). Shim (adapters/claim-hook.sh) pipes the
+    # runtime's PreToolUse JSON here: {tool_name, tool_input:{file_path}, cwd}.
+    # We lease the target file via `stitchpad claim`; if a DIFFERENT agent holds a
+    # fresh lease, emit a PreToolUse deny so the write is blocked. This is what
+    # turns the advisory claim into enforced atomic-write protection.
+    input="$(cat 2>/dev/null || true)"
+    cwd="$(printf '%s' "$input" | sed -n 's/.*"cwd"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+    [ -n "$cwd" ] && cd "$cwd" 2>/dev/null || true
+    sid="$(printf '%s' "$input" | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+    [ -n "$sid" ] && export STITCHPAD_SESSION="$sid"
+    # Pull file_path out of tool_input. python3 if present (robust), else sed fallback.
+    fp="$(printf '%s' "$input" | python3 -c 'import json,sys
+try:
+  d=json.load(sys.stdin); print(d.get("tool_input",{}).get("file_path","") or "")
+except: print("")' 2>/dev/null)"
+    [ -z "$fp" ] && fp="$(printf '%s' "$input" | sed -n 's/.*"file_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+    [ -z "$fp" ] && exit 0   # no file target (not a file write) → allow
+    # Claims only apply INSIDE a pad. No .stitchpad here → not a shared worktree,
+    # fail-open (else we'd block every write in every non-pad project). Walk up like the CLI does.
+    _d="$PWD"; _pad=""
+    while [ "$_d" != "/" ]; do [ -d "$_d/.stitchpad" ] && { _pad="$_d/.stitchpad"; break; }; _d="$(dirname "$_d")"; done
+    [ -z "$_pad" ] && exit 0   # not in a pad → allow
+    # Try to lease it. `claim` exits 0 if I get/hold it, non-zero if someone else holds a fresh one.
+    if "$0" claim "$fp" >/dev/null 2>&1; then
+      exit 0   # claim held by me → allow the write
+    fi
+    holder="$("$0" claims 2>/dev/null | grep -F "$fp" | head -1)"
+    reason="stitchpad: @$(sp_me 2>/dev/null) blocked — another agent holds a fresh write-lease on this file (${holder:-$fp}). Coordinate on the pad or wait for their release (stale leases free after 600s)."
+    # PreToolUse deny contract (current Claude): hookSpecificOutput.permissionDecision=deny.
+    printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":%s}}\n' \
+      "$(printf '%s' "$reason" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null || printf '"write blocked by stitchpad claim lease"')"
+    exit 0
+    ;;
+
   hook)
     # The Stop-hook brain. The shim (adapters/stop-hook.sh) just pipes the
     # runtime's stdin JSON here, so ALL logic lives in the CLI and the shim's hash
@@ -1101,6 +1136,94 @@ for os_win in data:
     total=$(( warn + err ))
     printf '\n%d issues found (%d warnings, %d errors)\n' "$total" "$warn" "$err"
     if [ "$err" -gt 0 ]; then exit 1; fi
+    ;;
+
+  # ── Stitch-Tasks (Linear-style issue tracking) ────────────────────────
+  task)
+    sp_init_paths || exit 1
+    sub="${1:-list}"; shift 2>/dev/null || true
+    case "$sub" in
+      new)
+        # stitchpad task new "title" [--priority high] [--to name] [--labels a,b]
+        title="${1:-Untitled}"; shift 2>/dev/null || true
+        priority="none"; assignee=""; labels=""
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            --priority) priority="$2"; shift 2 ;;
+            --to|--assignee) assignee="$2"; shift 2 ;;
+            --labels) labels="$2"; shift 2 ;;
+            *) shift ;;
+          esac
+        done
+        # Generate next ID: parse existing IDs, find max, increment
+        existing=$(sp_tasks | awk -F'|' '{print $1}' | sed 's/TASK-//' | sort -n | tail -1)
+        [ -z "$existing" ] && existing=0
+        id="TASK-$(( existing + 1 ))"
+        # Build the block — always include all core fields so edit can find them
+        ts="$(date -u '+%m-%d %H:%M')"
+        block="\`\`\`task $id"$'\n'"title: $title"$'\n'"status: todo"$'\n'"priority: $priority"$'\n'"assignee: ${assignee:-}"$'\n'"labels: ${labels:-}"$'\n'"created: $ts"$'\n'"---"$'\n'"$id created"$'\n'"\`\`\`"
+        sp_lock || exit 1
+        printf '\n%s\n' "$block" >> "$PAD_MD"
+        sp_commit "task $id: $title"
+        sp_unlock
+        echo "$id created"
+        # Wake assignee if set
+        if [ -n "$assignee" ] && sp_user_exists "$assignee"; then
+          printf '\n## @%s · %s\n\n**task %s assigned:** %s\n' "$assignee" "$(date -u '+%H:%M')" "$id" "$title" >> "$PAD_MD"
+          sp_commit "task $id assigned to @$assignee"
+        fi
+        ;;
+
+      list)
+        sp_tasks "$@"
+        ;;
+
+      move)
+        id="${1:-}"; new_status="${2:-}"
+        [ -z "$id" ] && { echo "usage: stitchpad task move <id> <status>" >&2; exit 1; }
+        [ -z "$new_status" ] && { echo "usage: stitchpad task move <id> <status>" >&2; exit 1; }
+        # Find the task block and update status in-place
+        sp_lock || exit 1
+        awk -v tid="$id" -v ns="$new_status" '
+          /^```task / && $2==tid { inblk=1; inmeta=1 }
+          inblk && inmeta && /^status:/ { sub(/status:.*/, "status: " ns) }
+          /^```$/ && inblk { inblk=0 }
+          { print }
+        ' "$PAD_MD" > "$PAD_MD.tmp" && mv "$PAD_MD.tmp" "$PAD_MD"
+        sp_commit "task $id → $new_status"
+        sp_unlock
+        echo "$id → $new_status"
+        ;;
+
+      edit)
+        id="${1:-}"; shift 2>/dev/null || true
+        [ -z "$id" ] && { echo "usage: stitchpad task edit <id> [--priority X] [--to name] [--labels X]" >&2; exit 1; }
+        sp_lock || exit 1
+        # Collect field updates
+        new_priority=""; new_assignee=""; new_labels=""
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            --priority) new_priority="$2"; shift 2 ;;
+            --to|--assignee) new_assignee="$2"; shift 2 ;;
+            --labels) new_labels="$2"; shift 2 ;;
+            *) shift ;;
+          esac
+        done
+        awk -v tid="$id" -v np="$new_priority" -v na="$new_assignee" -v nl="$new_labels" '
+          /^```task / && $2==tid { inblk=1; inmeta=1 }
+          inblk && inmeta && np!="" && /^priority:/ { sub(/priority:.*/, "priority: " np) }
+          inblk && inmeta && na!="" && /^assignee:/ { sub(/assignee:.*/, "assignee: " na) }
+          inblk && inmeta && nl!="" && /^labels:/ { sub(/labels:.*/, "labels: " nl) }
+          /^```$/ && inblk { inblk=0 }
+          { print }
+        ' "$PAD_MD" > "$PAD_MD.tmp" && mv "$PAD_MD.tmp" "$PAD_MD"
+        sp_commit "task $id metadata updated"
+        sp_unlock
+        echo "$id updated"
+        ;;
+
+      *) echo "usage: stitchpad task {new|list|move|edit}" >&2; exit 1 ;;
+    esac
     ;;
 
   help|*)

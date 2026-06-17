@@ -163,6 +163,41 @@ sp_roster() {
   ' "$PAD_MD"
 }
 
+# ── Tasks parser (```task blocks) ────────────────────────────────────────
+# Each task is a ```task TASK-N fenced block with YAML-like frontmatter and
+# a markdown description after the --- separator.
+#
+# Output: id|title|status|priority|assignee|labels|created
+#
+# sp_tasks                → all tasks in created order
+# sp_tasks --mine <name>  → tasks assigned to <name>
+# sp_tasks --status <s>    → tasks with matching status
+sp_tasks() {
+  local filter_name="" filter_status=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --mine)   filter_name="$2"; shift 2 ;;
+      --status) filter_status="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  awk -v fn="$filter_name" -v fs="$filter_status" '
+    BEGIN { id=""; title=""; status=""; priority=""; assignee=""; labels=""; created="" }
+    /^```task /                      { inblk=1; meta=1; id=$2; gsub(/^ *| *$/,"",id); title=""; status="todo"; priority="none"; assignee=""; labels=""; created="" }
+    /^```$/ && inblk                 { inblk=0; if (id!="") { if ((fn==""||assignee==fn) && (fs==""||status==fs)) print id "|" title "|" status "|" priority "|" assignee "|" labels "|" created; id="" } }
+    inblk && /^---/                   { meta=0; next }
+    inblk && meta && !/^```/ {
+      line=$0; gsub(/^[ \t]+|[ \t]+$/, "", line)
+      if (line ~ /^title:/)    { gsub(/^title: */, "", line); title=line }
+      if (line ~ /^status:/)   { gsub(/^status: */, "", line); status=line }
+      if (line ~ /^priority:/) { gsub(/^priority: */, "", line); priority=line }
+      if (line ~ /^assignee:/) { gsub(/^assignee: */, "", line); assignee=line }
+      if (line ~ /^labels:/)   { gsub(/^labels: */, "", line); labels=line }
+      if (line ~ /^created:/)  { gsub(/^created: */, "", line); created=line }
+    }
+  ' "$PAD_MD"
+}
+
 # Look up one field for a user. sp_user_field <name> <adapter|wake|target>
 sp_user_field() {
   local who="$1" field="$2"
