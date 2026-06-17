@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Regression test for per-agent heartbeat ticker.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SP="$ROOT/tool/bin/stitchpad"
+FIXTURE_DIR="$(mktemp -d)"
+trap 'rm -rf "$FIXTURE_DIR"' EXIT
+
+cd "$FIXTURE_DIR"
+"$SP" init --name heartbeat >/dev/null
+
+export STITCHPAD_NAME="alice"
+export STITCHPAD_SESSION="session-test"
+export KITTY_WINDOW_ID="42"
+export STITCHPAD_HEARTBEAT_INTERVAL="1"
+
+"$SP" heartbeat start >/dev/null
+
+alive="$FIXTURE_DIR/.stitchpad/.state/alive.alice"
+for _ in 1 2 3 4 5; do
+  [ -f "$alive" ] && break
+  sleep 0.2
+done
+[ -f "$alive" ]
+
+jq -e '.name == "alice" and .session == "session-test" and .kittyWindow == "42" and (.pid | type == "number") and (.ts | type == "number")' "$alive" >/dev/null
+pid="$(jq -r '.pid' "$alive")"
+kill -0 "$pid"
+
+mtime1="$(stat -f %m "$alive" 2>/dev/null || stat -c %Y "$alive")"
+sleep 2
+mtime2="$(stat -f %m "$alive" 2>/dev/null || stat -c %Y "$alive")"
+[ "$mtime2" -gt "$mtime1" ]
+
+"$SP" heartbeat --stop alice >/dev/null
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [ ! -e "$alive" ] && [ ! -d "$FIXTURE_DIR/.stitchpad/.state/heartbeat.alice.lock" ] && break
+  sleep 0.1
+done
+if [ -e "$alive" ] || [ -d "$FIXTURE_DIR/.stitchpad/.state/heartbeat.alice.lock" ]; then
+  echo "heartbeat state still present after --stop" >&2
+  exit 1
+fi
+if kill -0 "$pid" 2>/dev/null && ps -p "$pid" -o stat= 2>/dev/null | grep -vq 'Z'; then
+  echo "heartbeat ticker still running after --stop" >&2
+  exit 1
+fi
