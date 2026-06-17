@@ -249,31 +249,40 @@ function renderClaimBar(){
 function renderDMList(){
   const el=document.getElementById("dmlist"); if(!el)return;
   el.innerHTML=ROSTER.filter(n=>n!==me).map(n=>{
-    // status vocab is working|available|dnd (from the profiles blob), not "online"
-    const pst=(PROFILES[n]||{}).status||"available";
-    const dotcol = pst==="working" ? "#2ea043" : pst==="dnd" ? "#d29922" : "#6b7280";
-    const dot=`<span class="sdot" style="background:${dotcol}"></span>`;
-    return `<div class="chan dm-item${dmWith===n?" on":""}" data-dm="${esc(n)}">`+
+    // liveness-first: offline (stale heartbeat) = hollow grey, online = activity color
+    const ls=liveState(n);
+    const dotcol = ls==="working" ? "#2ea043" : ls==="dnd" ? "#d29922" : ls==="offline" ? "transparent" : "#3fb950";
+    const off = ls==="offline";
+    const dot=`<span class="sdot" title="${esc(ls)}" style="background:${dotcol};${off?"border:1.5px solid #6b7280":""}"></span>`;
+    return `<div class="chan dm-item${dmWith===n?" on":""}" data-dm="${esc(n)}" style="${off?"opacity:.55":""}">`+
       `<div class="dmav" style="background:${colorFor(n)};color:${initInk(n)}"><img src="avatars/${encodeURIComponent(n)}.png" alt="" onerror="this.remove()"><span>${initials(n)}</span></div>`+
       `${dot}${esc(n)}</div>`;
   }).join("");
 }
 function openDM(n){dmWith=n;localStorage.setItem("sp_dm",n);document.getElementById("chans").classList.remove("open");render();}
 function closeDM(){dmWith="";localStorage.removeItem("sp_dm");render();}
+// LIVENESS is ground truth, computed Mac-side from heartbeat freshness (mtime<90s AND
+// kill -0 pid) and pushed as PROFILES[name].online — the PWA can't kill -0 remotely.
+// Offline trumps activity: a crashed agent that posted 60s ago is still DEAD (grey).
+// Back-compat: if `online` isn't pushed yet, assume online so we don't grey everyone.
+function isOnline(n){const p=PROFILES[n]||{}; return p.online!==undefined?!!p.online:true;}
+function liveState(n){if(!isOnline(n))return"offline"; const s=(PROFILES[n]||{}).status; return s==="dnd"?"dnd":s==="working"?"working":"available";}
 // Presence strip under the header: count + a row of colored status dots (tap → card).
 // status from PROFILES[name].status: dnd | working | available (idle→available).
 function renderStatusBar(){
   const el=document.getElementById("statusbar"); if(!el)return;
   const agents=ROSTER.filter(n=>PROFILES[n]||ROSTER_INFO[n]);
   if(!agents.length){el.innerHTML="";return;}
-  let working=0,avail=0,dnd=0;
+  let working=0,avail=0,dnd=0,offline=0;
   const dots=agents.map(n=>{
-    const st=(PROFILES[n]||{}).status||"available";
-    if(st==="working")working++; else if(st==="dnd")dnd++; else avail++;
-    const title=`@${n} · ${st}`;
-    return `<span class="sb-dot card-trigger ${st}" data-agent="${esc(n)}" title="${esc(title)}" style="background:${colorFor(n)}"></span>`;
+    const ls=liveState(n);
+    if(ls==="working")working++; else if(ls==="dnd")dnd++; else if(ls==="offline")offline++; else avail++;
+    const title=`@${n} · ${ls}`;
+    // offline = hollow dot (color ring, transparent fill); online = filled with their color
+    const style = ls==="offline" ? `background:transparent;border-color:${colorFor(n)};opacity:.6` : `background:${colorFor(n)}`;
+    return `<span class="sb-dot card-trigger ${ls}" data-agent="${esc(n)}" title="${esc(title)}" style="${style}"></span>`;
   }).join("");
-  const parts=[]; if(working)parts.push(working+" working"); if(avail)parts.push(avail+" available"); if(dnd)parts.push(dnd+" dnd");
+  const parts=[]; if(working)parts.push(working+" working"); if(avail)parts.push(avail+" available"); if(dnd)parts.push(dnd+" dnd"); if(offline)parts.push(offline+" offline");
   el.innerHTML=`<span class="count">${parts.join(" · ")||agents.length+" agents"}</span><span class="dots">${dots}</span>`;
 }
 const ta=document.getElementById("text"),acEl=document.getElementById("ac");
