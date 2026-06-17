@@ -1,6 +1,26 @@
 #!/usr/bin/env node
 // stitchpad MCP server — the agent-facing side of stitchpad.
 //
+// ── TWO MODES ─────────────────────────────────────────────────────────
+// LOCAL MODE (default): every tool shells out to the local `stitchpad` CLI,
+//   which reads/writes the on-disk .stitchpad/stitchpad.md + isolated git. This
+//   is how a teammate ON the host machine joins the pad. Nothing here changes.
+//
+// RELAY MODE: an agent on a REMOTE machine has no local pad file. When BOTH
+//   STITCHPAD_RELAY (the Cloudflare relay base URL) and an invite/token are set,
+//   the tools route over HTTP to the relay instead of the local CLI:
+//     • STITCHPAD_INVITE                → redeemed ONCE at startup via POST /join-request
+//     • STITCHPAD_TOKEN + STITCHPAD_PAD → used directly (skip the redeem)
+//   say  → POST /say?pad=<pad>   {from, text}
+//   read → GET  /pad?pad=<pad>   (returns {pad, roster, profiles}; we slice .pad)
+//   who  → GET  /pad?pad=<pad>   (returns the .roster list)
+//   join → no-op confirm (already joined via the invite redeem at startup)
+//   leave→ courtesy /say "left"
+//   Every relay call carries: authorization: Bearer <relayToken>, content-type json.
+//
+// Mode is chosen ONCE at startup (RELAY_MODE below) and every tool handler
+// branches `if (RELAY_MODE) {...} else {<existing local CLI code>}`.
+//
 // The MCP is the ROSTER + TALKING surface. An agent adds this server and, at
 // startup, calls `join` to pick its name and declare which runtime it is. The
 // runtime's wake hook still needs STITCHPAD_NAME pinned to that name. The MCP
@@ -16,8 +36,8 @@
 // turn-end hook reading the pad, not an MCP poll. MCP = register + talk; the
 // hook does the waking.
 //
-// All state lives in stitchpad.md + the isolated git, written via the `stitchpad`
-// CLI so there is exactly one implementation of roster/commit logic.
+// All LOCAL state lives in stitchpad.md + the isolated git, written via the
+// `stitchpad` CLI so there is exactly one implementation of roster/commit logic.
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -38,29 +58,37 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STITCHPAD_HOME = path.resolve(__dirname, "..");
 const CLI = path.join(STITCHPAD_HOME, "bin", "stitchpad");
 
-// ── Mode detection: local pad vs remote relay ───────────────────────────
-const RELAY_URL = process.env.STITCHPAD_RELAY || "";
-const RELAY_TOKEN = process.env.STITCHPAD_TOKEN || "";
-const RELAY_PAD = process.env.STITCHPAD_PAD || "";
-const RELAY_HANDLE = process.env.STITCHPAD_HANDLE || "";
-const IS_RELAY = !!(RELAY_URL && RELAY_TOKEN);
+// ── Mode detection: local pad (CLI) vs remote relay (HTTP) ──────────────
+// RELAY MODE activates when STITCHPAD_RELAY (the relay base URL) is set together
+// with either an invite (STITCHPAD_INVITE, redeemed once at startup) or a
+// pre-issued bearer token (STITCHPAD_TOKEN, used directly with STITCHPAD_PAD).
+// Otherwise we run in LOCAL MODE and shell out to the `stitchpad` CLI as before.
+const RELAY_URL = (process.env.STITCHPAD_RELAY || "").replace(/\/+$/, "");
+const RELAY_INVITE = process.env.STITCHPAD_INVITE || "";
+const RELAY_MODE = !!(RELAY_URL && (RELAY_INVITE || process.env.STITCHPAD_TOKEN));
 
-if (IS_RELAY) {
-  // Validate that RELAY_URL is a real URL
-  try { new URL(RELAY_URL); } catch { console.error("STITCHPAD_RELAY is not a valid URL"); process.exit(1); }
-  console.error(`[stitchpad-mcp] relay mode → ${RELAY_URL} (pad: ${RELAY_PAD || 'from join'})`);
+if (RELAY_MODE) {
+  try {
+    new URL(RELAY_URL);
+  } catch {
+    console.error("[stitchpad-mcp] STITCHPAD_RELAY is not a valid URL");
+    process.exit(1);
+  }
 }
 
+// Relay session, held in memory. Populated by redeemInvite() at startup (invite
+// path) or straight from env (direct-token path). All relay HTTP calls use these.
+let relayToken = process.env.STITCHPAD_TOKEN || "";
+let padName = process.env.STITCHPAD_PAD || "";
+let myHandle = process.env.STITCHPAD_HANDLE || "";
+
 // Where is the pad? An agent's cwd is the project; the CLI walks up for .stitchpad.
-// Allow override via STITCHPAD_CWD (the dir to resolve the pad from).
+// Allow override via STITCHPAD_CWD (the dir to resolve the pad from). LOCAL only.
 const PAD_CWD = process.env.STITCHPAD_CWD || process.cwd();
 
 // `me` pins STITCHPAD_NAME for this call so the CLI derives the sender from
-// identity, not a trusted arg.
+// identity, not a trusted arg. (LOCAL MODE only — relay tools call relay* below.)
 async function sp(args, me, extraEnv = {}) {
-  // Relay mode: route through HTTP relay instead of local CLI
-  if (IS_RELAY) return relayCall(args, me);
-
   const { stdout, stderr } = await execFileP(CLI, args, {
     cwd: PAD_CWD,
     env: { ...process.env, STITCHPAD_HOME, ...extraEnv, ...(me ? { STITCHPAD_NAME: me } : {}) },
@@ -70,69 +98,63 @@ async function sp(args, me, extraEnv = {}) {
 }
 
 // ── Relay HTTP client (remote-agent mode) ───────────────────────────────
-let relayPad = RELAY_PAD;
-let relayHandle = RELAY_HANDLE;
-let relayAuthToken = RELAY_TOKEN;   // starts as invite token, replaced after join
+function relayHeaders() {
+  return {
+    authorization: `Bearer ${relayToken}`,
+    "content-type": "application/json",
+  };
+}
 
-async function relayCall(args, me) {
-  const op = args[0];
-  switch (op) {
-    case "join": {
-      const handle = args.length > 1 ? args[1] : RELAY_HANDLE;
-      relayHandle = handle;
-      // POST /join-request with invite token → get relay token + pad + handle
-      const r = await fetch(`${RELAY_URL}/join-request`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ token: RELAY_TOKEN }),
-      });
-      const j = await r.json();
-      if (j.error) return `join failed: ${j.error}`;
-      relayAuthToken = j.token || RELAY_TOKEN;
-      relayPad = j.pad || relayPad;
-      relayHandle = j.handle || relayHandle;
-      return `${relayHandle} joined ${relayPad}`;
-    }
-    case "say": {
-      const textArgs = args.slice(1).filter(a => a !== "--image" && !a.startsWith("/"));
-      const text = textArgs.join(" ");
-      if (!text) return "nothing to say";
-      const r = await fetch(`${RELAY_URL}/say`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${relayAuthToken}`,
-        },
-        body: JSON.stringify({ pad: relayPad, handle: relayHandle, text }),
-      });
-      const j = await r.json();
-      return j.error ? `say failed: ${j.error}` : "posted";
-    }
-    case "read": {
-      const reqLines = parseInt(args.length > 1 ? args[1] : 80, 10) || 80;
-      const r = await fetch(`${RELAY_URL}/pad?pad=${encodeURIComponent(relayPad)}`, {
-        headers: { Authorization: `Bearer ${relayAuthToken}` },
-      });
-      if (!r.ok) return `read failed: ${r.status}`;
-      const raw = await r.json();
-      const md = raw.md || raw.pad || "";
-      const lines = md.split("\n");
-      return lines.slice(-reqLines).join("\n");
-    }
-    case "who":
-    case "roster": {
-      const r = await fetch(`${RELAY_URL}/pad?pad=${encodeURIComponent(relayPad)}`, {
-        headers: { Authorization: `Bearer ${relayAuthToken}` },
-      });
-      if (!r.ok) return `who failed: ${r.status}`;
-      const raw = await r.json();
-      return raw.roster ? raw.roster.join("\n") : "(no roster)";
-    }
-    case "leave":
-      return "left (relay mode — noop)";
-    default:
-      return `unknown relay command: ${op}`;
-  }
+// Startup redeem: trade the one-time invite for a relay bearer token + pad + handle.
+// POST /join-request {token: <invite>} → {token: <relayBearer>, pad, handle}
+async function redeemInvite() {
+  const r = await fetch(`${RELAY_URL}/join-request`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token: RELAY_INVITE }),
+  });
+  if (!r.ok) throw new Error(`join-request ${r.status}: ${await r.text()}`);
+  const j = await r.json();
+  if (!j.token) throw new Error(`join-request returned no token: ${JSON.stringify(j)}`);
+  relayToken = j.token;
+  if (j.pad) padName = j.pad;
+  if (j.handle) myHandle = j.handle;
+}
+
+// say → POST /say?pad=<pad> {from, text}
+async function relaySay(textBody) {
+  const r = await fetch(`${RELAY_URL}/say?pad=${encodeURIComponent(padName)}`, {
+    method: "POST",
+    headers: relayHeaders(),
+    body: JSON.stringify({ from: myHandle, text: textBody }),
+  });
+  if (!r.ok) throw new Error(`say ${r.status}: ${await r.text()}`);
+  return `posted to ${padName} as @${myHandle}`;
+}
+
+// GET /pad?pad=<pad> → {pad: <markdown>, roster:[...], profiles:{...}}
+async function relayGetPad() {
+  const r = await fetch(`${RELAY_URL}/pad?pad=${encodeURIComponent(padName)}`, {
+    headers: relayHeaders(),
+  });
+  if (!r.ok) throw new Error(`pad ${r.status}: ${await r.text()}`);
+  return r.json();
+}
+
+// read → recent slice of the pad markdown (last ~2000 chars).
+async function relayRead() {
+  const { pad = "" } = await relayGetPad();
+  const slice = pad.length > 2000 ? pad.slice(-2000) : pad;
+  return slice || "(pad is empty)";
+}
+
+// who → the roster list from the pad payload.
+async function relayWho() {
+  const { roster = [] } = await relayGetPad();
+  if (!roster.length) return "(roster is empty)";
+  return roster
+    .map((m) => (typeof m === "string" ? m : m.name || m.handle || JSON.stringify(m)))
+    .join("\n");
 }
 
 function envValue(text, key) {
@@ -310,10 +332,19 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     let out;
     switch (name) {
       case "join": {
-        // Relay mode: skip kitty discovery, just register handle via relay
-        if (IS_RELAY) {
-          out = await sp(["join", a.name, a.adapter, "push", "-"]);
-          return text(out);
+        const adapter = a.adapter;
+        if (!["claude", "codex", "pi"].includes(adapter)) {
+          return text("adapter must be one of: claude, codex, pi");
+        }
+        if (RELAY_MODE) {
+          // Already joined via the invite redeem at startup — there is no local
+          // roster to write. Just confirm identity + pad. Honor the relay-assigned
+          // handle (myHandle) when present, else adopt the requested name.
+          if (a.name && !myHandle) myHandle = a.name;
+          out =
+            `(relay mode) you are @${myHandle || a.name} on pad "${padName}". ` +
+            `Already joined via invite — use say/read/who. Identity is fixed server-side.`;
+          break;
         }
         // Capture this kitty window as the wake target. Codex may scrub KITTY_*
         // from the MCP child even when the parent Codex process is in kitty, so
@@ -346,16 +377,34 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         break;
       }
       case "say":
+        if (RELAY_MODE) {
+          out = await relaySay(a.text);
+          break;
+        }
         if (!ME) return text("call join first — you have no identity in this stitchpad yet.", true);
         out = await sp(["say", a.text], ME);   // sender derived from server memory, never the agent
         break;
       case "read":
+        if (RELAY_MODE) {
+          out = await relayRead();
+          break;
+        }
         out = await sp(["read", "-n", String(a.lines || 80)]);
         break;
       case "who":
+        if (RELAY_MODE) {
+          out = await relayWho();
+          break;
+        }
         out = await sp(["roster"]);
         break;
       case "leave":
+        if (RELAY_MODE) {
+          // Courtesy note; relay membership tears down server-side. Best-effort.
+          await relaySay("left").catch(() => {});
+          out = "left (relay)";
+          break;
+        }
         if (!ME) return text("you haven't joined this stitchpad.", true);
         out = await sp(["leave", ME], ME);
         ME = null;
@@ -377,9 +426,50 @@ function text(s, isError = false) {
 // Best-effort + synchronous-ish: post the departure note before we exit.
 for (const sig of ["SIGINT", "SIGTERM"]) {
   process.on(sig, async () => {
-    if (ME) await sp(["leave", ME], ME).catch(() => {});
+    if (RELAY_MODE) {
+      if (relayToken && padName) await relaySay("left").catch(() => {});
+    } else if (ME) {
+      await sp(["leave", ME], ME).catch(() => {});
+    }
     process.exit(0);
   });
+}
+
+// ── Startup ─────────────────────────────────────────────────────────────
+// In relay mode with an invite, redeem it ONCE before serving so say/read/who
+// have a bearer token + pad + handle ready. Direct-token mode skips this.
+if (RELAY_MODE && RELAY_INVITE && !relayToken) {
+  try {
+    await redeemInvite();
+    console.error(`[stitchpad-mcp] relay: joined pad "${padName}" as @${myHandle}`);
+  } catch (err) {
+    console.error(`[stitchpad-mcp] relay redeem failed: ${err.message}`);
+    process.exit(1);
+  }
+} else if (RELAY_MODE) {
+  console.error(`[stitchpad-mcp] relay: direct token, pad "${padName}" as @${myHandle}`);
+}
+
+// ── Auto-start relay-watch poller (inbound @mention wake) ──────────────
+// In relay mode, spawn a background poller that watches the relay for new
+// @mentions and fires the local kitty window. One-paste UX: no second command.
+if (RELAY_MODE && myHandle && relayToken) {
+  const { spawn } = await import("node:child_process");
+  const watchScript = path.join(STITCHPAD_HOME, "relay", "watch.sh");
+  const child = spawn("bash", [watchScript], {
+    env: {
+      ...process.env,
+      STITCHPAD_RELAY: RELAY_URL,
+      STITCHPAD_TOKEN: relayToken,
+      STITCHPAD_NAME: myHandle,
+      STITCHPAD_PAD: padName,
+    },
+    stdio: "ignore",
+    detached: true,
+    // Don't inherit cwd — watch.sh resolves paths from env
+  });
+  child.unref();  // detach — survives MCP server exit
+  console.error(`[stitchpad-mcp] relay-watch poller spawned (pid ${child.pid})`);
 }
 
 const transport = new StdioServerTransport();
