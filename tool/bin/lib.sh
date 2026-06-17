@@ -273,6 +273,10 @@ sp_notify() {
 # Self-exit: watch.sh polls heartbeats and removes the lock + exits when ALL
 # heartbeats are stale (all agents' terminals closed).
 # Has any agent posted a fresh heartbeat recently?
+# MATCHES watch.sh react(): fresh mtime alone counts as alive when pid is empty
+# or zero (e.g. pre-ticker pads, corrupted alive files). Only stale mtime means
+# dead. This prevents the supervisor from exiting just because heartbeats lack
+# a pid field.
 sp_any_alive() {
   local now alive heart file pid ts
   now=$(date +%s)
@@ -281,7 +285,10 @@ sp_any_alive() {
     ts=$(stat -f %m "$heart" 2>/dev/null || stat -c %Y "$heart" 2>/dev/null || echo 0)
     [ $(( now - ts )) -lt 90 ] || continue
     pid=$(grep -o '"pid":[0-9]*' "$heart" 2>/dev/null | head -1 | cut -d: -f2)
-    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && return 0
+    # Fresh heartbeat with no pid still counts as alive (unknown != dead).
+    [ -z "$pid" ] && return 0
+    # Fresh heartbeat with live pid counts as alive.
+    kill -0 "$pid" 2>/dev/null && return 0
   done
   return 1
 }
