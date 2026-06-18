@@ -19,7 +19,18 @@
 # Requires (already in this kitty.conf): allow_remote_control socket-only (or yes).
 set -uo pipefail
 event="$1"; to="$2"; pad_md="$3"; taskfile="$4"
-log="${SP_PAD_DIR:-.}/.state/adapter.kitty.log"
+# SP_PAD_DIR may be either the project root (contains .stitchpad/) or the pad dir
+# itself (contains stitchpad.md). Normalize once so watcher/adapter agree.
+pad_root="${SP_PAD_DIR:-.}"
+if [ -f "$pad_root/stitchpad.md" ]; then
+  pad_dir="$pad_root"
+elif [ -d "$pad_root/.stitchpad" ]; then
+  pad_dir="$pad_root/.stitchpad"
+else
+  pad_dir=".stitchpad"
+fi
+mkdir -p "$pad_dir/.state" 2>/dev/null || true
+log="$pad_dir/.state/adapter.kitty.log"
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
 [ "$event" = "mention" ] || exit 0
 
@@ -31,28 +42,48 @@ case "$target" in
   *"@@"*) sock="${target%%@@*}"; win="${target##*@@}" ;;          # socket@@window_id (normal)
   *)      sock=""; win="" ;;                                       # empty/-/bare → resolve below
 esac
+# If the recorded kitty socket is stale (common after restart), drop it and
+# let the title-based self-heal find the current socket/window.
+if [[ "$sock" == unix:* ]]; then
+  _sock_path="${sock#unix:}"
+  [ -S "$_sock_path" ] || { sock=""; win=""; }
+fi
 
 # SELF-HEAL: if no usable target (codex/MCP often can't capture KITTY_WINDOW_ID),
-# find the agent's window by its title "🧵 <name>" via kitty's own window list.
-# Works without the agent ever having captured anything.
+# find the agent's window. Match AUTHORITATIVELY on env.STITCHPAD_NAME first (the
+# session itself declares who it is — set by the launcher / agent shell), then
+# fall back to the cosmetic title "🧵 <name>". This fixes the drift bug: a window
+# titled "🧵 larry" while hosting the dennis SESSION would mis-route under a
+# title-only match; env-first routes to whoever the session actually is. Once the
+# right window is found we re-stamp the title so the cosmetic drift self-corrects.
+# (Fleet without env yet → title fallback keeps working until next respawn.)
 if [ -z "$sock" ] || [ -z "$win" ]; then
   # Dynamic socket discovery: try KITTY_SOCKET/KITTY_LISTEN_ON, then find any kitty socket in /tmp/
   sk="${KITTY_SOCKET:-${KITTY_LISTEN_ON:-}}"
   if [ -z "$sk" ]; then
     sk="unix:$(ls /tmp/kitty-* 2>/dev/null | head -1)"
   fi
-  found="$("$kitty_bin" @ --to "$sk" ls 2>/dev/null | python3 -c '
+  # prints "<win_id> <matchkey>" where matchkey is env|title (or empty if none)
+  read -r found matchkey <<<"$("$kitty_bin" @ --to "$sk" ls 2>/dev/null | python3 -c '
 import sys,json
+name=sys.argv[1]
 try:
-  d=json.load(sys.stdin); name=sys.argv[1]
-  for o in d:
-    for t in o["tabs"]:
-      for w in t["windows"]:
-        if w.get("title","")=="🧵 "+name: print(w["id"]); raise SystemExit
-except SystemExit: pass
-except: pass' "$to" 2>/dev/null)"
+  d=json.load(sys.stdin)
+  wins=[w for o in d for t in o["tabs"] for w in t["windows"]]
+  # 1. authoritative: a session that declares STITCHPAD_NAME == name
+  for w in wins:
+    if (w.get("env",{}) or {}).get("STITCHPAD_NAME")==name:
+      print(w["id"],"env"); sys.exit()
+  # 2. fallback: cosmetic title (legacy fleet with no env set)
+  for w in wins:
+    if w.get("title","")=="🧵 "+name:
+      print(w["id"],"title"); sys.exit()
+except Exception: pass' "$to" 2>/dev/null)"
   if [ -n "$found" ]; then sock="$sk"; win="$found"
-    echo "[$(ts)] self-healed @$to target via title match -> win $win" >>"$log"
+    echo "[$(ts)] self-healed @$to target via $matchkey match -> win $win" >>"$log"
+    # Re-stamp the canonical title on the window we authoritatively found, so a
+    # drifted title (e.g. 🧵 larry on a dennis session) self-corrects this wake.
+    "$kitty_bin" @ --to "$sk" set-window-title --match "id:$found" "🧵 $to" 2>/dev/null || true
   fi
 fi
 [ -n "$sock" ] && [ -n "$win" ] || { echo "[$(ts)] no kitty target for @$to (no @@target, no '🧵 $to' window found)" >>"$log"; exit 1; }
@@ -74,28 +105,24 @@ except: print(False)' "$win" 2>/dev/null)"
   fi
 fi
 
-# Context-rich nudge: carry WHO pinged + WHAT they said, so the wake is a
-# notification not a blind bell. Pull the latest block addressed to @$to from the
-# pad, take its author + a short snippet. Sanitize hard (strip anything that could
-# break send-text: quotes, backticks, newlines, control chars) and truncate. Falls
-# back to the generic line if extraction yields nothing.
-ctx="$(awk -v who="$to" '
-  function flush(){ if(author!="" && author!=who && hit){ la=author; lb=buf } }
-  BEGIN{ mention="(^|[^a-z0-9_-])@" tolower(who) "([^a-z0-9_-]|$)" }
-  /^## @/{ flush(); a=$2; sub(/^@/,"",a); author=tolower(a); buf=""; hit=0; next }
-  {
-    if (tolower($0) ~ mention) hit=1
-    if (buf=="" && $0 ~ /[^ \t]/) buf=$0   # first non-empty body line of the block
-  }
-  END{ flush(); if(la!="") print la "\t" lb }
-' "$pad_md" 2>/dev/null)"
-sender="${ctx%%$'\t'*}"; snip="${ctx#*$'\t'}"
-# sanitize snippet: collapse whitespace, drop chars that break send-text, cap length
-snip="$(printf '%s' "$snip" | tr -d '\r\n`"'"'"'\\' | tr -s ' ' | cut -c1-120)"
-if [ -n "$sender" ] && [ -n "$snip" ]; then
-  nudge="stitchpad: NEW from @$sender — $snip — reply with @$sender (read .stitchpad/stitchpad.md for full context)"
-else
-  nudge="stitchpad: @$to you were pinged — read .stitchpad/stitchpad.md and reply with a line starting @whoever-pinged-you"
+# Get the canonical wake message from the CLI — same text the stop-hook delivers.
+nudge="$(STITCHPAD_NAME="$to" stitchpad wake "$to" --peek 2>/dev/null)"
+[ -z "$nudge" ] && nudge="stitchpad: @$to you were pinged — read .stitchpad/stitchpad.md and reply"
+# sanitize for send-text (strip chars that break kitty's send-text)
+nudge="$(printf '%s' "$nudge" | tr -d '\r\n' | tr -s ' ')"
+
+# Ensure the woken agent's heartbeat ticker is running so alive.<name> stays fresh.
+# The agent's own session starts it via sp_maybe_start_heartbeat on any CLI call,
+# but a cold wake (no CLI run yet) leaves no ticker → agent decays offline in 90s.
+# Running it here from the watcher (which knows the pad dir) closes that gap.
+# IMPORTANT: do NOT background this with `( … ) &`. `heartbeat start` already
+# forks+disowns its own ticker internally and returns immediately; wrapping it in a
+# backgrounded subshell puts the ticker in THIS adapter's process group, which the
+# kernel reaps the instant the adapter exits — the ticker dies in <1s and the agent
+# decays anyway. Foreground spawn lets the internal disown outlive the adapter.
+if [ -n "$pad_dir" ] && [ -f "$pad_dir/stitchpad.md" ]; then
+  ( cd "$(dirname "$pad_dir")" && STITCHPAD_NAME="$to" stitchpad heartbeat start "$to" >/dev/null 2>&1 )
+  echo "[$(ts)] ensured heartbeat for @$to" >>"$log"
 fi
 
 # Submit in two steps: send-text drops the line in the prompt, then a SEPARATE

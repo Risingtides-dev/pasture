@@ -91,8 +91,12 @@ nudge="$(printf '%s' "$nudge" | LC_ALL=C tr -d '\000-\037\177' | tr -s ' ')"
 # The -f "$pad_dir/stitchpad.md" guard below also covers mark's pad_dir-default note:
 # if resolution fell through to the bare ".stitchpad" default and no real pad is there,
 # the file check fails and we skip the spawn rather than logging to the wrong place.
+# NOT backgrounded (`( … ) &`): heartbeat start forks+disowns its own ticker and
+# returns immediately. Backgrounding it puts the ticker in this adapter's process
+# group, reaped the instant the adapter exits (<1s) → agent decays anyway. Foreground
+# spawn lets the internal disown outlive the short-lived adapter. (proven, same as kitty.sh)
 if [ -n "$pad_dir" ] && [ -f "$pad_dir/stitchpad.md" ]; then
-  ( cd "$(dirname "$pad_dir")" && STITCHPAD_NAME="$to" stitchpad heartbeat start "$to" >/dev/null 2>&1 ) &
+  ( cd "$(dirname "$pad_dir")" && STITCHPAD_NAME="$to" stitchpad heartbeat start "$to" >/dev/null 2>&1 )
   echo "[$(ts)] ensured heartbeat for @$to" >>"$log"
 fi
 
