@@ -779,7 +779,7 @@ except Exception:
     # overwrite it back to the local cursor, or the remote wake collides with the
     # local one and silently never fires (the henry bug). Only default if unset.
     [ -n "${seen_file:-}" ] || seen_file="$PAD_STATE/seen.$who"
-    seen=0; [ -f "$_mc_seen_file" ] && seen="$(cat "$_mc_seen_file" 2>/dev/null || echo 0)"
+    seen=0; [ -f "$seen_file" ] && seen="$(cat "$seen_file" 2>/dev/null || echo 0)"
     if [ "$force" -eq 0 ] && [ "$last_mention_to_me" -le "${seen:-0}" ]; then
       exit 0   # already delivered this mention; not nagging (--force bypasses this)
     fi
@@ -792,7 +792,7 @@ except Exception:
     [ -n "$_sender" ] || _sender="$who"
     _snip="$(printf '%s\n' "$_latest" | grep -v '^## ' | grep -v '^[[:space:]]*$' | head -1 | sed 's/^[[:space:]]*//' | cut -c1-120)"
     printf 'stitchpad: NEW from @%s — %s — reply with @%s (read .stitchpad/stitchpad.md for full context)\n' "$_sender" "$_snip" "$_sender"
-    [ "$peek" -eq 0 ] && printf '%s' "$last_mention_to_me" > "$_mc_seen_file"   # mark delivered
+    [ "$peek" -eq 0 ] && printf '%s' "$last_mention_to_me" > "$seen_file"   # mark delivered
     exit 0
     ;;
 
@@ -906,7 +906,7 @@ except: print("")' 2>/dev/null)"
   start)  sp_init_paths || exit 1; ensure_watcher; echo "→ watcher ensured"; ;;
   stop)   sp_init_paths || exit 1; if [ -f "$PAD_STATE/watch.lock.d/pid" ]; then kill "$(cat "$PAD_STATE/watch.lock.d/pid")" 2>/dev/null || true; fi; rm -rf "$PAD_STATE/watch.lock.d" 2>/dev/null; echo "→ watcher stopped"; ;;
   status) sp_init_paths || exit 1; sp_watcher_alive && echo "running (pid $(cat "$PAD_STATE/watch.lock.d/pid" 2>/dev/null))" || echo "stopped"; ;;
-  restart) sp_init_paths || exit 1; rm -rf "$PAD_STATE/watch.lock.d" 2>/dev/null; ensure_watcher; echo "→ watcher restarted"; ;;
+  restart) sp_init_paths || exit 1; if [ -f "$PAD_STATE/watch.lock.d/pid" ]; then kill "$(cat "$PAD_STATE/watch.lock.d/pid")" 2>/dev/null || true; fi; rm -rf "$PAD_STATE/watch.lock.d" 2>/dev/null; ensure_watcher; echo "→ watcher restarted"; ;;
   watch)   exec "$STITCHPAD_HOME/bin/watch.sh" ;;
   daemon)  exec "$STITCHPAD_HOME/bin/daemon.sh" "${@}" ;;
 

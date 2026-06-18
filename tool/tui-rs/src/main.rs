@@ -156,10 +156,10 @@ fn main() -> io::Result<()> {
 
             // thin bottom hint
             let footer = Paragraph::new(if tab == 1 {
-                "q:quit  t/1/2:tab  j/k:nav  r:refresh".to_string()
+                "q:quit  t/1/2:tab  j/k:nav  r:refresh  s:start-watcher".to_string()
             } else {
                 format!(
-                    "q:quit  t/1/2:tab  a:compose  Tab:focus[{}]  j/k:nav  r:refresh",
+                    "q:quit  t/1/2:tab  a:compose  Tab:focus[{}]  j/k:nav  r:refresh  s:start-watcher",
                     focus_labels[focus as usize]
                 )
             });
@@ -247,6 +247,15 @@ fn main() -> io::Result<()> {
                                 roster.refresh();
                                 messages.refresh();
                                 board.refresh();
+                            }
+                            KeyCode::Char('s') => {
+                                // `restart`, not `start`: start→ensure_watcher is idempotent
+                                // and no-ops ("ensured") when a stale watcher is already
+                                // running, so it never picks up roster changes. restart
+                                // clears the lock + re-seeds so a flipped roster takes effect.
+                                let _ = std::process::Command::new("stitchpad")
+                                    .arg("restart")
+                                    .status();
                             }
                             _ => {}
                         }
