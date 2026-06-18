@@ -52,7 +52,7 @@ sp_autostart_name() {
 sp_maybe_start_heartbeat() {
   [ "${STITCHPAD_HEARTBEAT_AUTOSTART:-1}" = "0" ] && return 0
   case "$cmd" in
-    init|heartbeat|hook|bind-session|leave|stop|daemon|watch|help|-h|--help) return 0 ;;
+    init|heartbeat|hook|bind-session|leave|stop|daemon|watch|migration-check|help|-h|--help) return 0 ;;
   esac
   sp_init_paths >/dev/null 2>&1 || return 0
   local who
@@ -241,8 +241,9 @@ EOF
     sid="${1:?usage: stitchpad bind-session <session_id|-> <name>}"
     nm="${2:?name required}"
     if [ "$sid" = "-" ]; then
-      printf '%s' "$nm" > "$PAD_STATE/whoami"   # pad default (pi: no session id)
-      echo "✓ bound pad default → @$nm"
+      # ponytail: whoami is a shared file — writing it stamps every session as $nm.
+      # Agents without a session id must use STITCHPAD_NAME or KITTY_WINDOW_ID instead.
+      echo "✓ no session id — set STITCHPAD_NAME=$nm in your shell to pin identity" >&2
     else
       printf '%s' "$nm" > "$PAD_STATE/sessions/$sid"
       echo "✓ bound session $sid → @$nm"
@@ -261,7 +262,8 @@ EOF
       _kitty="$(command -v kitty || echo kitty)"
       cur="$(sp_user_field "$nm" target)"
       if [ -z "$cur" ] || [ "$cur" = "-" ]; then
-        sp_lock || exit 0
+        # We already hold the pad lock from the outer join transaction.
+        # Re-entering sp_lock here would self-deadlock and skip target capture.
         tgt="${KITTY_LISTEN_ON}@@${KITTY_WINDOW_ID}"
         tmp="$(mktemp)"
         awk -v who="$nm" -v tgt="$tgt" '
@@ -369,6 +371,10 @@ EOF
     sp_lock || exit 1
     printf '\n## %s · %s\n\n%s\n' "@$from" "$ts" "$text" >> "$PAD_MD"
     sp_commit "$from: $(printf '%s' "$text" | tr '\n' ' ' | cut -c1-60)"
+    # Posting IS the reply — clear both dropped-turn markers (the pending re-block
+    # bound AND the delivered_no_reply visibility flag) so a reply resolves them and
+    # they can't cause a spurious re-block or stale doctor state later.
+    rm -f "$PAD_STATE/pending.$from" "$PAD_STATE/delivered_no_reply.$from" 2>/dev/null
     sp_unlock
     echo "✓ posted as @$from"
     ;;
@@ -690,16 +696,37 @@ PY
     # The shared wake primitive every runtime adapter calls. Blocks (prints the
     # message) iff a mention addressed to <name> is newer than <name>'s last
     # addressed reply; otherwise silent. Stateless — derived from pad git history.
-    #   stitchpad wake [name] [--peek]   (name defaults to the joined identity)
-    sp_init_paths || exit 1
-    who="${1:-}"
-    if [ -n "$who" ] && [ "$who" != "--peek" ]; then shift; else who=""; fi
+    #   stitchpad wake [name] [--peek] [--relay]
+    # name defaults to the joined identity. Relay mode may run on a coworker's
+    # machine with no local .stitchpad checkout, so it uses global hook state.
+    relay_mode=0; peek=0; ordinal_only=0; force=0; who=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --peek) peek=1; shift ;;
+        # --peek-ordinal: print just the open-mention ordinal (mention>reply) and
+        # exit, never advancing seen. Used by watch.sh to stamp pending.<name> so
+        # the stop-hook can recover a dropped turn in the same ordinal currency.
+        --peek-ordinal) ordinal_only=1; peek=1; shift ;;
+        # --force: bypass the seen cursor (still honors the engagement gate:
+        # mention>reply). Emits the wake message for an OPEN mention even if already
+        # delivered. The stop-hook's dropped-turn recovery uses this to re-present a
+        # mention whose seen cursor was consumed by a turn that died before posting.
+        --force) force=1; peek=1; shift ;;
+        --relay) relay_mode=1; shift ;;
+        *) [ -z "$who" ] && who="$1"; shift ;;
+      esac
+    done
+    if [ "$relay_mode" -eq 1 ]; then
+      PAD_STATE="${STITCHPAD_RELAY_STATE_DIR:-${STITCHPAD_HOME:-$HOME/.stitchpad}/.state}"
+      mkdir -p "$PAD_STATE/sessions"
+    else
+      sp_init_paths || exit 1
+    fi
     # Identity: explicit arg, else this terminal's pinned STITCHPAD_NAME.
     [ -z "$who" ] && who="$(sp_me)"
     [ -z "$who" ] && exit 0   # unidentified → nothing to wake
-    peek=0; [ "${1:-}" = "--peek" ] && peek=1
     # Relay-mode wake: download pad from relay, run local wake logic against it
-    if [ "${1:-}" = "--relay" ]; then shift
+    if [ "$relay_mode" -eq 1 ]; then
       relay="${STITCHPAD_RELAY:-}"; token="${STITCHPAD_TOKEN:-}"; pad="${STITCHPAD_PAD:-}"
       [ -z "$relay" ] || [ -z "$token" ] || [ -z "$pad" ] && exit 0
       tmpmd="$(mktemp)"; trap 'rm -f "$tmpmd"' EXIT
@@ -717,7 +744,7 @@ except Exception:
       [ -s "$tmpmd" ] || exit 0
       # Temporarily override PAD_MD to the downloaded relay pad so the local
       # engagement/wake machinery runs unchanged against it.
-      _orig_pad_md="$PAD_MD"; PAD_MD="$tmpmd"
+      PAD_MD="$tmpmd"
       # Track seen cursor against relay, not local pad
       seen_file="$PAD_STATE/seen.relay.$who"
     fi
@@ -737,6 +764,10 @@ except Exception:
     if [ "${last_reply_by_me:-0}" -gt "$last_mention_to_me" ]; then
       exit 0   # my reply is newer than the mention → handled
     fi
+    # --peek-ordinal: gate is open (mention unanswered) → print the ordinal, done.
+    # Independent of the seen cursor on purpose: pending tracks "owes a reply",
+    # seen tracks "already nudged". They answer different questions.
+    if [ "$ordinal_only" -eq 1 ]; then printf '%s' "$last_mention_to_me"; exit 0; fi
     # WAKE-ONCE: fire on a mention once, don't nag it forever. An agent that reads
     # a mention and chooses not to reply (legitimately going quiet) must still be
     # able to clear the gate — otherwise "stand down" traps it in a re-fire loop.
@@ -744,10 +775,13 @@ except Exception:
     # .state/seen.<name>; a mention <= seen is "already delivered" → silent. A
     # genuinely NEWER mention (higher ordinal) still fires. No reply required.
     # --peek never advances seen (so callers can inspect without consuming).
-    seen_file="$PAD_STATE/seen.$who"
+    # NOTE: relay mode already set seen_file to seen.relay.<who> above — do NOT
+    # overwrite it back to the local cursor, or the remote wake collides with the
+    # local one and silently never fires (the henry bug). Only default if unset.
+    [ -n "${seen_file:-}" ] || seen_file="$PAD_STATE/seen.$who"
     seen=0; [ -f "$seen_file" ] && seen="$(cat "$seen_file" 2>/dev/null || echo 0)"
-    if [ "$last_mention_to_me" -le "${seen:-0}" ]; then
-      exit 0   # already delivered this mention; not nagging
+    if [ "$force" -eq 0 ] && [ "$last_mention_to_me" -le "${seen:-0}" ]; then
+      exit 0   # already delivered this mention; not nagging (--force bypasses this)
     fi
     if sp_dnd_is_on "$who"; then
       exit 0   # muted locally; leave seen untouched so the mention queues
@@ -808,13 +842,60 @@ except: print("")' 2>/dev/null)"
     [ -n "$cwd" ] && cd "$cwd" 2>/dev/null || true
     sid="$(printf '%s' "$input" | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
     [ -n "$sid" ] && export STITCHPAD_SESSION="$sid"
+    # Relay-mode MCP runs in a different process from this Stop hook. Persisted
+    # hook env lets remote agents wake via the same Stop hook without users
+    # hand-exporting relay vars in the runtime shell.
+    if [ -z "${STITCHPAD_RELAY:-}" ] || [ -z "${STITCHPAD_TOKEN:-}" ] || [ -z "${STITCHPAD_PAD:-}" ]; then
+      for _relay_env in \
+        "${sid:+${STITCHPAD_HOME:-$HOME/.stitchpad}/.state/relay-hook.$sid.env}" \
+        "${STITCHPAD_HOME:-$HOME/.stitchpad}/.state/relay-hook.env"
+      do
+        [ -n "$_relay_env" ] || continue
+        [ -f "$_relay_env" ] || continue
+        # shellcheck disable=SC1090
+        . "$_relay_env" 2>/dev/null || true
+        [ -n "${STITCHPAD_RELAY:-}" ] && [ -n "${STITCHPAD_TOKEN:-}" ] && [ -n "${STITCHPAD_PAD:-}" ] && break
+      done
+    fi
     # Don't re-block a turn we already continued (avoids an infinite Stop loop).
     if printf '%s' "$input" | grep -q '"stop_hook_active"[[:space:]]*:[[:space:]]*true'; then exit 0; fi
     # Relay mode: check relay for @mentions instead of local pad
     if [ -n "${STITCHPAD_RELAY:-}" ] && [ -n "${STITCHPAD_TOKEN:-}" ] && [ -n "${STITCHPAD_PAD:-}" ]; then
       msgs="$("$0" wake --relay 2>/dev/null || true)"
     else
-      msgs="$("$0" wake ${STITCHPAD_NAME:+"$STITCHPAD_NAME"} 2>/dev/null || true)"
+      sp_init_paths || exit 0
+      # In Stop-hook context, session id is the authority. A stale STITCHPAD_NAME
+      # in the runtime env must not override the session binding and wake the
+      # wrong agent. If the session cannot be resolved, fail closed.
+      who="$(sp_session_name)"
+      [ -z "$who" ] && exit 0
+      msgs="$("$0" wake ${who:+"$who"} 2>/dev/null || true)"
+      # DROPPED-TURN RECOVERY (local mode only). The normal wake above respects the
+      # seen cursor, so a mention already pushed by the watcher returns nothing —
+      # correct for a legitimately-silent turn, WRONG for a turn that died mid-tool
+      # before posting (smaths then sees silence). pending.<who> was stamped by
+      # watch.sh with the delivered ordinal. If it's still set AND the engagement
+      # gate is STILL open at the SAME ordinal (no reply posted), re-block ONCE via
+      # 'wake --force' (bypasses the consumed seen cursor, gate still holds).
+      #
+      # VISIBILITY (dennis's acceptance gap): the re-block is bounded to one shot,
+      # but if that retry ALSO produces no reply we must not lose it silently — that
+      # was the whole bug. So we don't just delete pending: we TRANSITION it to
+      # delivered_no_reply.<who> (carrying the ordinal). That marker is surfaced by
+      # doctor/TUI and cleared only by an actual authored reply (in the `say` path).
+      # Net: at most one re-block (no loop), but a persistently-dropped mention stays
+      # VISIBLE instead of vanishing. A genuinely newer mention supersedes it.
+      _pend="$PAD_STATE/pending.$who"
+      if [ -z "$msgs" ] && [ -f "$_pend" ]; then
+        _pend_ord="$(cat "$_pend" 2>/dev/null || echo 0)"
+        _open_ord="$("$0" wake "$who" --peek-ordinal 2>/dev/null || echo 0)"
+        rm -f "$_pend" 2>/dev/null   # consume the re-block bound regardless
+        if [ -n "$_open_ord" ] && [ "${_open_ord:-0}" -gt 0 ] && [ "${_open_ord:-0}" = "${_pend_ord:-x}" ]; then
+          msgs="$("$0" wake "$who" --force 2>/dev/null || true)"
+          # mark delivered-but-unanswered so a second silent drop stays visible
+          printf '%s' "$_open_ord" > "$PAD_STATE/delivered_no_reply.$who" 2>/dev/null || true
+        fi
+      fi
     fi
     [ -z "$msgs" ] && exit 0   # nothing for me → stop normally
     esc="$(printf '%s' "$msgs" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null)"
@@ -991,6 +1072,7 @@ except: print("")' 2>/dev/null)"
       [ernie]='#9b30ff'    # purple
       [dennis]='#ff8c00'   # orange
       [Jill]='#ff1493'     # pink
+      [jill]='#ff1493'     # pink
       [mark]='#ffd700'     # yellow
       [nancy]='#00ffff'    # cyan
       [henry]='#1e90ff'    # blue — remote writer (Eric's machine)
@@ -1041,6 +1123,15 @@ except: print("")' 2>/dev/null)"
     else
       echo "${_color_map[$1]:-#808080}"
     fi
+    ;;
+
+  send)
+    # stitchpad send <file> [caption...]  — upload image + post to pad in one step
+    sp_init_paths || exit 1
+    file="${1:?usage: stitchpad send <file> [caption...]}"
+    shift || true
+    caption="$*"
+    exec "$0" say --image "$file" ${caption:+"$caption"}
     ;;
 
   roster|who)  sp_init_paths || exit 1; sp_roster ;;
@@ -1203,8 +1294,12 @@ for os_win in data:
       _level="$(cat "$PAD_STATE/level.$_name" 2>/dev/null || true)"
 
       if [ "$_json" -eq 1 ]; then
-        _entry="$(printf '{"name":"%s","adapter":"%s","wake":"%s","target":"%s","harness":"%s","model":"%s","status":"%s","health":"%s","role":"%s","level":"%s"}' \
-          "$_name" "$_adapter" "$_wake" "$_target" "$_harness_display" "${_model:-}" "$_online" "$_health" "$_role" "$_level")"
+        # delivered_no_reply: a mention was re-delivered to this agent and STILL got
+        # no authored reply (dropped twice). Surfaced so persistent silence is
+        # visible, not lost. "true"/"false" — TUI can flag the row.
+        _dnr="false"; [ -f "$PAD_STATE/delivered_no_reply.$_name" ] && _dnr="true"
+        _entry="$(printf '{"name":"%s","adapter":"%s","wake":"%s","target":"%s","harness":"%s","model":"%s","status":"%s","health":"%s","role":"%s","level":"%s","delivered_no_reply":%s}' \
+          "$_name" "$_adapter" "$_wake" "$_target" "$_harness_display" "${_model:-}" "$_online" "$_health" "$_role" "$_level" "$_dnr")"
         _json_entries+=("$_entry")
       else
         if [ ${#issues[@]} -eq 0 ]; then
@@ -1368,6 +1463,132 @@ for os_win in data:
 
       *) echo "usage: stitchpad task {new|list|move|edit}" >&2; exit 1 ;;
     esac
+    ;;
+
+  migration-check)
+    # 4-point migration verifier: confirms an agent is safe to migrate from
+    # kitty to Supacode. All 4 gates must pass (green) before migration is
+    # declared proven. Any red → revert to kitty.
+    #   stitchpad migration-check <name>
+    sp_init_paths || exit 1
+    local pilot="${1:-}"
+    if [ -z "$pilot" ]; then
+      echo "usage: stitchpad migration-check <name>" >&2
+      exit 1
+    fi
+
+    local pass=0 fail=0
+    local green='\033[32m' red='\033[31m' reset='\033[0m'
+    local check mark
+
+    echo "stitchpad migration-check — verifying @$pilot"
+    echo ""
+
+    # Gate 1: doctor confirms supacode target
+    echo -n "  [1/4] supacode target .......... "
+    local doctor_out
+    doctor_out="$("$0" doctor --json 2>/dev/null || true)"
+    if echo "$doctor_out" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for m in data:
+    if m.get('name') == '$pilot':
+        t = m.get('target', '')
+        a = m.get('adapter', '')
+        if a == 'supacode' and t and t != '-':
+            print('OK')
+            sys.exit(0)
+print('FAIL')
+sys.exit(1)
+" 2>/dev/null; then
+      echo "${green}PASS${reset} — supacode target validated"
+      (( pass++ ))
+    else
+      echo "${red}FAIL${reset} — not supacode or no target"
+      (( fail++ ))
+    fi
+
+    # Gate 2: recent heartbeat from supacode
+    echo -n "  [2/4] heartbeat ................ "
+    local alive_file="$PAD_STATE/alive.$pilot"
+    if [ -f "$alive_file" ]; then
+      local alive_age="$(($(date +%s) - $(stat -f %m "$alive_file" 2>/dev/null || echo 0)))"
+      if [ "$alive_age" -lt 90 ]; then
+        local alive_pid="$(python3 -c "import json; print(json.load(open('$alive_file')).get('pid',''))" 2>/dev/null || true)"
+        if [ -n "$alive_pid" ] && kill -0 "$alive_pid" 2>/dev/null; then
+          echo "${green}PASS${reset} — heartbeat $(printf '%ds' "$alive_age") ago, pid $alive_pid alive"
+          (( pass++ ))
+        else
+          echo "${red}FAIL${reset} — pid $alive_pid not running"
+          (( fail++ ))
+        fi
+      else
+        echo "${red}FAIL${reset} — heartbeat ${alive_age}s stale"
+        (( fail++ ))
+      fi
+    else
+      echo "${red}FAIL${reset} — no heartbeat file"
+      (( fail++ ))
+    fi
+
+    # Gate 3: single session→name (no dual ownership)
+    echo -n "  [3/4] single identity ........... "
+    local session_count=0
+    local extra_sessions=""
+    for sf in "$PAD_STATE/sessions/"*; do
+      [ -f "$sf" ] || continue
+      if [ "$(cat "$sf" 2>/dev/null)" = "$pilot" ]; then
+        (( session_count++ ))
+        [ "$session_count" -gt 1 ] && extra_sessions="$extra_sessions $(basename "$sf")"
+      fi
+    done
+    # Also check whoami fallback
+    if [ "$(cat "$PAD_STATE/whoami" 2>/dev/null || true)" = "$pilot" ]; then
+      (( session_count++ ))
+      extra_sessions="$extra_sessions whoami"
+    fi
+    if [ "$session_count" -eq 1 ]; then
+      echo "${green}PASS${reset} — exactly 1 session→name binding"
+      (( pass++ ))
+    elif [ "$session_count" -eq 0 ]; then
+      echo "${red}FAIL${reset} — no session bound"
+      (( fail++ ))
+    else
+      echo "${red}FAIL${reset} — $session_count bindings (dual ownership):$extra_sessions"
+      (( fail++ ))
+    fi
+
+    # Gate 4: wake round-trip — seen cursor advanced + reply ordinal exists
+    echo -n "  [4/4] wake round-trip ........... "
+    local seen_file="$PAD_STATE/seen.$pilot"
+    local seen_before=0 seen_after=0
+    if [ -f "$seen_file" ]; then
+      seen_before="$(cat "$seen_file" 2>/dev/null || echo 0)"
+    fi
+    # Send a test ping via the pad (silent, just advances the cursor)
+    "$0" say "[$pilot migration-check ping $(date +%s)]" >/dev/null 2>&1 || true
+    sleep 2
+    # Check the seen cursor advanced
+    if [ -f "$seen_file" ]; then
+      seen_after="$(cat "$seen_file" 2>/dev/null || echo 0)"
+    fi
+    if [ "$seen_after" -gt "$seen_before" ]; then
+      echo "${green}PASS${reset} — seen cursor $seen_before → $seen_after (wake delivered)"
+      (( pass++ ))
+    else
+      echo "${red}FAIL${reset} — seen cursor did not advance ($seen_before → $seen_after)"
+      (( fail++ ))
+    fi
+
+    # Summary
+    echo ""
+    if [ "$fail" -eq 0 ]; then
+      echo "${green}ALL 4 GATES PASSED — @$pilot migration proven.${reset}"
+      exit 0
+    else
+      echo "${red}$fail/$(( pass + fail )) GATES FAILED — revert @$pilot to kitty.${reset}"
+      exit 1
+    fi
     ;;
 
   help|*)
