@@ -100,17 +100,24 @@ if [ -n "$pad_dir" ] && [ -f "$pad_dir/stitchpad.md" ]; then
   echo "[$(ts)] ensured heartbeat for @$to" >>"$log"
 fi
 
-# WAKE via zmx raw-pty write — the session name is `supa-<surface_uuid>` (lowercased).
-# The trailing carriage return is the submit (a real Enter to the pty), which is the
-# part the supacode CLI's insert path drops. zmx docs are explicit: send is raw and
-# caller appends \r to execute. One call, submits across plain shells AND TUI agents.
-# We focus the surface first (cosmetic — brings it visible) then send.
+# WAKE via the send-key fork primitive: `surface focus --input <text> --key Enter`
+# inserts the nudge AND fires a REAL keyboard Enter event in one call. This is the fix
+# for the Claude-TUI submit bug: zmx's `\r` lands text in the composer but the TUI's
+# custom keyboard mode treats it as "newline in composer", not "submit" — so wakes
+# parked un-sent (proven live: nudge sat at dale's `❯` prompt, never submitted). A real
+# ghostty_surface_key Enter event bypasses that interception and submits. (fork
+# feature/send-key, GhosttyKeyMapping + GhosttySurfaceBridge.sendKey; built + installed.)
 sess="supa-$(printf '%s' "$surface" | tr 'A-Z' 'a-z')"
-"$sc_bin" surface focus -t "$tab" -s "$surface" >/dev/null 2>&1   # bring visible (rc ignored)
-if printf '%s\r' "$nudge" | "$zmx_bin" send "$sess" >>"$log" 2>&1; then
-  echo "[$(ts)] woke @$to via zmx send ($sess)" >>"$log"
+if "$sc_bin" surface focus -t "$tab" -s "$surface" --input "$nudge" --key Enter >>"$log" 2>&1; then
+  echo "[$(ts)] woke @$to via surface focus --input+--key Enter ($surface)" >>"$log"
+  exit 0
+# FALLBACK: older supacode without `--key` (pre-fork). zmx `\r` still submits in plain
+# shells / pi surfaces; only the Claude TUI needs the real key-event. Keeps non-claude
+# wakes working if an agent's app hasn't been updated to the send-key build yet.
+elif printf '%s\r' "$nudge" | "$zmx_bin" send "$sess" >>"$log" 2>&1; then
+  echo "[$(ts)] woke @$to via zmx send fallback ($sess) — --key unavailable" >>"$log"
   exit 0
 else
-  echo "[$(ts)] zmx send failed for @$to ($sess) — session may be dead; respawn via launcher" >>"$log"
+  echo "[$(ts)] wake FAILED for @$to ($sess) — surface dead; respawn via launcher" >>"$log"
   exit 1
 fi
