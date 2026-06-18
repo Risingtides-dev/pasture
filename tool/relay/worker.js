@@ -102,7 +102,27 @@ export default {
     }
     if (url.pathname === "/pad" && req.method === "GET") {
       const v = await env.STITCHPAD.get(padKey);
-      return json(v ? JSON.parse(v) : { pad: "", roster: [], name: pad, at: 0 });
+      if (!v) return json({ pad: "", roster: [], name: pad, at: 0 });
+      const data = JSON.parse(v);
+      // ETag: use the stored `at` timestamp as the version identifier.
+      const etag = `"${data.at || 0}"`;
+      const ifNoneMatch = req.headers.get("if-none-match") || "";
+      if (ifNoneMatch === etag) {
+        return new Response(null, { status: 304, headers: { ...cors, etag } });
+      }
+      // Tail support: ?tail=N returns only the last N lines of pad markdown,
+      // keeping roster/files/colors/metadata intact. This shrinks the polling
+      // payload for large pads where the PWA only needs recent context.
+      const tail = parseInt(url.searchParams.get("tail") || "0", 10);
+      let responseData = data;
+      if (tail > 0 && typeof data.pad === "string") {
+        const lines = data.pad.split("\n");
+        responseData = { ...data, pad: lines.slice(-tail).join("\n") };
+      }
+      return new Response(JSON.stringify(responseData), {
+        status: 200,
+        headers: { "content-type": "application/json", ...cors, etag }
+      });
     }
     if (url.pathname === "/pad.colors" && req.method === "GET") {
       const v = await env.STITCHPAD.get(padKey);

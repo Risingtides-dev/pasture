@@ -167,7 +167,10 @@ const initInk=n=>onLight(n)?"#1a1d29":"#fff";          // initials read on the a
 const esc=s=>(s||"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 const initials=n=>(n||"?").slice(0,2).toUpperCase();
 // avatar: show avatars/<name>.png if it loads, else fall back to colored initials square.
-const av=n=>`<div class="av card-trigger" data-agent="${esc(n)}" style="background:${colorFor(n)};color:${initInk(n)}"><img src="avatars/${encodeURIComponent(n)}.png" alt="" onerror="this.onerror=null;this.src='avatars/_default.png'"><span>${initials(n)}</span></div>`;
+// loading="lazy" + decoding="async": off-screen avatars in a long log don't fetch
+// or block until scrolled near. The colored initials square shows immediately, the
+// png swaps in when in view. Pure client-side, no payload-contract dependency.
+const av=n=>`<div class="av card-trigger" data-agent="${esc(n)}" style="background:${colorFor(n)};color:${initInk(n)}"><img src="avatars/${encodeURIComponent(n)}.png" alt="" loading="lazy" decoding="async" onerror="this.onerror=null;this.src='avatars/_default.png'"><span>${initials(n)}</span></div>`;
 function fmt(t){
   t=esc(t);
   t=t.replace(/```([\s\S]*?)```/g,(m,c)=>`<div class="cb"><button class="cpy" title="copy">copy</button><pre>${c.trim()}</pre></div>`);
@@ -188,7 +191,7 @@ async function loadPads(){
   if(!pad&&pads[0])pad=pads[0].name;
   pads.forEach(p=>{const d=document.createElement("div");d.className="chan"+(p.name===pad?" on":"");
     d.innerHTML=`<span class="h">#</span>${esc(p.name)}`;
-    d.onclick=()=>{pad=p.name;dmWith="";localStorage.removeItem("sp_dm");localStorage.setItem("sp_pad",pad);document.getElementById("chans").classList.remove("open");render();loadPads();};
+    d.onclick=()=>{pad=p.name;dmWith="";PAD_ETAG="";localStorage.removeItem("sp_dm");localStorage.setItem("sp_pad",pad);document.getElementById("chans").classList.remove("open");render();loadPads();};
     cl.appendChild(d);});
 }
 function parse(md){const out=[];let cur=null;
@@ -213,7 +216,18 @@ function inDM(b,x){
 }
 async function render(){
   if(!pad)return;
-  const r=await api("/pad?pad="+encodeURIComponent(pad)); if(!r.ok)return; const d=await r.json();
+  // ETag-aware polling: send If-None-Match so unchanged pads return 304 (tiny body).
+  // Use ?tail=200 on subsequent polls to keep payload small on large pads.
+  const headers = {};
+  if (PAD_ETAG) headers["if-none-match"] = PAD_ETAG;
+  const tailParam = PAD_ETAG ? "&tail=200" : "";
+  const r=await api("/pad?pad="+encodeURIComponent(pad)+tailParam, {headers});
+  if (r.status === 304) return; // pad unchanged, skip render entirely
+  if (!r.ok) return;
+  // Store the new ETag for next poll
+  const newEtag = r.headers.get("etag");
+  if (newEtag) PAD_ETAG = newEtag;
+  const d=await r.json();
   document.getElementById("chTitle").textContent=dmWith?("@"+dmWith):("# "+pad);
   setRelayColors(d.colors);   // single source of truth — relay's stitchpad-color table
   ROSTER=(d.roster||[]).map(m=>m.name); FILES=d.files||[];
@@ -230,9 +244,18 @@ async function render(){
   const cpyBtn=text=>`<button class="row-cpy" title="copy message" data-copy="${btoa(unescape(encodeURIComponent(text)))}">copy</button>`;
   const rowHtml=b=>`<div class="row">${cpyBtn(b.body.join("\n").trim())}${av(b.who)}<div class="bubble"><div class="hd"><span class="who card-trigger" data-agent="${esc(b.who)}" style="color:${nameColor(b.who)}">${esc(b.who)}</span><span class="ts">${esc(b.t)}</span></div><div class="bd">${fmt(b.body.join("\n").trim())}</div></div></div>`;
   const pendHtml=p=>`<div class="row pending">${av(me)}<div class="bubble"><div class="hd"><span class="who" style="color:${nameColor(me)}">${esc(me)}</span><span class="ts">sending…</span></div><div class="bd">${fmt(p.text)}</div></div></div>`;
-  log.innerHTML=msgs.map(b=>b.sys?`<div class="sys">${esc(b.sys)}</div>`:rowHtml(b)).join("")+PENDING.map(pendHtml).join("");
-  if(atBottom)log.scrollTop=log.scrollHeight;
+  const html=msgs.map(b=>b.sys?`<div class="sys">${esc(b.sys)}</div>`:rowHtml(b)).join("")+PENDING.map(pendHtml).join("");
+  // PERF: render() runs every 3s. Nuking log.innerHTML each time re-parses every
+  // message, re-runs fmt() markdown on every body, and re-paints the whole list —
+  // the jank smaths felt, and it worsens as the pad grows. Skip the DOM write when
+  // the rendered HTML is byte-identical to last paint (the common idle case). Only
+  // an actual content change touches the DOM now. ponytail: string-equality guard
+  // beats a virtual-DOM diff for a flat append-only log; upgrade to keyed appends
+  // only if message counts get huge enough that even building `html` is the cost.
+  if(html!==LAST_LOG_HTML){ log.innerHTML=html; LAST_LOG_HTML=html; if(atBottom)log.scrollTop=log.scrollHeight; }
 }
+let LAST_LOG_HTML="";
+let PAD_ETAG="";
 let ROSTER=[],FILES=[],PENDING=[],ROSTER_INFO={},PROFILES={},CLAIMS=[],dmWith="";
 // File-write claims telemetry: "✏️ @x editing <file>" — shows who holds a write
 // lease so we can SEE the locks. Reads pad.claims (from `stitchpad claims` via bridge).
@@ -339,7 +362,21 @@ async function send(){let text=ta.value.trim();if(!text||!pad)return;ta.value=""
   const log=document.getElementById("log");
   log.insertAdjacentHTML("beforeend",`<div class="row pending">${av(me)}<div class="bubble"><div class="hd"><span class="who" style="color:${nameColor(me)}">${esc(me)}</span><span class="ts">sending…</span></div><div class="bd">${fmt(text)}</div></div></div>`);
   log.scrollTop=log.scrollHeight;
-  await api("/say?pad="+encodeURIComponent(pad),{method:"POST",body:JSON.stringify({from:me,text})});setTimeout(render,400);}
+  // SEND FEEDBACK: a control surface must never leave a message stuck on "sending…"
+  // with no signal. On network/HTTP failure, surface it + offer one-tap retry by
+  // restoring the text to the composer, instead of silent loss (the painful case).
+  try{
+    const r=await api("/say?pad="+encodeURIComponent(pad),{method:"POST",body:JSON.stringify({from:me,text})});
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    setTimeout(render,400);
+  }catch(err){
+    PENDING=PENDING.filter(p=>p.text!==text);   // drop the optimistic bubble
+    ta.value=text; autosize();                   // restore text so the send isn't lost
+    const b=document.createElement("div"); b.className="sys";
+    b.style.color="#e01010"; b.textContent="⚠ send failed ("+err.message+") — your text is back in the box, press send to retry";
+    log.appendChild(b); log.scrollTop=log.scrollHeight;
+  }
+}
 document.getElementById("send").onclick=send;
 ta.addEventListener("keydown",e=>{
   if(ac.open){
