@@ -2,7 +2,7 @@
 # relay-watch — remote-agent mention poller.
 #
 # Polls the relay GET /pad endpoint for new @mentions of the local agent.
-# When a mention is found, fires the local kitty window (same as watch.sh).
+# When a mention is found, wakes the local Velocity surface (same as watch.sh).
 #
 # Usage:
 #   STITCHPAD_RELAY=https://stitchpad.agentsworld.org \
@@ -10,8 +10,8 @@
 #   STITCHPAD_NAME=<your-handle> \
 #   stitchpad relay-watch
 #
-# Requires: KITTY_LISTEN_ON or KITTY_SOCKET + KITTY_WINDOW_ID in env
-# (kitty auto-sets these for child processes).
+# Requires: $VELOCITY_SURFACE_ID + $VELOCITY_TAB_ID in env (Velocity injects
+# these into every surface's shell).
 
 set -euo pipefail
 
@@ -25,13 +25,23 @@ if [ -z "$RELAY" ] || [ -z "$TOKEN" ] || [ -z "$HANDLE" ]; then
   exit 1
 fi
 
-KITTY_SOCK="${KITTY_LISTEN_ON:-${KITTY_SOCKET:-}}"
-KITTY_WIN="${KITTY_WINDOW_ID:-}"
+SC_SURFACE="${VELOCITY_SURFACE_ID:-${SUPACODE_SURFACE_ID:-}}"
+SC_TAB="${VELOCITY_TAB_ID:-${SUPACODE_TAB_ID:-}}"
+SC_WORKTREE="${VELOCITY_WORKTREE_ID:-${SUPACODE_WORKTREE_ID:-}}"
+# Velocity is the only surface. (SUPACODE_* are the env vars Velocity inherited.)
+SURFACE_APP="velocity"
 
-if [ -z "$KITTY_SOCK" ] || [ -z "$KITTY_WIN" ]; then
-  echo "relay-watch: KITTY_LISTEN_ON and KITTY_WINDOW_ID required (run in kitty)" >&2
+if [ -z "$SC_SURFACE" ] || [ -z "$SC_TAB" ]; then
+  echo "relay-watch: surface + tab IDs required (run in Velocity)" >&2
   exit 1
 fi
+
+if [ -n "${STITCHPAD_SURFACE_CLI:-}" ]; then
+  SC_BIN="$STITCHPAD_SURFACE_CLI"
+else
+  SC_BIN="$(command -v velocity 2>/dev/null || echo /Applications/Velocity.app/Contents/Resources/bin/velocity)"
+fi
+[ -x "$SC_BIN" ] || { echo "relay-watch: velocity CLI not found at $SC_BIN" >&2; exit 1; }
 
 LAST_SEEN=0  # track mention ordinal to avoid re-firing
 SEEN_FILE="${STITCHPAD_HOME:-$HOME/.stitchpad}/.state/relay-watch-seen.${HANDLE}"
@@ -64,13 +74,12 @@ while true; do
 
   if [ "$mention_count" -gt "$LAST_SEEN" ]; then
     NEW_COUNT=$(( mention_count - LAST_SEEN ))
-    echo "[relay-watch] ${NEW_COUNT} new @${HANDLE} mentions — waking kitty window ${KITTY_WIN}"
+    echo "[relay-watch] ${NEW_COUNT} new @${HANDLE} mentions — waking ${SURFACE_APP} surface ${SC_SURFACE}"
 
-    # Fire kitty: send a wake nudge to the agent's window
-    # Use remote-control to type a short prompt that triggers wake
-    kitty @ --to "$KITTY_SOCK" send-text \
-      --match "id:${KITTY_WIN}" \
-      "stitchpad wake ${HANDLE}"$'\n' 2>/dev/null || true
+    # Wake the surface: insert the nudge then submit it (same as velocity.sh).
+    nudge="stitchpad wake ${HANDLE}"
+    "$SC_BIN" surface focus -w "$SC_WORKTREE" -t "$SC_TAB" -s "$SC_SURFACE" -i "$nudge" >/dev/null 2>&1 || true
+    "$SC_BIN" surface send-key -w "$SC_WORKTREE" -t "$SC_TAB" -s "$SC_SURFACE" --key Enter >/dev/null 2>&1 || true
 
     LAST_SEEN="$mention_count"
     echo "$LAST_SEEN" > "$SEEN_FILE"

@@ -46,7 +46,7 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { execFile } from "node:child_process";
-import { readdir } from "node:fs/promises";
+import { chmod, mkdir, writeFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -81,6 +81,31 @@ if (RELAY_MODE) {
 let relayToken = process.env.STITCHPAD_TOKEN || "";
 let padName = process.env.STITCHPAD_PAD || "";
 let myHandle = process.env.STITCHPAD_HANDLE || "";
+
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+async function persistRelayHookEnv() {
+  if (!RELAY_MODE || !relayToken || !padName || !myHandle) return;
+  const stateDir = path.join(process.env.HOME || "", ".stitchpad", ".state");
+  if (!stateDir.startsWith("/")) return;
+  await mkdir(stateDir, { recursive: true, mode: 0o700 }).catch(() => {});
+  const body = [
+    `STITCHPAD_RELAY=${shellQuote(RELAY_URL)}`,
+    `STITCHPAD_TOKEN=${shellQuote(relayToken)}`,
+    `STITCHPAD_PAD=${shellQuote(padName)}`,
+    `STITCHPAD_NAME=${shellQuote(myHandle)}`,
+    `STITCHPAD_HANDLE=${shellQuote(myHandle)}`,
+    "",
+  ].join("\n");
+  const files = [path.join(stateDir, "relay-hook.env")];
+  if (SESSION_ID) files.unshift(path.join(stateDir, `relay-hook.${SESSION_ID}.env`));
+  for (const file of files) {
+    await writeFile(file, body, { mode: 0o600 });
+    await chmod(file, 0o600).catch(() => {});
+  }
+}
 
 // Where is the pad? An agent's cwd is the project; the CLI walks up for .stitchpad.
 // Allow override via STITCHPAD_CWD (the dir to resolve the pad from). LOCAL only.
@@ -157,79 +182,47 @@ async function relayWho() {
     .join("\n");
 }
 
-function envValue(text, key) {
-  const match = text.match(new RegExp(`(?:^|\\s)${key}=([^\\s]+)`));
-  return match ? match[1] : "";
-}
 
-async function parentKittyEnv() {
+// Recover the Velocity surface env from the PARENT process when this MCP child
+// didn't inherit it. Codex spawns the stitchpad MCP without forwarding surface env,
+// so the join's own process.env has no surface → it fell back to pull|- and could
+// never be push-woken. The surface vars live in the parent (the codex/claude process
+// running inside the app surface), so read them from `ps eww`. claude inherits
+// them directly; this only does work when they're missing. Best-effort: any failure
+// just leaves them blank and join falls back to pull as before.
+async function parentSurfaceEnv() {
+  const env = process.env;
+  // Velocity emits SUPACODE_* (inherited contract); VELOCITY_* preferred if present.
+  const have = {
+    VELOCITY_SURFACE_ID: env.VELOCITY_SURFACE_ID || "",
+    VELOCITY_TAB_ID: env.VELOCITY_TAB_ID || "",
+    VELOCITY_WORKTREE_ID: env.VELOCITY_WORKTREE_ID || "",
+    SUPACODE_SURFACE_ID: env.SUPACODE_SURFACE_ID || "",
+    SUPACODE_TAB_ID: env.SUPACODE_TAB_ID || "",
+    SUPACODE_WORKTREE_ID: env.SUPACODE_WORKTREE_ID || "",
+    STITCHPAD_SURFACE_ADAPTER: env.STITCHPAD_SURFACE_ADAPTER || "",
+  };
+  if ((have.VELOCITY_SURFACE_ID || have.SUPACODE_SURFACE_ID) && (have.VELOCITY_TAB_ID || have.SUPACODE_TAB_ID)) return have;
   try {
     const { stdout } = await execFileP("ps", ["eww", "-p", String(process.ppid), "-o", "command="], {
       maxBuffer: 1024 * 1024,
     });
+    const pick = (k) => {
+      const m = stdout.match(new RegExp(`(?:^|\\s)${k}=([^\\s]+)`));
+      return m ? m[1] : "";
+    };
     return {
-      sock: envValue(stdout, "KITTY_LISTEN_ON") || envValue(stdout, "KITTY_SOCKET"),
-      win: envValue(stdout, "KITTY_WINDOW_ID"),
+      VELOCITY_SURFACE_ID: have.VELOCITY_SURFACE_ID || pick("VELOCITY_SURFACE_ID"),
+      VELOCITY_TAB_ID: have.VELOCITY_TAB_ID || pick("VELOCITY_TAB_ID"),
+      VELOCITY_WORKTREE_ID: have.VELOCITY_WORKTREE_ID || pick("VELOCITY_WORKTREE_ID"),
+      SUPACODE_SURFACE_ID: have.SUPACODE_SURFACE_ID || pick("SUPACODE_SURFACE_ID"),
+      SUPACODE_TAB_ID: have.SUPACODE_TAB_ID || pick("SUPACODE_TAB_ID"),
+      SUPACODE_WORKTREE_ID: have.SUPACODE_WORKTREE_ID || pick("SUPACODE_WORKTREE_ID"),
+      STITCHPAD_SURFACE_ADAPTER: have.STITCHPAD_SURFACE_ADAPTER || pick("STITCHPAD_SURFACE_ADAPTER"),
     };
   } catch {
-    return { sock: "", win: "" };
+    return have;
   }
-}
-
-async function kittySockets(preferred) {
-  const sockets = [];
-  const add = (sock) => {
-    if (sock && !sockets.includes(sock)) sockets.push(sock);
-  };
-  add(preferred);
-  try {
-    for (const entry of await readdir("/tmp")) {
-      if (entry.startsWith("kitty-")) add(`unix:/tmp/${entry}`);
-    }
-  } catch {
-    // No socket directory or no permission; join can still fall back to hook wake.
-  }
-  return sockets;
-}
-
-function findWindowForPid(kittyState, pid) {
-  const needle = Number(pid);
-  for (const osWindow of kittyState) {
-    for (const tab of osWindow.tabs || []) {
-      for (const win of tab.windows || []) {
-        if (Number(win.pid) === needle) return win.id;
-        for (const proc of win.foreground_processes || []) {
-          if (Number(proc.pid) === needle) return win.id;
-        }
-      }
-    }
-  }
-  return "";
-}
-
-async function discoverKittyTarget() {
-  let sock = process.env.KITTY_LISTEN_ON || process.env.KITTY_SOCKET || "";
-  let win = process.env.KITTY_WINDOW_ID || "";
-
-  if (!sock || !win) {
-    const parentEnv = await parentKittyEnv();
-    sock ||= parentEnv.sock;
-    win ||= parentEnv.win;
-  }
-  if (sock && win) return { sock, win };
-
-  for (const candidate of await kittySockets(sock)) {
-    try {
-      const { stdout } = await execFileP("kitty", ["@", "--to", candidate, "ls"], {
-        maxBuffer: 4 * 1024 * 1024,
-      });
-      const found = findWindowForPid(JSON.parse(stdout), process.ppid);
-      if (found) return { sock: candidate, win: String(found) };
-    } catch {
-      // Try the next socket.
-    }
-  }
-  return { sock: "", win: "" };
 }
 
 // ── Identity, server-side ─────────────────────────────────────────────
@@ -280,6 +273,12 @@ const TOOLS = [
             "Which runtime you are — selects how you get woken: claude/codex via " +
             "their Stop hook, pi via the pi adapter extension. All read the pad at " +
             "turn-end; no keystrokes are sent to your terminal.",
+        },
+        surfaceAdapter: {
+          type: "string",
+          enum: ["velocity"],
+          description:
+            "Which app surface should receive push wakes. Defaults to velocity (the only surface).",
         },
       },
       required: ["name", "adapter"],
@@ -336,31 +335,73 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         if (!["claude", "codex", "pi"].includes(adapter)) {
           return text("adapter must be one of: claude, codex, pi");
         }
+        if (a.surfaceAdapter && a.surfaceAdapter !== "velocity") {
+          return text("surfaceAdapter must be: velocity");
+        }
         if (RELAY_MODE) {
           // Already joined via the invite redeem at startup — there is no local
           // roster to write. Just confirm identity + pad. Honor the relay-assigned
           // handle (myHandle) when present, else adopt the requested name.
           if (a.name && !myHandle) myHandle = a.name;
+          await persistRelayHookEnv();
           out =
             `(relay mode) you are @${myHandle || a.name} on pad "${padName}". ` +
-            `Already joined via invite — use say/read/who. Identity is fixed server-side.`;
+            `Already joined via invite — use say/read/who. Stop-hook wake is wired from relay state. Identity is fixed server-side.`;
           break;
         }
-        // Capture this kitty window as the wake target. Codex may scrub KITTY_*
-        // from the MCP child even when the parent Codex process is in kitty, so
-        // recover it from the parent env or kitty's window list when needed.
-        const { sock, win } = await discoverKittyTarget();
-        const target = sock && win ? `${sock}@@${win}` : "-";   // @@ not | (roster is pipe-delimited)
-        const kittyEnv = sock && win ? { KITTY_LISTEN_ON: sock, KITTY_WINDOW_ID: win } : {};
-        // Tag the kitty window+tab with the agent's name so you can see who's who.
-        if (sock && win) {
-          await execFileP("kitty", ["@", "--to", sock, "set-window-title", "--match", `id:${win}`, `🧵 ${a.name}`]).catch(() => {});
-          await execFileP("kitty", ["@", "--to", sock, "set-tab-title", "--match", `id:${win}`, `🧵 ${a.name}`]).catch(() => {});
+        // Identity is bound to THIS coding session, not the name argument. If this
+        // session already joined, that handle is locked — reuse it and ignore any
+        // name passed. Only a session with no prior binding may set a name; absent
+        // a name we derive a stable one from the session id. A session can never be
+        // shoved into another session's identity.
+        const bound = SESSION_ID
+          ? await sp(["whoami"], undefined, { STITCHPAD_SESSION: SESSION_ID }).then(s => s.trim()).catch(() => "")
+          : "";
+        if (bound) {
+          ME = bound;
+          // Rejoin (e.g. after an MCP restart): identity is locked, but the heartbeat
+          // ticker died with the old process — restart it so the live roster shows us.
+          await sp(["heartbeat", "start", bound], bound, {
+            STITCHPAD_SESSION: SESSION_ID,
+            STITCHPAD_HEARTBEAT_PARENT_PID: String(process.ppid),
+          }).catch(() => {});
+          out = `(already joined this session as @${bound} — identity is locked to your session id; rejoin returns the same handle.)`;
+          break;
         }
-        // adapter column = "kitty" (the universal wake); runtime metadata records
-        // the actual harness (claude/codex/pi) for TUI roster classifiers.
-        out = await sp(["join", a.name, "kitty", "push", target], undefined, kittyEnv);
-        await sp(["meta", "set", a.name, "runtime", adapter]).catch(() => {});
+        const handle = (a.name && a.name.trim())
+          || (SESSION_ID ? SESSION_ID.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 8) : "")
+          || "agent";
+        // Wake target comes from the Velocity surface this session lives in.
+        // Surface env is injected into every surface's shell. claude inherits it into
+        // the MCP child directly; codex doesn't forward it, so we recover it from the
+        // parent process — without this, codex joins pull|- and can't be push-woken.
+        // Velocity inherited Supacode's env contract: it still emits SUPACODE_* (not
+        // VELOCITY_*) and names zmx sessions supa-<uuid>. We read whichever is present
+        // (VELOCITY_* preferred for forward-compat) — these are the inherited bolts,
+        // not a separate app.
+        const scEnv = await parentSurfaceEnv();
+        const scSurface = scEnv.VELOCITY_SURFACE_ID || scEnv.SUPACODE_SURFACE_ID;
+        const scTab = scEnv.VELOCITY_TAB_ID || scEnv.SUPACODE_TAB_ID;
+        const scWorktree = scEnv.VELOCITY_WORKTREE_ID || scEnv.SUPACODE_WORKTREE_ID;
+        // Velocity is the only surface now — always route there.
+        const surfaceAdapter = "velocity";
+        // target = worktree@@tab@@surface (3-part); @@ not | (roster is pipe-delimited).
+        const target = (scSurface && scTab) ? `${scWorktree}@@${scTab}@@${scSurface}` : "-";
+        const wakeEnv = (scSurface && scTab) ? {
+          VELOCITY_SURFACE_ID: scSurface,
+          VELOCITY_TAB_ID: scTab,
+          VELOCITY_WORKTREE_ID: scWorktree,
+          STITCHPAD_SURFACE_ADAPTER: surfaceAdapter,
+          // inherited bolts: the Velocity binary still reads these as a fallback
+          SUPACODE_SURFACE_ID: scSurface,
+          SUPACODE_TAB_ID: scTab,
+          SUPACODE_WORKTREE_ID: scWorktree,
+        } : {};
+        if (scWorktree) {
+          await sp(["meta", "set", handle, "worktree", scWorktree]).catch(() => {});
+        }
+        out = await sp(["join", handle, surfaceAdapter, "push", target], undefined, wakeEnv);
+        await sp(["meta", "set", handle, "runtime", adapter]).catch(() => {});
         const model =
           process.env.STITCHPAD_MODEL ||
           process.env.CODEX_MODEL ||
@@ -368,12 +409,12 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
           process.env.ANTHROPIC_MODEL ||
           "";
         if (model) {
-          await sp(["meta", "set", a.name, "model", model]).catch(() => {});
+          await sp(["meta", "set", handle, "model", model]).catch(() => {});
         }
-        await bindSession(a.name, kittyEnv);   // hold identity + write session record for the hook
+        await bindSession(handle, wakeEnv);   // hold identity + write session record for the hook
         out += target === "-"
-          ? `\n(you are @${a.name}, but no kitty window detected — external wake won't work unless you run in kitty. Hook-based turn-end wake still applies.)`
-          : `\n(you are @${a.name}; @${a.name} mentions wake this kitty window. Reply with the say tool — identity is fixed server-side.)`;
+          ? `\n(you are @${handle}, but no Velocity surface detected — external wake won't work outside Velocity. Hook-based turn-end wake still applies.)`
+          : `\n(you are @${handle}; @${handle} mentions wake this ${surfaceAdapter} surface. Reply with the say tool — identity is locked to your session.)`;
         break;
       }
       case "say":
@@ -441,18 +482,20 @@ for (const sig of ["SIGINT", "SIGTERM"]) {
 if (RELAY_MODE && RELAY_INVITE && !relayToken) {
   try {
     await redeemInvite();
+    await persistRelayHookEnv();
     console.error(`[stitchpad-mcp] relay: joined pad "${padName}" as @${myHandle}`);
   } catch (err) {
     console.error(`[stitchpad-mcp] relay redeem failed: ${err.message}`);
     process.exit(1);
   }
 } else if (RELAY_MODE) {
+  await persistRelayHookEnv();
   console.error(`[stitchpad-mcp] relay: direct token, pad "${padName}" as @${myHandle}`);
 }
 
 // ── Auto-start relay-watch poller (inbound @mention wake) ──────────────
 // In relay mode, spawn a background poller that watches the relay for new
-// @mentions and fires the local kitty window. One-paste UX: no second command.
+// @mentions and fires the local app surface. One-paste UX: no second command.
 if (RELAY_MODE && myHandle && relayToken) {
   const { spawn } = await import("node:child_process");
   const watchScript = path.join(STITCHPAD_HOME, "relay", "watch.sh");
