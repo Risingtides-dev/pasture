@@ -39,7 +39,7 @@ case "${1:-status}" in
     # it dies, and CLEARS THE LOCK on exit so stop/crash leaves no stale gate.
     # KEEP-ALIVE: only respawn while at least one agent heartbeat is fresh.
     ( trap 'rm -rf "$LOCKDIR"' EXIT
-      echo $$ > "$PIDFILE"            # the supervisor records ITS OWN pid
+      echo "$BASHPID" > "$PIDFILE"    # the supervisor records ITS OWN pid
       while true; do
         date +%s > "$LOCKDIR/heartbeat"
         STITCHPAD_PAD_DIR="$PAD_DIR" bash "$STITCHPAD_HOME/bin/watch.sh" >>"$LOG" 2>&1
@@ -48,6 +48,7 @@ case "${1:-status}" in
         # check agent heartbeats before respawning
         if ! sp_any_alive; then
           echo "[stitchpad] no fresh agent heartbeats — supervisor exiting" >>"$LOG"
+          sp_reap_dead   # session's over: physically sweep the dead presences/claims
           exit 0
         fi
         echo "[stitchpad] watcher exited (code $?), restarting in 2s..." >>"$LOG"

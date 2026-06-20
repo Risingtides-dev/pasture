@@ -52,34 +52,54 @@ sp_init_paths() {
 # ── Identity ─────────────────────────────────────────────────────────
 # Identity is bound to the agent's SESSION, declared once via the MCP `join` tool
 # (which calls `stitchpad bind-session <id> <name>`, writing .state/sessions/<id>).
-# Resolution order:
-#   1. explicit STITCHPAD_NAME      (the hook may pin it; tests use it)
-#   2. .state/sessions/$STITCHPAD_SESSION   (the MCP-written session record)
-# The hook exports STITCHPAD_SESSION from its Stop-payload session_id, so it
-# resolves the SAME name the MCP bound. No shared whoami → no impersonation: a
-# session can only ever resolve to the name it joined with.
+# Resolution order — SESSION BINDING WINS:
+#   1. .state/sessions/$STITCHPAD_SESSION   (the durable identity bound at join)
+#   2. explicit STITCHPAD_NAME              (fallback when no session binding)
+# The session binding is checked FIRST so a STALE STITCHPAD_NAME left in the shell
+# (e.g. a session that re-joined under a new handle but whose shell still exports the
+# OLD name) cannot override the real identity. This is the @Jill→@deepseek bug: the
+# session rebound to deepseek but the shell still had STITCHPAD_NAME=Jill, so every
+# post was mis-stamped @Jill. Session id is the source of truth; env name is a hint.
 sp_me() {
-  if [ -n "${STITCHPAD_NAME:-}" ]; then echo "$STITCHPAD_NAME"; return; fi
-  local sid="${STITCHPAD_SESSION:-}"
+  # Session binding wins. Prefer the explicit STITCHPAD_SESSION, but fall back to
+  # the runtime's own session id ($CLAUDE_CODE_SESSION_ID) when the shell never
+  # exported STITCHPAD_SESSION — that gap is exactly what let a stale STITCHPAD_NAME
+  # leak through and mis-stamp posts (@Jill bug). Try both before trusting the name.
+  local sid="${STITCHPAD_SESSION:-${CLAUDE_CODE_SESSION_ID:-}}"
   if [ -n "$sid" ] && [ -f "$PAD_STATE/sessions/$sid" ]; then
     cat "$PAD_STATE/sessions/$sid" 2>/dev/null; return
   fi
-  # Window-id resolution: each kitty window is unique and stable, and the roster
-  # records each agent's window as "...@@<window_id>". A process that knows its own
-  # KITTY_WINDOW_ID can therefore find its name unambiguously — no shared state.
-  # This is what keeps codex/pi agents (no session id) from colliding on whoami:
-  # without it they all fell through to the single whoami file and posted as
-  # whoever joined last (ernie's posts landing as @Jill/@larry).
-  if [ -n "${KITTY_WINDOW_ID:-}" ]; then
+  if [ -n "${STITCHPAD_NAME:-}" ]; then echo "$STITCHPAD_NAME"; return; fi
+  # Surface-id resolution: each Velocity surface UUID is unique and stable, and
+  # the roster records each agent's surface as "...@@<surface_id>". A process that
+  # knows its own surface ID can find its name unambiguously — no shared
+  # state. Keeps sessions from colliding on whoami when no session id is present.
+  local _surface_id="${VELOCITY_SURFACE_ID:-${SUPACODE_SURFACE_ID:-}}"
+  if [ -n "$_surface_id" ]; then
     local _wname
-    _wname="$(sp_roster | awk -F'|' -v w="$KITTY_WINDOW_ID" '
+    _wname="$(sp_roster | awk -F'|' -v w="$_surface_id" '
       { gsub(/^[ \t]+|[ \t]+$/, "", $1); gsub(/^[ \t]+|[ \t]+$/, "", $4)
         n=$4; sub(/.*@@/, "", n)
         if (n == w) { print $1; exit } }' 2>/dev/null)"
     if [ -n "$_wname" ]; then echo "$_wname"; return; fi
   fi
-  # Pad default (pi: no session id, not in a kitty window). Last-resort fallback.
-  cat "$PAD_STATE/whoami" 2>/dev/null || true
+  # Last-resort pad default is intentionally opt-in. A shared whoami file can
+  # collapse multiple agents into whoever joined last (for example, everyone
+  # posting as @nancy). Prefer explicit STITCHPAD_NAME, STITCHPAD_SESSION, or
+  # VELOCITY_SURFACE_ID resolution; fail closed instead of misattributing work.
+  if [ "${STITCHPAD_ALLOW_WHOAMI_FALLBACK:-0}" = "1" ]; then
+    cat "$PAD_STATE/whoami" 2>/dev/null || true
+  fi
+}
+
+# Resolve identity from the bound session only. Used by the Stop hook so a stale
+# STITCHPAD_NAME in the runtime env cannot override the session mapping.
+sp_session_name() {
+  [ -n "${PAD_STATE:-}" ] || return 0
+  local sid="${STITCHPAD_SESSION:-${CLAUDE_CODE_SESSION_ID:-}}"
+  if [ -n "$sid" ] && [ -f "$PAD_STATE/sessions/$sid" ]; then
+    cat "$PAD_STATE/sessions/$sid" 2>/dev/null || true
+  fi
 }
 
 # ── Do Not Disturb ──────────────────────────────────────────────────
@@ -161,6 +181,26 @@ sp_roster() {
       }
     }
   ' "$PAD_MD"
+}
+
+# Roster filtered to LIVE sessions: an agent is shown only if its heartbeat
+# (alive.<name>, mtime < 90s) is fresh — same liveness rule as sp_any_alive.
+# A session that closed without leaving simply stops appearing; no graveyard.
+# Operators/humans have no heartbeat and are always kept (they read, not woken).
+sp_roster_live() {
+  local now; now=$(date +%s)
+  sp_roster | while IFS='|' read -r name adapter wake target; do
+    [ -n "$name" ] || continue
+    local rt; rt="$(cat "$PAD_STATE/runtime.$name" 2>/dev/null || true)"
+    if [ "$rt" = "operator" ] || [ "$rt" = "human" ]; then
+      printf '%s|%s|%s|%s\n' "$name" "$adapter" "$wake" "$target"; continue
+    fi
+    local hb="$PAD_STATE/alive.$name" ts
+    [ -f "$hb" ] || continue
+    ts=$(stat -f %m "$hb" 2>/dev/null || stat -c %Y "$hb" 2>/dev/null || echo 0)
+    [ $(( now - ts )) -lt 90 ] || continue
+    printf '%s|%s|%s|%s\n' "$name" "$adapter" "$wake" "$target"
+  done
 }
 
 # ── Tasks parser (```task blocks) ────────────────────────────────────────
@@ -276,9 +316,14 @@ sp_engagement() {
     # first non-empty content line decides silent-ack (leading "." or "[ack]")
     !seen_body && /[^[:space:]]/ {
       seen_body=1
-      b=tolower($0); sub(/^[ \t]*/,"",b); sub(/^(@[a-z0-9_-]+[ \t]*)+/,"",b); sub(/[ \t]+$/,"",b)
-      if (b ~ /^(\.|\[ack\])/) silent=1
-      if (b ~ /^(ack|read|noted|got it|standing down|standing by|stand by|will do|understood|done here|copy|sounds good)[. !]*$/) silent=1
+      b=tolower($0); sub(/^[ \t]*/,"",b)
+      # count @mentions before stripping; 2+ means broadcast — never silent
+      n_at=0; tmp=b; while (match(tmp,/@[a-z0-9_-]+/)) { n_at++; tmp=substr(tmp,RSTART+RLENGTH) }
+      sub(/^(@[a-z0-9_-]+[ \t]*)+/,"",b); sub(/[ \t]+$/,"",b)
+      if (n_at < 2) {
+        if (b ~ /^(\.|\[ack\])/) silent=1
+        if (b ~ /^(ack|read|noted|got it|standing down|standing by|stand by|will do|understood|done here|copy|sounds good)[. !]*$/) silent=1
+      }
     }
     # Strip inline code (`...`) before appending to buffer — prevents `@name` in code
     # snippets from counting as an address. Real addresses survive because only the
@@ -328,6 +373,41 @@ sp_any_alive() {
   return 1
 }
 
+# Physically delete the corpses the 90s-TTL liveness rules already ignore, so
+# .state/ doesn't accumulate a graveyard across sessions. Logic was always
+# self-healing (roster/sp_any_alive skip stale mtime); this just reclaims disk.
+# Safe to call any time — it only removes things proven dead. Called on join
+# and on supervisor exit.
+sp_reap_dead() {
+  [ -n "${PAD_STATE:-}" ] || return 0
+  local now; now=$(date +%s)
+  # 1. leftover atomic-write tmp files (.alive.<who>.<pid>) whose rename never
+  #    completed — never read by anything, pure litter.
+  for f in "$PAD_STATE"/.alive.*; do
+    [ -e "$f" ] || continue
+    local pid="${f##*.}"
+    kill -0 "$pid" 2>/dev/null || rm -f "$f"
+  done
+  # 2. presence heartbeats (alive.<name>) gone stale: mtime >90s AND pid dead.
+  #    operators/humans have no pid and never expire — leave them.
+  for f in "$PAD_STATE"/alive.*; do
+    [ -f "$f" ] || continue
+    local ts; ts=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || echo 0)
+    [ $(( now - ts )) -lt 90 ] && continue
+    local pid; pid=$(grep -o '"pid":[0-9]*' "$f" 2>/dev/null | head -1 | cut -d: -f2)
+    [ -z "$pid" ] || [ "$pid" = "0" ] && continue   # unknown/operator → keep
+    kill -0 "$pid" 2>/dev/null || rm -rf "$f" "$PAD_STATE/heartbeat.${f##*/alive.}.lock" 2>/dev/null
+  done
+  # 3. file-claims whose holder pid is gone (holder line: "<name> <ts> <path>";
+  #    no pid recorded, so fall back to staleness — claims older than 1h are dead).
+  for d in "$PAD_STATE"/claims/*.d; do
+    [ -d "$d" ] || continue
+    local cts; cts=$(stat -f %m "$d" 2>/dev/null || stat -c %Y "$d" 2>/dev/null || echo 0)
+    [ $(( now - cts )) -gt 3600 ] && rm -rf "$d"
+  done
+  return 0
+}
+
 # Is the watcher running? (lock dir exists AND PID alive)
 sp_watcher_alive() {
   local watch_lock="$PAD_STATE/watch.lock.d"
@@ -349,6 +429,67 @@ sp_watcher_alive() {
   return 1
 }
 
+sp_watch_processes_for_pad() {
+  [ -n "${PAD_MD:-}" ] || return 0
+  ps -axo pid=,ppid=,command= | awk -v pad="$PAD_MD" '
+    index($0, "fswatch -0 " pad) && $0 !~ /awk/ {
+      print $1
+      print $2
+    }
+  ' | sort -nu
+}
+
+sp_watch_fswatch_parents_for_pad() {
+  [ -n "${PAD_MD:-}" ] || return 0
+  ps -axo pid=,ppid=,command= | awk -v pad="$PAD_MD" '
+    index($0, "fswatch -0 " pad) && $0 !~ /awk/ {
+      print $2
+    }
+  ' | sort -nu
+}
+
+sp_stop_watchers_for_pad() {
+  [ -n "${PAD_STATE:-}" ] || return 0
+  local watch_lock="$PAD_STATE/watch.lock.d"
+  local p pids=()
+  p="$(cat "$watch_lock/pid" 2>/dev/null || true)"
+  [ -n "$p" ] && pids+=( "$p" )
+  while IFS= read -r p; do
+    [ -n "$p" ] && pids+=( "$p" )
+  done < <(sp_watch_processes_for_pad)
+
+  rm -rf "$watch_lock" 2>/dev/null || true
+  for p in "${pids[@]}"; do
+    kill "$p" 2>/dev/null || true
+  done
+  sleep 0.2
+  for p in "${pids[@]}"; do
+    kill -0 "$p" 2>/dev/null && kill -KILL "$p" 2>/dev/null || true
+  done
+}
+
+sp_reap_duplicate_watchers_for_pad() {
+  [ -n "${PAD_STATE:-}" ] || return 0
+  local watch_lock="$PAD_STATE/watch.lock.d"
+  local keep parent parents=()
+  keep="$(cat "$watch_lock/pid" 2>/dev/null || true)"
+  if [ -z "$keep" ] || ! kill -0 "$keep" 2>/dev/null; then
+    sp_stop_watchers_for_pad
+    return 1
+  fi
+
+  while IFS= read -r parent; do
+    [ -n "$parent" ] && parents+=( "$parent" )
+  done < <(sp_watch_fswatch_parents_for_pad)
+
+  if [ "${#parents[@]}" -eq 1 ] && [ "${parents[0]}" = "$keep" ]; then
+    return 0
+  fi
+
+  sp_stop_watchers_for_pad
+  return 1
+}
+
 ensure_watcher() {
   [ -n "${PAD_DIR:-}" ] || sp_init_paths || return 0
   local watch_lock="$PAD_STATE/watch.lock.d"
@@ -356,7 +497,13 @@ ensure_watcher() {
   # Only spawn if someone is alive and listening
   sp_any_alive || return 0
   # Already running? Nothing to do.
-  sp_watcher_alive && return 0
+  if sp_watcher_alive; then
+    if sp_reap_duplicate_watchers_for_pad; then
+      sleep 0.2
+      sp_watcher_alive && return 0
+    fi
+  fi
+  sp_stop_watchers_for_pad
   # ATOMIC acquire: exactly one caller wins.
   if ! mkdir "$watch_lock" 2>/dev/null; then
     # Lost the race. Brief sleep lets winner write its PID, then re-check.
