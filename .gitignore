@@ -8,6 +8,9 @@
 .chatroom/.state/
 .chatroom/channel-git/
 
+# repo ledger (append-only, local-only)
+events.md
+
 # rust build artifacts
 tool/tui-rs/target/
 
