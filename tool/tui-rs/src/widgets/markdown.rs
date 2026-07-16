@@ -3,7 +3,7 @@
 //! no links, tables, blockquotes, nesting, HTML, or headers (YAGNI for a chat pad).
 //!
 //! `!img: /path` lines are detected separately (see `image_path`) so the widget can
-//! shell `kitten icat` on kitty, or show a muted `[image: …]` elsewhere.
+//! show a muted `[image: …]` placeholder.
 
 use ratatui::{
     style::{Color, Modifier, Style},

@@ -2,7 +2,7 @@ mod color;
 mod widgets;
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -13,38 +13,67 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
 };
 use std::io;
+use std::io::Write as _;
 use std::path::Path;
 use std::sync::mpsc;
+use std::time::Duration;
+
+use widgets::roster::{RosterMember, RosterRail};
+
+/// Chat-first stitchpad TUI.
+///
+/// The prompt is ALWAYS live on the Chat tab — type and hit Enter, no compose
+/// mode. That means plain letters belong to the input, so app actions live on
+/// modifiers (^C quit, ^T tasks, ^R refresh, ^Y copy) — the irssi/weechat
+/// convention. The Tasks tab has no input, so it keeps plain vim keys.
+struct App {
+    tab: u8, // 0=Chat 1=Tasks
+    input: String,
+    detail_open: bool,
+    watcher_alive: bool,
+    flash: Option<(String, std::time::Instant)>,
+}
+
+impl App {
+    fn flash(&mut self, msg: impl Into<String>) {
+        self.flash = Some((msg.into(), std::time::Instant::now()));
+    }
+    fn flash_line(&self) -> Option<&str> {
+        match &self.flash {
+            Some((m, t)) if t.elapsed() < Duration::from_secs(3) => Some(m.as_str()),
+            _ => None,
+        }
+    }
+}
 
 fn main() -> io::Result<()> {
-    // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+    // Restore the terminal even on panic — a raw-mode corpse is the worst UX.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        default_hook(info);
+    }));
 
-    // Create roster rail + message list
-    let mut roster = widgets::roster::RosterRail::from_doctor();
+    let mut roster = RosterRail::from_doctor();
     let mut messages = widgets::messages::MessageList::from_pad();
     let mut board = widgets::tasks::TaskBoard::from_pad();
+    let mut app = App {
+        tab: 0,
+        input: String::new(),
+        detail_open: false,
+        watcher_alive: RosterRail::watcher_alive(),
+        flash: None,
+    };
 
-    // Top-level tabs: 0=Chat (roster+messages+compose), 1=Tasks (kanban board).
-    // 't' toggles; 1/2 jump directly.
-    let mut tab: u8 = 0;
-    let tab_labels = ["Chat", "Tasks"];
-
-    // Compose mode state (wires 'a' compose key; @mark builds the compose widget)
-    let mut composing = false;
-    let mut compose_buf = String::new();
-    let mut focus: u8 = 0; // 0=roster, 1=messages, 2=compose
-    let focus_labels = ["roster", "messages", "compose"];
-
-    // Live-tail: watch .stitchpad/stitchpad.md and signal the loop to re-read on change.
-    // notify runs its own thread; we only poll the channel non-blockingly below.
+    // Live-tail: watch .stitchpad/ and re-read pad-derived views on change.
     let (watch_tx, watch_rx) = mpsc::channel::<()>();
     let _watcher = {
-        let pad = Path::new(".stitchpad/stitchpad.md").to_path_buf();
         let tx = watch_tx.clone();
         notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             if res.is_ok() {
@@ -57,218 +86,413 @@ fn main() -> io::Result<()> {
             Ok(w)
         })
         .ok()
-        .map(|w| {
-            let _ = &pad;
-            w
-        }) // keep watcher alive for the program's lifetime
     };
 
+    // Background roster ticker: doctor + liveness probes are forks — far too slow
+    // for the draw loop, and alive.* lives in .state/ where the non-recursive
+    // watcher can't see it. A thread re-fetches every 5s and ships results over a
+    // channel; the UI just drains. This is what makes the duplicate-member /
+    // stale-triangle staleness impossible: the rail ALWAYS converges on doctor.
+    let (roster_tx, roster_rx) = mpsc::channel::<(Vec<RosterMember>, bool)>();
+    std::thread::spawn(move || {
+        loop {
+            let members = RosterRail::fetch();
+            let alive = RosterRail::watcher_alive();
+            if roster_tx.send((members, alive)).is_err() {
+                break; // UI gone
+            }
+            std::thread::sleep(Duration::from_secs(5));
+        }
+    });
+
+    let pad_name = std::env::current_dir()
+        .ok()
+        .and_then(|d| d.file_name().map(|f| f.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "stitchpad".into());
+
     loop {
-        // Live-tail: if the pad changed since last frame, re-read it. Drain all
-        // pending events so a burst of writes collapses into one refresh.
+        // Drain pad-change events (collapse bursts into one refresh) — every
+        // pad-derived view re-reads, not just messages (the old staleness bug).
         let mut changed = false;
         while watch_rx.try_recv().is_ok() {
             changed = true;
         }
         if changed {
             messages.refresh();
+            board.refresh();
+        }
+        // Drain background roster updates.
+        while let Ok((members, alive)) = roster_rx.try_recv() {
+            roster.set_members(members);
+            app.watcher_alive = alive;
         }
 
-        // Draw UI
         terminal.draw(|f| {
-            use ratatui::style::{Color, Style};
+            use ratatui::style::{Color, Modifier, Style};
+            use ratatui::text::{Line, Span};
             use ratatui::widgets::{Block, Borders, Paragraph};
 
-            // top = tab bar, middle = main area, bottom = thin hint footer
-            let main_chunks = Layout::default()
+            let show_input = app.tab == 0;
+            let mut constraints = vec![Constraint::Length(1), Constraint::Min(3)];
+            if show_input {
+                constraints.push(Constraint::Length(3));
+            }
+            constraints.push(Constraint::Length(1));
+            let rows = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(1),
-                    Constraint::Min(3),
-                    Constraint::Length(1),
-                ])
+                .constraints(constraints)
                 .split(f.area());
+            let (header_row, main_row) = (rows[0], rows[1]);
+            let input_row = if show_input { Some(rows[2]) } else { None };
+            let footer_row = rows[rows.len() - 1];
 
-            // Tab bar: [ Chat ] [ Tasks ] — active one highlighted.
-            let tab_spans: Vec<ratatui::text::Span> = tab_labels
-                .iter()
-                .enumerate()
-                .flat_map(|(i, label)| {
-                    let style = if i as u8 == tab {
-                        Style::default().fg(Color::Black).bg(Color::Cyan)
-                    } else {
-                        Style::default().fg(Color::Gray)
-                    };
-                    vec![
-                        ratatui::text::Span::styled(format!(" {} ", label), style),
-                        ratatui::text::Span::raw(" "),
-                    ]
-                })
-                .collect();
-            f.render_widget(
-                Paragraph::new(ratatui::text::Line::from(tab_spans)),
-                main_chunks[0],
-            );
-
-            if tab == 1 {
-                // Tasks tab: full-width kanban board.
-                f.render_widget(&board, main_chunks[1]);
-            } else {
-                // Chat tab: left = messages, right = roster column (rail + compose).
-                let chunks = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
-                    .split(main_chunks[1]);
-
-                let right = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Min(10), Constraint::Length(8)])
-                    .split(chunks[1]);
-
-                f.render_widget(&messages, chunks[0]);
-                f.render_widget(&roster, right[0]);
-
-                // Prompt box — under the roster. Type @names to address agents, Enter sends.
-                let (title, body, border) = if composing {
-                    (
-                        " Prompt  Enter=send  Esc=cancel ",
-                        format!("{}\n_", compose_buf),
-                        Color::Cyan,
-                    )
+            // ── Header: pad name · tabs · watcher + agent count ──────────
+            let dim = Style::default().fg(Color::Rgb(128, 128, 128));
+            let mut header = vec![
+                Span::styled(" ⛵ ", Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    pad_name.clone(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("   "),
+            ];
+            for (i, label) in ["Chat", "Tasks"].iter().enumerate() {
+                if i as u8 == app.tab {
+                    header.push(Span::styled(
+                        format!(" {} ", label),
+                        Style::default().fg(Color::Black).bg(Color::Cyan),
+                    ));
                 } else {
-                    (
-                        " Prompt ",
-                        "Press a to compose\nStart with @name to wake agents\n\n".to_string(),
-                        Color::DarkGray,
-                    )
-                };
-                let compose = Paragraph::new(body)
-                    .style(Style::default().fg(if composing { Color::White } else { Color::Gray }))
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(title)
-                            .border_style(Style::default().fg(border)),
-                    )
-                    .wrap(ratatui::widgets::Wrap { trim: false });
-                f.render_widget(compose, right[1]);
+                    header.push(Span::styled(format!(" {} ", label), dim));
+                }
+                header.push(Span::raw(" "));
+            }
+            let online = roster
+                .members
+                .iter()
+                .filter(|m| {
+                    matches!(m.live_status, widgets::roster::LiveStatus::Online)
+                })
+                .count();
+            let right = format!(
+                "{} {} · {}/{} online ",
+                if app.watcher_alive { "●" } else { "○" },
+                if app.watcher_alive { "watcher" } else { "watcher DOWN (^S)" },
+                online,
+                roster.members.len(),
+            );
+            let pad_w = (header_row.width as usize)
+                .saturating_sub(header.iter().map(|s| s.content.chars().count()).sum::<usize>())
+                .saturating_sub(right.chars().count());
+            header.push(Span::raw(" ".repeat(pad_w)));
+            header.push(Span::styled(
+                right,
+                Style::default().fg(if app.watcher_alive {
+                    Color::Green
+                } else {
+                    Color::Red
+                }),
+            ));
+            f.render_widget(Paragraph::new(Line::from(header)), header_row);
+
+            // ── Main area ────────────────────────────────────────────────
+            if app.tab == 1 {
+                f.render_widget(&board, main_row);
+                if app.detail_open {
+                    if let Some(task) = board.selected_task() {
+                        widgets::tasks::render_detail(task, f.area(), f.buffer_mut());
+                    }
+                }
+            } else {
+                // Floor plan: below 90 cols the agents rail folds away and the
+                // conversation takes the full width (still fine at 80×24).
+                if main_row.width >= 90 {
+                    let cols = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Min(40), Constraint::Length(26)])
+                        .split(main_row);
+                    f.render_widget(&messages, cols[0]);
+                    f.render_widget(&roster, cols[1]);
+                } else {
+                    f.render_widget(&messages, main_row);
+                }
+
+                // ── Prompt: ALWAYS live. Type → Enter sends. ────────────
+                if let Some(area) = input_row {
+                    let me = std::env::var("STITCHPAD_NAME").unwrap_or_else(|_| "smaths".into());
+                    let border = if app.input.is_empty() {
+                        Style::default().fg(Color::Rgb(90, 90, 90))
+                    } else {
+                        Style::default().fg(Color::Cyan)
+                    };
+                    let content: Line = if app.input.is_empty() {
+                        Line::from(Span::styled(
+                            "type to talk · @name wakes them · Enter sends",
+                            dim,
+                        ))
+                    } else {
+                        Line::from(vec![
+                            Span::raw(app.input.clone()),
+                            Span::styled("█", Style::default().fg(Color::Cyan)),
+                        ])
+                    };
+                    f.render_widget(
+                        Paragraph::new(content).block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .border_style(border)
+                                .title(format!(" @{} ", me)),
+                        ),
+                        area,
+                    );
+                }
             }
 
-            // thin bottom hint
-            let footer = Paragraph::new(if tab == 1 {
-                "q:quit  t/1/2:tab  j/k:nav  r:refresh  s:start-watcher".to_string()
+            // ── Footer: flash message wins, else per-tab hints ───────────
+            let footer_text = if let Some(fmsg) = app.flash_line() {
+                fmsg.to_string()
+            } else if app.tab == 1 {
+                "j/k:nav  Enter:detail  ]/[:move  d:done  x:cancel  1/^T:chat  q:quit".to_string()
             } else {
-                format!(
-                    "q:quit  t/1/2:tab  a:compose  Tab:focus[{}]  j/k:nav  r:refresh  s:start-watcher",
-                    focus_labels[focus as usize]
-                )
-            });
-            f.render_widget(footer, main_chunks[2]);
+                "Enter:send  Tab:@complete  ↑↓/PgUp:scroll  ^Y:copy convo  ^T:tasks  ^R:refresh  ^C:quit"
+                    .to_string()
+            };
+            f.render_widget(Paragraph::new(footer_text).style(dim), footer_row);
         })?;
 
-        // Handle input
-        if event::poll(std::time::Duration::from_millis(100))? {
+        // ── Input ────────────────────────────────────────────────────────
+        if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    if composing {
-                        match key.code {
-                            KeyCode::Esc => {
-                                composing = false;
-                                compose_buf.clear();
-                            }
-                            KeyCode::Enter => {
-                                if !compose_buf.trim().is_empty() {
-                                    // Shell out to stitchpad say; STITCHPAD_NAME comes from env
-                                    let _ = std::process::Command::new("stitchpad")
-                                        .arg("say")
-                                        .arg(&compose_buf)
-                                        .status();
-                                    compose_buf.clear();
-                                    composing = false;
-                                    messages.refresh();
-                                }
-                            }
-                            KeyCode::Backspace => {
-                                compose_buf.pop();
-                            }
-                            KeyCode::Char(c) => compose_buf.push(c),
-                            _ => {}
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+                // Global (both tabs): modifier chords.
+                if ctrl {
+                    match key.code {
+                        KeyCode::Char('c') => break,
+                        KeyCode::Char('t') => {
+                            app.tab ^= 1;
+                            app.detail_open = false;
+                            continue;
                         }
-                    } else {
-                        match key.code {
-                            KeyCode::Char('q') => break,
-                            // Tab switching: 't' toggles, 1/2 jump direct.
-                            KeyCode::Char('t') => tab = (tab + 1) % tab_labels.len() as u8,
-                            KeyCode::Char('1') => tab = 0,
-                            KeyCode::Char('2') => tab = 1,
-                            KeyCode::Char('a') if tab == 0 => {
-                                composing = true;
-                                compose_buf.clear();
+                        KeyCode::Char('r') => {
+                            color::invalidate();
+                            roster.refresh();
+                            messages.refresh();
+                            board.refresh();
+                            app.watcher_alive = RosterRail::watcher_alive();
+                            app.flash("refreshed");
+                            continue;
+                        }
+                        KeyCode::Char('y') => {
+                            match copy_conversation(&messages) {
+                                Ok(n) => app.flash(format!("copied {} messages to clipboard", n)),
+                                Err(e) => app.flash(format!("copy failed: {}", e)),
                             }
-                            KeyCode::Tab if tab == 0 => {
-                                focus = (focus + 1) % focus_labels.len() as u8
+                            continue;
+                        }
+                        KeyCode::Char('s') => {
+                            let _ = std::process::Command::new("stitchpad")
+                                .arg("restart")
+                                .output();
+                            app.watcher_alive = RosterRail::watcher_alive();
+                            app.flash("watcher restarted");
+                            continue;
+                        }
+                        KeyCode::Char('u') => {
+                            app.input.clear();
+                            continue;
+                        }
+                        KeyCode::Char('w') => {
+                            // delete last word (readline convention)
+                            let trimmed = app.input.trim_end().to_string();
+                            match trimmed.rfind(' ') {
+                                Some(i) => app.input = trimmed[..=i].to_string(),
+                                None => app.input.clear(),
                             }
-                            KeyCode::BackTab if tab == 0 => {
-                                focus = (focus + focus_labels.len() as u8 - 1)
-                                    % focus_labels.len() as u8
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+
+                if app.tab == 1 {
+                    // Tasks tab: no text input → plain vim keys.
+                    match key.code {
+                        KeyCode::Char('q') => break,
+                        KeyCode::Esc => {
+                            if app.detail_open {
+                                app.detail_open = false;
+                            } else {
+                                app.tab = 0;
                             }
-                            KeyCode::Char('j') => {
-                                if tab == 1 {
-                                    board.next()
-                                } else if focus == 0 {
-                                    roster.next()
-                                } else {
-                                    messages.scroll_down()
-                                }
-                            }
-                            KeyCode::Char('k') => {
-                                if tab == 1 {
-                                    board.previous()
-                                } else if focus == 0 {
-                                    roster.previous()
-                                } else {
-                                    messages.scroll_up()
-                                }
-                            }
-                            KeyCode::Up if tab == 0 => messages.scroll_up(),
-                            KeyCode::Down if tab == 0 => messages.scroll_down(),
-                            KeyCode::PageUp if tab == 0 => {
-                                for _ in 0..10 {
-                                    messages.scroll_up()
-                                }
-                            }
-                            KeyCode::PageDown if tab == 0 => {
-                                for _ in 0..10 {
-                                    messages.scroll_down()
-                                }
-                            }
-                            KeyCode::Char('r') => {
-                                color::invalidate();
-                                roster.refresh();
+                        }
+                        KeyCode::Char('t') | KeyCode::Char('1') => {
+                            app.tab = 0;
+                            app.detail_open = false;
+                        }
+                        KeyCode::Char('j') | KeyCode::Down => board.next(),
+                        KeyCode::Char('k') | KeyCode::Up => board.previous(),
+                        KeyCode::Enter => app.detail_open = !app.detail_open,
+                        KeyCode::Char(']') => board.move_selected(true),
+                        KeyCode::Char('[') => board.move_selected(false),
+                        KeyCode::Char('d') => board.set_selected_status("done"),
+                        KeyCode::Char('x') => board.set_selected_status("canceled"),
+                        KeyCode::Char('r') => board.refresh(),
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                // Chat tab: everything printable belongs to the prompt.
+                match key.code {
+                    KeyCode::Enter => {
+                        let text = app.input.trim().to_string();
+                        if !text.is_empty() {
+                            let ok = std::process::Command::new("stitchpad")
+                                .arg("say")
+                                .arg(&text)
+                                .output()
+                                .map(|o| o.status.success())
+                                .unwrap_or(false);
+                            if ok {
+                                app.input.clear();
                                 messages.refresh();
-                                board.refresh();
+                            } else {
+                                app.flash("send failed — is this a pad dir?");
                             }
-                            KeyCode::Char('s') => {
-                                // `restart`, not `start`: start→ensure_watcher is idempotent
-                                // and no-ops ("ensured") when a stale watcher is already
-                                // running, so it never picks up roster changes. restart
-                                // clears the lock + re-seeds so a flipped roster takes effect.
-                                let _ = std::process::Command::new("stitchpad")
-                                    .arg("restart")
-                                    .status();
-                            }
-                            _ => {}
                         }
                     }
+                    KeyCode::Esc => app.input.clear(),
+                    KeyCode::Backspace => {
+                        app.input.pop();
+                    }
+                    KeyCode::Tab => {
+                        // @name completion from the roster (last token).
+                        if let Some(done) = complete_mention(&app.input, &roster.members) {
+                            app.input = done;
+                        }
+                    }
+                    KeyCode::Up | KeyCode::PageUp => {
+                        let n = if key.code == KeyCode::PageUp { 10 } else { 1 };
+                        for _ in 0..n {
+                            messages.scroll_up();
+                        }
+                    }
+                    KeyCode::Down | KeyCode::PageDown => {
+                        let n = if key.code == KeyCode::PageDown { 10 } else { 1 };
+                        for _ in 0..n {
+                            messages.scroll_down();
+                        }
+                    }
+                    KeyCode::Char(c) => app.input.push(c),
+                    _ => {}
                 }
             }
         }
     }
 
-    // Restore terminal
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
-
     Ok(())
+}
+
+/// Complete the trailing `@prefix` token against roster names. Returns the new
+/// input line, or None if the cursor isn't on an @-token / nothing matches.
+fn complete_mention(input: &str, members: &[RosterMember]) -> Option<String> {
+    let start = input.rfind('@')?;
+    // the @ must start a token (line start or after whitespace)
+    if start > 0 && !input[..start].ends_with(' ') {
+        return None;
+    }
+    let prefix = &input[start + 1..];
+    if prefix.contains(' ') {
+        return None; // cursor is past the token
+    }
+    let m = members
+        .iter()
+        .find(|m| m.name.starts_with(prefix) && m.name != prefix)?;
+    Some(format!("{}@{} ", &input[..start], m.name))
+}
+
+/// Copy the visible conversation to the system clipboard as clean markdown —
+/// no gutters, borders, or roster bleed (the reason terminal drag-select is
+/// useless in a multi-panel TUI). macOS pbcopy; xclip/wl-copy fallbacks.
+fn copy_conversation(list: &widgets::messages::MessageList) -> Result<usize, String> {
+    let mut out = String::new();
+    for m in &list.messages {
+        out.push_str(&format!("@{} · {}\n", m.author, m.time));
+        for line in &m.body {
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    if out.is_empty() {
+        return Err("no messages".into());
+    }
+    let candidates: &[(&str, &[&str])] = &[
+        ("pbcopy", &[]),
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+    ];
+    for (cmd, args) in candidates {
+        let child = std::process::Command::new(cmd)
+            .args(*args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        if let Ok(mut child) = child {
+            if let Some(stdin) = child.stdin.as_mut() {
+                if stdin.write_all(out.as_bytes()).is_ok() {
+                    let _ = child.wait();
+                    return Ok(list.messages.len());
+                }
+            }
+            let _ = child.wait();
+        }
+    }
+    Err("no clipboard tool (pbcopy/wl-copy/xclip)".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use widgets::roster::{Health, LiveStatus};
+
+    fn member(name: &str) -> RosterMember {
+        RosterMember {
+            name: name.into(),
+            adapter: "pi".into(),
+            wake: "push".into(),
+            harness: "pi".into(),
+            model: "—".into(),
+            health: Health::Healthy,
+            live_status: LiveStatus::Online,
+            issue: None,
+        }
+    }
+
+    #[test]
+    fn completes_mention_prefix() {
+        let members = vec![member("codex"), member("fable")];
+        assert_eq!(
+            complete_mention("@co", &members).as_deref(),
+            Some("@codex ")
+        );
+        assert_eq!(
+            complete_mention("hey @fa", &members).as_deref(),
+            Some("hey @fable ")
+        );
+        // mid-word @ (email-ish) must not complete
+        assert_eq!(complete_mention("me@co", &members), None);
+        // past the token → no completion
+        assert_eq!(complete_mention("@codex hi", &members), None);
+        // no match
+        assert_eq!(complete_mention("@zz", &members), None);
+    }
 }

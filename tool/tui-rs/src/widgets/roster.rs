@@ -88,11 +88,46 @@ pub struct RosterRail {
 impl RosterRail {
     /// Create a new roster rail by running `stitchpad doctor` and parsing the output
     pub fn from_doctor() -> Self {
-        let members = Self::parse_doctor_output();
+        let members = Self::fetch();
         Self {
             members,
             selected: 0,
         }
+    }
+
+    /// Fetch a fresh member list (doctor shell-out + liveness probes), deduped by
+    /// name. Static so a background thread can run it without borrowing the widget —
+    /// the doctor fork + kill -0 probes are too slow for the draw loop.
+    pub fn fetch() -> Vec<RosterMember> {
+        let mut members = Self::parse_doctor_output();
+        let mut seen = std::collections::HashSet::new();
+        members.retain(|m| seen.insert(m.name.clone()));
+        members
+    }
+
+    /// Replace members from a background fetch, keeping the selection clamped.
+    pub fn set_members(&mut self, members: Vec<RosterMember>) {
+        self.members = members;
+        if self.selected >= self.members.len() {
+            self.selected = self.members.len().saturating_sub(1);
+        }
+    }
+
+    /// Is the pad watcher daemon running? (lock dir + live pid — same check the
+    /// CLI uses). Probed in the background refresh thread, shown in the header.
+    pub fn watcher_alive() -> bool {
+        let pid = match fs::read_to_string(".stitchpad/.state/watch.lock.d/pid") {
+            Ok(s) => s.trim().to_string(),
+            Err(_) => return false,
+        };
+        if pid.is_empty() {
+            return false;
+        }
+        Command::new("kill")
+            .args(["-0", &pid])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
     }
 
     /// Parse the output of `stitchpad doctor`
@@ -114,9 +149,9 @@ impl RosterRail {
             }
 
             // Parse lines like:
-            //   ✓ @dale (kitty/push) — healthy
-            //   ⚠ @larry (kitty/push) — target '-' (no wake target, unreachable)
-            //   ✗ @old-agent (kitty/push) — stale target — kitty window gone
+            //   ✓ @dale (velocity/push) — healthy
+            //   ⚠ @larry (velocity/push) — target '-' (no wake target, unreachable)
+            //   ✗ @old-agent (velocity/push) — unknown adapter
             if !trimmed.starts_with("✓")
                 && !trimmed.starts_with("⚠")
                 && !trimmed.starts_with("✗")
@@ -223,10 +258,8 @@ impl RosterRail {
 
     /// Refresh the roster from the current doctor output
     pub fn refresh(&mut self) {
-        self.members = Self::parse_doctor_output();
-        if self.selected >= self.members.len() {
-            self.selected = self.members.len().saturating_sub(1);
-        }
+        let members = Self::fetch();
+        self.set_members(members);
     }
 
     /// Select the next member
@@ -308,14 +341,17 @@ impl RosterRail {
 
 impl Widget for &RosterRail {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let block = Block::default().title(" Roster ").borders(Borders::ALL);
+        let block = Block::default()
+            .title(" Agents ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Rgb(90, 90, 90)));
 
         let inner = block.inner(area);
         block.render(area, buf);
 
         if self.members.is_empty() {
             let empty = Line::from(Span::styled(
-                "  No members",
+                "  no agents joined",
                 Style::default().fg(Color::Gray),
             ));
             buf.set_line(inner.x, inner.y, &empty, inner.width);
@@ -330,41 +366,37 @@ impl Widget for &RosterRail {
                 break;
             }
 
-            // Name uses the shared author color (matches the pad + the kitty window);
-            // status/health dots keep their status colors. Selected row = bold name.
+            // Name uses the shared author color (matches the pad + terminal surface).
+            // CLUTTER RULE: the health glyph appears ONLY when something is wrong —
+            // a ✓/⚠ on every row marks nothing. Healthy = just the live dot + name.
             let name_color = crate::color::color_for(&member.name);
-            let name_style = if i == self.selected {
-                Style::default().fg(name_color).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(name_color)
-            };
-
-            let icon_style = Style::default().fg(member.health.color());
+            let name_style = Style::default().fg(name_color).add_modifier(Modifier::BOLD);
             let live_style = Style::default().fg(member.live_status.color());
 
-            let line = Line::from(vec![
+            let mut row = vec![
                 Span::styled(format!(" {} ", member.live_status.icon()), live_style),
-                Span::styled(format!("{} ", member.health.icon()), icon_style),
                 Span::styled(format!("@{}", member.name), name_style),
-            ]);
-
-            buf.set_line(inner.x, y, &line, inner.width);
+            ];
+            if member.health != Health::Healthy {
+                row.push(Span::styled(
+                    format!("  {}", member.health.icon()),
+                    Style::default().fg(member.health.color()),
+                ));
+            }
+            buf.set_line(inner.x, y, &Line::from(row), inner.width);
 
             if !compact && y + 1 < inner.y + inner.height {
-                // Jill's contrast bug: Color::DarkGray/Gray wash out on a light/paper
-                // terminal background. Use explicit mid-dark greys that stay legible on
-                // BOTH light and dark backgrounds — labels dimmer, values stronger.
-                let label = Style::default().fg(Color::Rgb(120, 120, 120));
-                let value = Style::default().fg(Color::Rgb(70, 70, 70));
-                let meta = Line::from(vec![
-                    Span::raw("    "),
-                    Span::styled("harness ", label),
-                    Span::styled(format!("{} ", member.harness), value),
-                    Span::styled("· ", label),
-                    Span::styled("model ", label),
-                    Span::styled(&member.model, value),
-                ]);
-                buf.set_line(inner.x, y + 1, &meta, inner.width);
+                // Mid-grey stays legible on both light and dark backgrounds.
+                let value = Style::default().fg(Color::Rgb(128, 128, 128));
+                let mut meta = format!("   {}", member.harness);
+                if member.model != "—" && !member.model.is_empty() {
+                    meta.push_str(&format!(" · {}", member.model));
+                }
+                if !member.wake.is_empty() {
+                    meta.push_str(&format!(" · {}", member.wake));
+                }
+                let meta_line = Line::from(Span::styled(meta, value));
+                buf.set_line(inner.x, y + 1, &meta_line, inner.width);
             }
         }
     }

@@ -200,7 +200,7 @@ impl MessageList {
             lines.push(Line::from(header));
 
             // body: inline-markdown → styled spans, word-wrapped, hanging-indented.
-            // an `!img: <path>` line renders as a muted placeholder (kitty icat is a
+            // an `!img: <path>` line renders as a muted placeholder (inline image is a
             // later enhancement; the placeholder keeps it legible everywhere now).
             let avail = (width as usize).saturating_sub(BODY_PREFIX_WIDTH).max(8);
             for raw in &m.body {

@@ -2,7 +2,7 @@
 //!
 //! The CLI emits the final RGB hex (`#rrggbb`) with the override map applied
 //! (e.g. Jill=#ff1493, ernie=#5f2f8f) and the same collision-aware assignment the
-//! kitty window backgrounds use. The TUI does NOT reimplement any palette — it
+//! terminal surface backgrounds use. The TUI does NOT reimplement any palette — it
 //! shells out and parses the hex, so the board and the terminals can never drift.
 //!
 //! Batch mode: `stitchpad color` (no arg) dumps the full `name #hex` table in one

@@ -192,17 +192,13 @@ async function relayWho() {
 // just leaves them blank and join falls back to pull as before.
 async function parentSurfaceEnv() {
   const env = process.env;
-  // Velocity emits SUPACODE_* (inherited contract); VELOCITY_* preferred if present.
   const have = {
     VELOCITY_SURFACE_ID: env.VELOCITY_SURFACE_ID || "",
     VELOCITY_TAB_ID: env.VELOCITY_TAB_ID || "",
     VELOCITY_WORKTREE_ID: env.VELOCITY_WORKTREE_ID || "",
-    SUPACODE_SURFACE_ID: env.SUPACODE_SURFACE_ID || "",
-    SUPACODE_TAB_ID: env.SUPACODE_TAB_ID || "",
-    SUPACODE_WORKTREE_ID: env.SUPACODE_WORKTREE_ID || "",
     STITCHPAD_SURFACE_ADAPTER: env.STITCHPAD_SURFACE_ADAPTER || "",
   };
-  if ((have.VELOCITY_SURFACE_ID || have.SUPACODE_SURFACE_ID) && (have.VELOCITY_TAB_ID || have.SUPACODE_TAB_ID)) return have;
+  if (have.VELOCITY_SURFACE_ID && have.VELOCITY_TAB_ID) return have;
   try {
     const { stdout } = await execFileP("ps", ["eww", "-p", String(process.ppid), "-o", "command="], {
       maxBuffer: 1024 * 1024,
@@ -215,9 +211,6 @@ async function parentSurfaceEnv() {
       VELOCITY_SURFACE_ID: have.VELOCITY_SURFACE_ID || pick("VELOCITY_SURFACE_ID"),
       VELOCITY_TAB_ID: have.VELOCITY_TAB_ID || pick("VELOCITY_TAB_ID"),
       VELOCITY_WORKTREE_ID: have.VELOCITY_WORKTREE_ID || pick("VELOCITY_WORKTREE_ID"),
-      SUPACODE_SURFACE_ID: have.SUPACODE_SURFACE_ID || pick("SUPACODE_SURFACE_ID"),
-      SUPACODE_TAB_ID: have.SUPACODE_TAB_ID || pick("SUPACODE_TAB_ID"),
-      SUPACODE_WORKTREE_ID: have.SUPACODE_WORKTREE_ID || pick("SUPACODE_WORKTREE_ID"),
       STITCHPAD_SURFACE_ADAPTER: have.STITCHPAD_SURFACE_ADAPTER || pick("STITCHPAD_SURFACE_ADAPTER"),
     };
   } catch {
@@ -321,6 +314,59 @@ const TOOLS = [
       "note. Call when you're done collaborating or shutting down.",
     inputSchema: { type: "object", properties: {} },
   },
+  {
+    name: "tasks",
+    description:
+      "List the pad's task board (kanban tickets living in stitchpad.md). Check " +
+      "this when you wake or start work — tasks assigned to you are yours to " +
+      "drive without being asked.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        mine: { type: "boolean", description: "Only tasks assigned to me." },
+        status: {
+          type: "string",
+          enum: ["backlog", "todo", "in_progress", "in_review", "done", "canceled"],
+          description: "Filter by status.",
+        },
+      },
+    },
+  },
+  {
+    name: "task_new",
+    description:
+      "Create a task on the pad's board. Use when work is agreed in chat that " +
+      "someone should own — capture it as a ticket instead of leaving it implicit.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "Short imperative title." },
+        priority: { type: "string", enum: ["none", "low", "medium", "high", "urgent"] },
+        assignee: { type: "string", description: "Handle to assign (e.g. 'pi'). Posts an assignment note that wakes them." },
+        labels: { type: "string", description: "Comma-separated labels." },
+      },
+      required: ["title"],
+    },
+  },
+  {
+    name: "task_update",
+    description:
+      "Update a task's status or metadata. MAINTAIN YOUR OWN TICKETS UNPROMPTED: " +
+      "move your task to in_progress the moment you start it, in_review when you " +
+      "post work for review, and done when it's finished and verified — as part of " +
+      "the work itself, not when a human reminds you.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Task id, e.g. TASK-3." },
+        status: { type: "string", enum: ["backlog", "todo", "in_progress", "in_review", "done", "canceled"] },
+        priority: { type: "string", enum: ["none", "low", "medium", "high", "urgent"] },
+        assignee: { type: "string", description: "Reassign to this handle." },
+        labels: { type: "string", description: "Replace labels (comma-separated)." },
+      },
+      required: ["id"],
+    },
+  },
 ];
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
@@ -375,14 +421,10 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         // Surface env is injected into every surface's shell. claude inherits it into
         // the MCP child directly; codex doesn't forward it, so we recover it from the
         // parent process — without this, codex joins pull|- and can't be push-woken.
-        // Velocity inherited Supacode's env contract: it still emits SUPACODE_* (not
-        // VELOCITY_*) and names zmx sessions supa-<uuid>. We read whichever is present
-        // (VELOCITY_* preferred for forward-compat) — these are the inherited bolts,
-        // not a separate app.
         const scEnv = await parentSurfaceEnv();
-        const scSurface = scEnv.VELOCITY_SURFACE_ID || scEnv.SUPACODE_SURFACE_ID;
-        const scTab = scEnv.VELOCITY_TAB_ID || scEnv.SUPACODE_TAB_ID;
-        const scWorktree = scEnv.VELOCITY_WORKTREE_ID || scEnv.SUPACODE_WORKTREE_ID;
+        const scSurface = scEnv.VELOCITY_SURFACE_ID;
+        const scTab = scEnv.VELOCITY_TAB_ID;
+        const scWorktree = scEnv.VELOCITY_WORKTREE_ID;
         // Velocity is the only surface now — always route there.
         const surfaceAdapter = "velocity";
         // target = worktree@@tab@@surface (3-part); @@ not | (roster is pipe-delimited).
@@ -392,10 +434,6 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
           VELOCITY_TAB_ID: scTab,
           VELOCITY_WORKTREE_ID: scWorktree,
           STITCHPAD_SURFACE_ADAPTER: surfaceAdapter,
-          // inherited bolts: the Velocity binary still reads these as a fallback
-          SUPACODE_SURFACE_ID: scSurface,
-          SUPACODE_TAB_ID: scTab,
-          SUPACODE_WORKTREE_ID: scWorktree,
         } : {};
         if (scWorktree) {
           await sp(["meta", "set", handle, "worktree", scWorktree]).catch(() => {});
@@ -450,6 +488,49 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         out = await sp(["leave", ME], ME);
         ME = null;
         break;
+      case "tasks": {
+        if (RELAY_MODE) return text("tasks are not available over relay yet.", true);
+        const args = ["task", "list"];
+        if (a.mine) {
+          if (!ME) return text("call join first — 'mine' needs your identity.", true);
+          args.push("--mine", ME);
+        }
+        if (a.status) args.push("--status", a.status);
+        out = await sp(args);
+        out = out.trim()
+          ? `id|title|status|priority|assignee|labels|created\n${out.trim()}`
+          : "(no tasks match)";
+        break;
+      }
+      case "task_new": {
+        if (RELAY_MODE) return text("tasks are not available over relay yet.", true);
+        if (!ME) return text("call join first — tasks are authored under your identity.", true);
+        const args = ["task", "new", a.title];
+        if (a.priority) args.push("--priority", a.priority);
+        if (a.assignee) args.push("--to", a.assignee);
+        if (a.labels) args.push("--labels", a.labels);
+        out = await sp(args, ME);
+        break;
+      }
+      case "task_update": {
+        if (RELAY_MODE) return text("tasks are not available over relay yet.", true);
+        if (!ME) return text("call join first — tasks are updated under your identity.", true);
+        if (!a.id) return text("task id required (e.g. TASK-3).", true);
+        const parts = [];
+        if (a.status) {
+          parts.push(await sp(["task", "move", a.id, a.status], ME));
+        }
+        const edit = [];
+        if (a.priority) edit.push("--priority", a.priority);
+        if (a.assignee) edit.push("--to", a.assignee);
+        if (a.labels) edit.push("--labels", a.labels);
+        if (edit.length) {
+          parts.push(await sp(["task", "edit", a.id, ...edit], ME));
+        }
+        if (!parts.length) return text("nothing to update — pass status/priority/assignee/labels.", true);
+        out = parts.join("\n");
+        break;
+      }
       default:
         return text(`unknown tool: ${name}`, true);
     }

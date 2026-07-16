@@ -120,6 +120,69 @@ export default function stitchpadExtension(pi: ExtensionAPI) {
     async execute(_id, _params, _sig, _upd, ctx) { return ok(await sp(["leave"], ctx.cwd, pinned || undefined)); },
   });
 
+  pi.registerTool({
+    name: "stitchpad_tasks",
+    label: "stitchpad: tasks",
+    description: "List the pad's task board. Check this when you wake or start work — tasks assigned to you are yours to drive without being asked.",
+    parameters: Type.Object({
+      mine: Type.Optional(Type.Boolean({ description: "Only tasks assigned to me." })),
+      status: Type.Optional(Type.String({ description: "Filter: backlog|todo|in_progress|in_review|done|canceled" })),
+    }),
+    async execute(_id, params, _sig, _upd, ctx) {
+      const args = ["task", "list"];
+      if (params.mine) {
+        const me = pinned || (await sp(["whoami"], ctx.cwd).catch(() => "")).trim();
+        if (me) args.push("--mine", me);
+      }
+      if (params.status) args.push("--status", params.status);
+      const out = await sp(args, ctx.cwd);
+      return ok(out.trim() ? `id|title|status|priority|assignee|labels|created\n${out.trim()}` : "(no tasks match)");
+    },
+  });
+
+  pi.registerTool({
+    name: "stitchpad_task_new",
+    label: "stitchpad: task new",
+    description: "Create a task on the pad's board. Use when work is agreed in chat that someone should own — capture it as a ticket instead of leaving it implicit.",
+    parameters: Type.Object({
+      title: Type.String({ description: "Short imperative title." }),
+      priority: Type.Optional(Type.String({ description: "none|low|medium|high|urgent" })),
+      assignee: Type.Optional(Type.String({ description: "Handle to assign (e.g. 'codex'). Posts an assignment note that wakes them." })),
+      labels: Type.Optional(Type.String({ description: "Comma-separated labels." })),
+    }),
+    async execute(_id, params, _sig, _upd, ctx) {
+      const args = ["task", "new", params.title];
+      if (params.priority) args.push("--priority", params.priority);
+      if (params.assignee) args.push("--to", params.assignee);
+      if (params.labels) args.push("--labels", params.labels);
+      return ok(await sp(args, ctx.cwd, pinned || undefined));
+    },
+  });
+
+  pi.registerTool({
+    name: "stitchpad_task_update",
+    label: "stitchpad: task update",
+    description: "Update a task's status or metadata. MAINTAIN YOUR OWN TICKETS UNPROMPTED: move your task to in_progress the moment you start it, in_review when you post work for review, and done when it's finished and verified — as part of the work itself, not when a human reminds you.",
+    parameters: Type.Object({
+      id: Type.String({ description: "Task id, e.g. TASK-3." }),
+      status: Type.Optional(Type.String({ description: "backlog|todo|in_progress|in_review|done|canceled" })),
+      priority: Type.Optional(Type.String({ description: "none|low|medium|high|urgent" })),
+      assignee: Type.Optional(Type.String({ description: "Reassign to this handle." })),
+      labels: Type.Optional(Type.String({ description: "Replace labels (comma-separated)." })),
+    }),
+    async execute(_id, params, _sig, _upd, ctx) {
+      const parts: string[] = [];
+      if (params.status) parts.push(await sp(["task", "move", params.id, params.status], ctx.cwd, pinned || undefined));
+      const edit: string[] = [];
+      if (params.priority) edit.push("--priority", params.priority);
+      if (params.assignee) edit.push("--to", params.assignee);
+      if (params.labels) edit.push("--labels", params.labels);
+      if (edit.length) parts.push(await sp(["task", "edit", params.id, ...edit], ctx.cwd, pinned || undefined));
+      if (!parts.length) return ok("nothing to update — pass status/priority/assignee/labels.");
+      return ok(parts.join("\n"));
+    },
+  });
+
   // ── Wake (agent_end = pi's idle moment, the claude/codex Stop equivalent) ──
   async function drain(ctx: ExtensionContext) {
     if (!ctx.isIdle()) return;   // don't collide with an in-flight turn

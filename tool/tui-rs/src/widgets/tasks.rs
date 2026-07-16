@@ -88,6 +88,109 @@ impl TaskBoard {
     pub fn selected_task(&self) -> Option<&Task> {
         self.tasks.get(self.selected)
     }
+
+    /// Move the selected task one status column forward/back (backlog↔…↔done) via
+    /// the CLI, then re-read. Canceling is explicit (`set_selected_status`), not on
+    /// the arrow path, so ]] can't accidentally kill a ticket.
+    pub fn move_selected(&mut self, forward: bool) {
+        let Some(task) = self.selected_task() else { return };
+        let cur = bucket(&task.status);
+        let last_movable = 4; // done — ]/[ never walks into canceled
+        let next = if forward {
+            (cur + 1).min(last_movable)
+        } else {
+            cur.saturating_sub(1)
+        };
+        if next == cur || cur > last_movable {
+            return;
+        }
+        self.set_selected_status(COLUMNS[next].0);
+    }
+
+    /// Set the selected task to an explicit status via the CLI, then re-read.
+    pub fn set_selected_status(&mut self, status: &str) {
+        let Some(task) = self.selected_task() else { return };
+        let id = task.id.clone();
+        let _ = std::process::Command::new("stitchpad")
+            .args(["task", "move", &id, status])
+            .output();
+        self.refresh();
+        // keep the same ticket selected across the re-read (it changed columns)
+        if let Some(pos) = self.tasks.iter().position(|t| t.id == id) {
+            self.selected = pos;
+        }
+    }
+}
+
+/// Centered overlay rect: `pct` of the area, clamped to sane minimums.
+pub fn overlay_rect(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
+    let w = (area.width as u32 * pct_x as u32 / 100).max(30) as u16;
+    let h = (area.height as u32 * pct_y as u32 / 100).max(8) as u16;
+    let w = w.min(area.width);
+    let h = h.min(area.height);
+    Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + (area.height - h) / 2,
+        width: w,
+        height: h,
+    }
+}
+
+/// Full-field detail card for one task, rendered as a modal overlay.
+pub fn render_detail(task: &Task, area: Rect, buf: &mut Buffer) {
+    let rect = overlay_rect(area, 70, 60);
+    ratatui::widgets::Clear.render(rect, buf);
+    let block = Block::default()
+        .title(format!(" {} ", task.id))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(rect);
+    block.render(rect, buf);
+
+    let label = Style::default().fg(Color::Rgb(128, 128, 128));
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            task.title.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("status   ", label),
+            Span::styled(task.status.clone(), Style::default().fg(Color::Cyan)),
+            Span::styled("   priority ", label),
+            Span::styled(
+                task.priority.clone(),
+                Style::default().fg(priority_color(&task.priority)),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("assignee ", label),
+            Span::styled(
+                format!("@{}", task.assignee),
+                Style::default().fg(crate::color::color_for(&task.assignee)),
+            ),
+            Span::styled("   created ", label),
+            Span::raw(task.created.clone()),
+        ]),
+    ];
+    if !task.labels.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("labels   ", label),
+            Span::raw(task.labels.join(", ")),
+        ]));
+    }
+    lines.push(Line::from(""));
+    for l in task.description.lines() {
+        lines.push(Line::from(l.to_string()));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Esc:close   ]/[:move status   d:done   x:cancel",
+        label,
+    )));
+    Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .render(inner, buf);
 }
 
 /// Collect every ```task <ID> block from the pad and parse its key:value frontmatter
