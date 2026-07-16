@@ -62,7 +62,7 @@ const store = {
   pads: [], doc: null, blocks: null, pending: [], notices: [], dmlogs: {},
   summary: null, summaryOpen: false, summarizing: false,
   dmView: "chat", terms: {},
-  wasBottom: true, authed: false, loginErr: "",
+  authed: false, loginErr: "",
 };
 const subs = new Set();
 const publish = () => subs.forEach(f => f());
@@ -76,7 +76,7 @@ function stick(smooth) {
   if (smooth && !matchMedia("(prefers-reduced-motion: reduce)").matches) l.scrollTo({ top: l.scrollHeight, behavior: "smooth" });
   else l.scrollTop = l.scrollHeight;
 }
-const notice = (text, err) => { store.notices = [...store.notices, { text, err, at: Date.now() }]; publish(); requestAnimationFrame(() => stick()); };
+const notice = (text, err) => { const was = nearBottom(); store.notices = [...store.notices, { text, err, at: Date.now() }]; publish(); if (was) requestAnimationFrame(() => stick()); };
 
 // ── transport: websocket to PadHub DO + polling fallback ─────
 let PAD_ETAG = "";
@@ -95,7 +95,6 @@ function acceptDoc(d) {
   if (d.name && d.name !== store.pad) return;      // stale after a pad switch
   if (d.at) PAD_ETAG = `"${d.at}"`;
   setRelayColors(d.colors);
-  store.wasBottom = nearBottom() || !store.doc;
   const fresh = keyBlocks(parse(d.pad));
   // MERGE, don't replace: subsequent polls only carry the last 200 lines, so a
   // naive swap drops rows off the TOP and shifts the log under a reader who is
@@ -199,9 +198,10 @@ function pushDm(msg) {
   // the ws echo carries the SERVER timestamp — dedupe on from+text within a
   // 15s window (not exact at), else the optimistic add doubles on screen
   if (cur.some(m => m.from === msg.from && m.text === msg.text && Math.abs((m.at || 0) - (msg.at || 0)) < 15000)) return;
+  const was = nearBottom();
   store.dmlogs = { ...store.dmlogs, [peer]: [...cur, msg].slice(-200) };
   publish();
-  if (store.dmWith === peer) requestAnimationFrame(() => stick(true));
+  if (store.dmWith === peer && was) requestAnimationFrame(() => stick(true));
 }
 // the DM pane content is the agent's terminal SESSION chat — ask the bridge to
 // re-read the session transcript every 5s while a DM is open and visible
@@ -471,14 +471,29 @@ function Log() {
   const fresh = new Set();
   if (!first.current) items.forEach(it => { if (!known.current.has(it.key)) fresh.add(it.key); });
   const loaded = s.dmWith ? (s.terms[s.dmWith] !== undefined || s.dmlogs[s.dmWith] !== undefined) : !!s.blocks;
+  // RENDER-PHASE snapshot (before the DOM commits): is the reader at the
+  // bottom right now, and if not, which row is at the top of their viewport?
+  // store.wasBottom can be stale — any publish (dm, term, notice) re-runs this
+  // effect, but only pad polls refreshed it. Measure live, every render.
+  const l0 = logEl();
+  const atBottom = first.current || !l0 || nearBottom();
+  let anchor = null;
+  if (l0 && !atBottom) {
+    for (const el of (document.getElementById("rows")?.children || [])) {
+      if (el.offsetTop + el.offsetHeight > l0.scrollTop) { anchor = { el, top: el.offsetTop - l0.scrollTop }; break; }
+    }
+  }
   useLayoutEffect(() => {
     items.forEach(it => known.current.add(it.key));
-    // NEVER steal focus: scroll only on the view's first paint, or when the
-    // reader was already at the bottom when this update arrived. Scrolled up →
-    // new rows append below, silently; the viewport does not move.
-    const shouldStick = first.current || store.wasBottom;
     if (loaded) first.current = false;
-    if (shouldStick) stick(false);
+    // NEVER steal focus: stick only on first paint or when the reader was at
+    // the bottom BEFORE this update. Scrolled up → re-pin the row they were
+    // reading (the merge window can insert/remove rows above the viewport,
+    // which otherwise shifts the page under them — the "jolt").
+    if (atBottom) stick(false);
+    else if (anchor && anchor.el.isConnected) {
+      const l = logEl(); if (l) l.scrollTop = anchor.el.offsetTop - anchor.top;
+    }
   });
 
   return html`<div id="log">

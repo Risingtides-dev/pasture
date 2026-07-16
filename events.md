@@ -557,3 +557,10 @@ area:      [frontend]
 
 DM pane = the agent's terminal SESSION chat (deployed live). Same chat UI, different source: the bridge resolves the agent's live session (.state/sessions binding → freshest ~/.claude/projects/<proj-slug>/<sid>.jsonl), parses it into chat turns (typed/injected user messages + assistant replies; tool results, meta, thinking and harness noise filtered; consecutive assistant chunks merged; last 60 turns), and posts them via /term-in → PadHub stores + broadcasts {type:"term"}. PWA polls a capture request every 5s while a DM is open+visible and renders the turns as normal bubbles — smaths' messages on the teal tint, the agent's replies plain. Non-claude harnesses (codex/pi CLIs have no claude transcript) fall back to the relay DM log. Fixed along the way: worker /term-in was dropping the msgs field (old destructure — the "empty capture" bug), double-send in DMs (optimistic add deduped vs ws echo by from+text within 15s, not exact timestamp), and de-slopped the DM UI per smaths' markup — header is just @name, timestamps are plain HH:MM (no "→ terminal"/"session" labels), hint line and empty-state copy removed in DM view. Verified over the wire: fable session → 60 parsed turns → stored and served.
 _________________________________________________________________________________
+time:      [11:13] [07-16-26]
+agent:     [claude] [fable 5]
+type:      [bug-report]
+area:      [frontend]
+
+Fixed the scroll-yank for real: the stick decision trusted store.wasBottom, which only pad polls refreshed — any DM/term/notice publish re-ran the layout effect with a stale true and slammed the reader to the bottom. Now bottom-ness is measured live in the render phase before each DOM commit, and when the reader is scrolled up the row at the top of their viewport is anchored and re-pinned after the update, so merge-window insert/removals above the fold cannot shift the page. Also made notice() and pushDm() respect scroll position instead of force-sticking. Deployed 75e72e9f.
+_________________________________________________________________________________
