@@ -51,14 +51,6 @@ function parse(md) {
   if (cur) out.push(cur);
   return out;
 }
-function inDM(b, x, me) {
-  const a = (b.who || "").toLowerCase(), meL = me.toLowerCase(), xL = x.toLowerCase();
-  if (a !== meL && a !== xL) return false;
-  const body = (b.body || []).join(" ").toLowerCase();
-  const other = (a === meL) ? xL : meL;
-  const mentions = n => new RegExp("(^|[^a-z0-9_-])@" + n + "([^a-z0-9_-]|$)").test(body);
-  return mentions(other) || !/(^|[^a-z0-9_-])@[a-z0-9_-]/.test(body);
-}
 const normTxt = s => (s || "").replace(/\s+/g, " ").trim();
 
 // ── store: transport writes, components subscribe ────────────
@@ -67,18 +59,13 @@ const store = {
   token: localStorage.getItem("sp_token") || "",
   pad: localStorage.getItem("sp_pad") || "",
   dmWith: localStorage.getItem("sp_dm") || "",
-  pads: [], doc: null, pending: [], notices: [],
+  pads: [], doc: null, blocks: null, pending: [], notices: [], dmlogs: {},
   wasBottom: true, authed: false, loginErr: "",
 };
 const subs = new Set();
 const publish = () => subs.forEach(f => f());
 const useStore = () => { const [, set] = useState(0); useEffect(() => { const f = () => set(x => x + 1); subs.add(f); return () => subs.delete(f); }, []); return store; };
 const api = (p, o = {}) => fetch(RELAY + p, { ...o, headers: { authorization: "Bearer " + store.token, "content-type": "application/json", ...(o.headers || {}) } });
-
-// local log of true DMs (terminal-routed) per pad+agent
-const dmLKey = n => "sp_dmlog_" + store.pad + "_" + n;
-const dmLoad = n => { try { return JSON.parse(localStorage.getItem(dmLKey(n)) || "[]"); } catch (_) { return []; } };
-const dmSave = (n, l) => { try { localStorage.setItem(dmLKey(n), JSON.stringify(l.slice(-50))); } catch (_) {} };
 
 const logEl = () => document.getElementById("log");
 const nearBottom = () => { const l = logEl(); return !l || l.scrollHeight - l.scrollTop - l.clientHeight < 80; };
@@ -91,13 +78,34 @@ const notice = (text, err) => { store.notices = [...store.notices, { text, err, 
 
 // ── transport: websocket to PadHub DO + polling fallback ─────
 let PAD_ETAG = "";
+// stable block keys with reverse-occurrence disambiguation (append-only safe)
+function keyBlocks(blocks) {
+  const seen = {};
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    const b = blocks[i];
+    const base = b.sys ? "s" + djb2(b.sys) : djb2(b.who + "|" + b.t + "|" + b.body.join("\n").trim());
+    const n = seen[base] = (seen[base] || 0) + 1;
+    b.key = n > 1 ? base + "#" + n : base;
+  }
+  return blocks;
+}
 function acceptDoc(d) {
   if (d.name && d.name !== store.pad) return;      // stale after a pad switch
   if (d.at) PAD_ETAG = `"${d.at}"`;
   setRelayColors(d.colors);
   store.wasBottom = nearBottom() || !store.doc;
+  const fresh = keyBlocks(parse(d.pad));
+  // MERGE, don't replace: subsequent polls only carry the last 200 lines, so a
+  // naive swap drops rows off the TOP and shifts the log under a reader who is
+  // scrolled up (the focus-yank complaint). The pad is append-only — keep every
+  // block we've seen this session, splice the fresh window onto the tail.
+  if (!store.blocks) store.blocks = fresh;
+  else {
+    const freshKeys = new Set(fresh.map(b => b.key));
+    store.blocks = [...store.blocks.filter(b => !freshKeys.has(b.key)), ...fresh].slice(-500);
+  }
   // drop optimistic pendings that have landed (fuzzy: bridge may reflow text)
-  const mine = parse(d.pad).filter(b => !b.sys && (b.who || "").toLowerCase() === store.me.toLowerCase()).map(b => normTxt((b.body || []).join("\n")));
+  const mine = fresh.filter(b => !b.sys && (b.who || "").toLowerCase() === store.me.toLowerCase()).map(b => normTxt((b.body || []).join("\n")));
   store.pending = store.pending.filter(p => {
     const n = normTxt(p.text);
     if (mine.some(l => l === n || l.startsWith(n) || n.startsWith(l))) return false;
@@ -136,6 +144,7 @@ function connectWS() {
   s.onmessage = e => {
     let m; try { m = JSON.parse(e.data); } catch (_) { return; }
     if (m.type === "pad" && m.data && myPad === store.pad) acceptDoc(m.data);
+    if (m.type === "dm" && m.msg && myPad === store.pad) pushDm(m.msg);
   };
   s.onclose = () => {
     if (WS !== s) return;
@@ -158,17 +167,32 @@ document.addEventListener("visibilitychange", () => {
   else { poll(); loadPads(); startPolling(); connectWS(); }
 });
 function switchPad(name) {
-  store.pad = name; store.dmWith = ""; store.doc = null; store.pending = []; store.notices = [];
+  store.pad = name; store.dmWith = ""; store.doc = null; store.blocks = null; store.pending = []; store.notices = []; store.dmlogs = {};
   PAD_ETAG = "";
   localStorage.removeItem("sp_dm"); localStorage.setItem("sp_pad", name);
   publish(); poll(); loadPads(); connectWS();
 }
-function openDM(n) { store.dmWith = n; localStorage.setItem("sp_dm", n); store.notices = []; publish(); requestAnimationFrame(() => stick()); }
+async function loadDmLog(peer) {
+  const r = await api("/dmlog?pad=" + encodeURIComponent(store.pad) + "&a=" + encodeURIComponent(store.me) + "&b=" + encodeURIComponent(peer)).catch(() => null);
+  if (!r || !r.ok) return;
+  store.dmlogs = { ...store.dmlogs, [peer]: await r.json() };
+  publish(); requestAnimationFrame(() => stick());
+}
+function pushDm(msg) {
+  const peer = (msg.from || "").toLowerCase() === store.me.toLowerCase() ? msg.to : msg.from;
+  const cur = store.dmlogs[peer] || [];
+  if (cur.some(m => m.at === msg.at && m.from === msg.from && m.text === msg.text)) return;   // ws echo of our optimistic add
+  store.dmlogs = { ...store.dmlogs, [peer]: [...cur, msg].slice(-200) };
+  publish();
+  if (store.dmWith === peer) requestAnimationFrame(() => stick(true));
+}
+function openDM(n) { store.dmWith = n; localStorage.setItem("sp_dm", n); store.notices = []; publish(); loadDmLog(n); }
 function closeDM() { store.dmWith = ""; localStorage.removeItem("sp_dm"); store.notices = []; publish(); }
 function startApp() {
   store.authed = true;
   store.dmWith = localStorage.getItem("sp_dm") || "";
   publish(); loadPads(); poll(); startPolling(); connectWS();
+  if (store.dmWith) loadDmLog(store.dmWith);
 }
 async function doLogin(user, pass) {
   store.loginErr = ""; publish();
@@ -198,16 +222,17 @@ const isOnline = n => { const p = profiles()[n] || {}; return p.online !== undef
 const liveState = n => { if (!isOnline(n)) return "offline"; const s = (profiles()[n] || {}).status; return s === "dnd" ? "dnd" : s === "working" ? "working" : "available"; };
 
 // send + DM + attach
-let DM_PAD_COUNT = 0;
 async function sendText(text) {
   if (!text || !store.pad) return { ok: true };
   if (store.dmWith) {
     // TRUE DM → relay dmbox → bridge → herdr injection. Never lands on the pad.
+    // The DO records it in the per-pair DM log; our optimistic add is deduped
+    // when the websocket echo arrives.
+    const to = store.dmWith;
     try {
-      const r = await api("/dm?pad=" + encodeURIComponent(store.pad), { method: "POST", body: JSON.stringify({ from: store.me, to: store.dmWith, text }) });
+      const r = await api("/dm?pad=" + encodeURIComponent(store.pad), { method: "POST", body: JSON.stringify({ from: store.me, to, text }) });
       if (!r.ok) throw new Error("HTTP " + r.status);
-      const l = dmLoad(store.dmWith); l.push({ text, at: Date.now(), anchor: DM_PAD_COUNT }); dmSave(store.dmWith, l);
-      publish(); requestAnimationFrame(() => stick(true));
+      pushDm({ from: store.me, to, text, at: Date.now() });
       return { ok: true };
     } catch (err) {
       notice("⚠ DM failed (" + err.message + ") — your text is back in the box", true);
@@ -334,10 +359,12 @@ function Row({ b, grouped, enter }) {
   </div></div>`;
 }
 
-function DmRow({ dm, to }) {
+function DmRow({ dm }) {
+  const mine = (dm.from || "").toLowerCase() === store.me.toLowerCase();
   const t = new Date(dm.at), hh = String(t.getHours()).padStart(2, "0"), mm = String(t.getMinutes()).padStart(2, "0");
-  return html`<div class="row dmrow"><${Av} n=${store.me} trigger=${false}/><div class="bubble">
-    <div class="hd"><span class="who" style=${{ color: nameColor(store.me) }}>${store.me}</span><span class="ts dmts">${hh}:${mm} → @${to}'s terminal</span></div>
+  const ts = mine ? `${hh}:${mm} → @${dm.to}'s terminal` : `${hh}:${mm} · from their terminal`;
+  return html`<div class=${"row" + (mine ? " dmrow" : "")}><${Av} n=${dm.from} trigger=${!mine}/><div class="bubble">
+    <div class="hd"><span class=${"who" + (mine ? "" : " card-trigger")} data-agent=${dm.from} style=${{ color: nameColor(dm.from) }}>${dm.from}</span><span class="ts dmts">${ts}</span></div>
     <div class="bd" dangerouslySetInnerHTML=${{ __html: fmt(dm.text) }}></div>
   </div></div>`;
 }
@@ -353,44 +380,42 @@ function Log() {
   useEffect(() => { known.current = new Set(); first.current = true; }, [s.pad, s.dmWith]);
 
   let items = [];
-  if (s.doc) {
-    let msgs = parse(s.doc.pad);
-    if (s.dmWith) {
-      msgs = msgs.filter(b => !b.sys && inDM(b, s.dmWith, s.me));
-      DM_PAD_COUNT = msgs.length;
-      const locals = dmLoad(s.dmWith);
-      const woven = [];
-      for (let i = 0; i <= msgs.length; i++) {
-        locals.forEach(l => { if (Math.min(l.anchor ?? msgs.length, msgs.length) === i) woven.push({ dm: l }); });
-        if (i < msgs.length) woven.push(msgs[i]);
-      }
-      msgs = woven;
-    }
+  if (s.dmWith) {
+    // DM pane = the TERMINAL log (per-pair DM history from the relay), not the
+    // old pad-filtered thread. Both directions render; live via ws {type:"dm"}.
+    items = (s.dmlogs[s.dmWith] || []).map(m => ({ key: "d" + m.at + djb2((m.from || "") + (m.text || "")), dm: m }));
+  } else if (s.blocks) {
+    const msgs = s.blocks;
     items = msgs.map((b, i) => {
-      if (b.sys) return { key: "s" + djb2(b.sys), sys: b.sys };
-      if (b.dm) return { key: "d" + b.dm.at + djb2(b.dm.text), dm: b.dm };
+      if (b.sys) return { key: b.key, sys: b.sys };
       const prev = msgs[i - 1];
-      const grouped = !!(prev && !prev.sys && !prev.dm && prev.who === b.who);
-      return { key: djb2(b.who + "|" + b.t + "|" + b.body.join("\n").trim()) + (grouped ? "g" : ""), b, grouped };
+      const grouped = !!(prev && !prev.sys && prev.who === b.who);
+      return { key: b.key + (grouped ? "g" : ""), b, grouped };
     });
   }
   // entrance animation only for keys that appear after first paint
   const fresh = new Set();
   if (!first.current) items.forEach(it => { if (!known.current.has(it.key)) fresh.add(it.key); });
+  const loaded = s.dmWith ? s.dmlogs[s.dmWith] !== undefined : !!s.blocks;
   useLayoutEffect(() => {
     items.forEach(it => known.current.add(it.key));
-    const was = store.wasBottom || first.current;
-    if (s.doc) first.current = false;
-    if (was) stick(false);
+    // NEVER steal focus: scroll only on the view's first paint, or when the
+    // reader was already at the bottom when this update arrived. Scrolled up →
+    // new rows append below, silently; the viewport does not move.
+    const shouldStick = first.current || store.wasBottom;
+    if (loaded) first.current = false;
+    if (shouldStick) stick(false);
   });
 
   return html`<div id="log">
     <div id="rows">
-      ${!s.doc && html`<${Skeleton}/>`}
-      ${s.doc && !items.length && html`<div class="empty"><b>Quiet in here</b><span>type <code>@name</code> to address an agent — their next turn picks it up</span></div>`}
+      ${!loaded && html`<${Skeleton}/>`}
+      ${loaded && !items.length && (s.dmWith
+        ? html`<div class="empty"><b>No DMs yet</b><span>messages here go straight to @${s.dmWith}'s terminal — the pad never sees them</span></div>`
+        : html`<div class="empty"><b>Quiet in here</b><span>type <code>@name</code> to address an agent — their next turn picks it up</span></div>`)}
       ${items.map(it =>
         it.sys ? html`<div key=${it.key} class=${"sys" + (fresh.has(it.key) ? " enter" : "")}>${it.sys}</div>`
-        : it.dm ? html`<${DmRow} key=${it.key} dm=${it.dm} to=${s.dmWith}/>`
+        : it.dm ? html`<${DmRow} key=${it.key} dm=${it.dm}/>`
         : html`<${Row} key=${it.key} b=${it.b} grouped=${it.grouped} enter=${fresh.has(it.key)}/>`)}
     </div>
     <div id="pend">

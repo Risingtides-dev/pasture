@@ -11,7 +11,7 @@
 //
 //   STITCHPAD_RELAY=... STITCHPAD_TOKEN=... node bridge-ws.mjs [roots...]
 import { execFile, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, watch, writeFileSync, createWriteStream } from "node:fs";
+import { existsSync, mkdirSync, watch, writeFileSync, readFileSync, truncateSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import os from "node:os";
@@ -147,6 +147,23 @@ function track(padd) {
   log("tracking", p.name);
 }
 
+// agent → human DMs: `stitchpad dm` appends to .state/dmout.jsonl; forward each
+// line to the relay (/dm-in records it in the pair log + broadcasts to phones).
+async function drainDmOut(p) {
+  const f = join(p.padd, ".state", "dmout.jsonl");
+  try { if (!existsSync(f) || statSync(f).size === 0) return; } catch { return; }
+  let raw = "";
+  try { raw = readFileSync(f, "utf8"); truncateSync(f, 0); } catch { return; }
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const m = JSON.parse(line);
+      await api(`/dm-in?pad=${encodeURIComponent(p.name)}`, { method: "POST", body: JSON.stringify(m) });
+      log(p.name, `DM @${m.from} → @${m.to} (agent → phone)`);
+    } catch (e) { log(p.name, "dm-in forward failed:", e.message); }
+  }
+}
+
 // ── main ─────────────────────────────────────────────────────
 log(`relay=${RELAY} roots=${ROOTS.join(",")} (websocket mode)`);
 findPads().forEach(track);
@@ -154,6 +171,7 @@ setInterval(() => findPads().forEach(track), 60000);              // new pads ap
 setInterval(() => pads.forEach(p => pushPad(p, "sweep")), 45000); // presence/status refresh
 setInterval(() => pads.forEach(p => p.ws?.readyState === 1 ? p.ws.send('{"type":"ping"}') : null), 25000);
 setInterval(() => pads.forEach(p => { if (!p.ws || p.ws.readyState !== 1) drainQueues(p); }), 30000);
+setInterval(() => pads.forEach(drainDmOut), 2000);                // agent DM replies
 // heartbeat file so `stitchpad doctor` can see the bridge is alive
 setInterval(() => pads.forEach(p => {
   try { writeFileSync(join(p.padd, ".state", "bridge-heartbeat"), JSON.stringify({ ts: new Date().toISOString(), pad: p.name, mode: "ws" })); } catch {}

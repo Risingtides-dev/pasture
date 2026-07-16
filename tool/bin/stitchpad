@@ -681,6 +681,22 @@ PY
     tail -n "$n" "$PAD_MD"
     ;;
 
+  dm)
+    # True DM — bypasses the pad entirely. Queues into .state/dmout.jsonl; the
+    # relay bridge forwards it to the recipient's DM pane on the phone (and the
+    # relay records it in the per-pair DM log). Sender = your bound identity.
+    #   stitchpad dm <@handle> <text...>
+    sp_init_paths || exit 1
+    who="$(sp_me)"
+    [ -z "$who" ] && { echo "stitchpad: no identity — call the MCP join tool first (or set STITCHPAD_NAME)" >&2; exit 1; }
+    to="${1:?usage: stitchpad dm <@handle> <text...>}"; shift || true
+    to="${to#@}"
+    text="$*"
+    [ -z "$text" ] && { echo "stitchpad: empty message" >&2; exit 1; }
+    jq -nc --arg f "$who" --arg t "$to" --arg x "$text" '{from:$f,to:$t,text:$x,at:(now*1000|floor)}' >> "$PAD_STATE/dmout.jsonl" \
+      && echo "✓ DM → @$to (private, via relay bridge — not on the pad)"
+    ;;
+
   dnd)
     # Local wake suppression for the current agent.
     #   stitchpad dnd on

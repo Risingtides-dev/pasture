@@ -89,14 +89,29 @@ export class PadHub {
 
     // instant delivery attempt: say/dm/file → a connected bridge socket.
     // {delivered:false} tells the worker to fall back to the KV queue.
+    // DMs additionally persist to the per-pair DM log (the "terminal log" the
+    // PWA DM pane renders) and broadcast {type:"dm"} to client sockets live.
     if (url.pathname === "/deliver" && req.method === "POST") {
       const { kind, msg } = await req.json();
+      if (kind === "dm" || kind === "dm-in") {
+        const pair = [msg.from, msg.to].sort().join("~");
+        const log = (await this.ctx.storage.get("dm:" + pair)) || [];
+        log.push(msg);
+        await this.ctx.storage.put("dm:" + pair, log.slice(-200));
+        this.broadcast("client", JSON.stringify({ type: "dm", pad, msg }));
+        if (kind === "dm-in") return json({ delivered: true });   // inbound: no bridge hop
+      }
       const bridges = this.ctx.getWebSockets("bridge");
       if (!bridges.length) return json({ delivered: false });
       const s = JSON.stringify({ type: kind, pad, msg });
       let sent = 0;
       bridges.forEach(w => { try { w.send(s); sent++; } catch {} });
       return json({ delivered: sent > 0 });
+    }
+    // per-pair DM history (?a=&b=)
+    if (url.pathname === "/dmlog" && req.method === "GET") {
+      const pair = [url.searchParams.get("a") || "", url.searchParams.get("b") || ""].sort().join("~");
+      return json((await this.ctx.storage.get("dm:" + pair)) || []);
     }
 
     return json({ error: "not found" }, 404);
@@ -161,7 +176,7 @@ export default {
     }
 
     // Non-API paths → serve the PWA static assets (index.html, manifest).
-    const API = ["/login", "/join-request", "/invite", "/pads", "/pad", "/pad.colors", "/push", "/say", "/outbox", "/dm", "/dmbox", "/upload-image", "/upload-file", "/filebox", "/ws"];
+    const API = ["/login", "/join-request", "/invite", "/pads", "/pad", "/pad.colors", "/push", "/say", "/outbox", "/dm", "/dmbox", "/dm-in", "/dmlog", "/upload-image", "/upload-file", "/filebox", "/ws"];
     if (!API.includes(url.pathname) && !url.pathname.startsWith("/img/") && !url.pathname.startsWith("/f/")) {
       return env.ASSETS ? env.ASSETS.fetch(req) : json({ error: "no assets" }, 404);
     }
@@ -210,8 +225,15 @@ export default {
     if (!pad) return json({ error: "missing ?pad=NAME" }, 400);
 
     // realtime hot path → the pad's Durable Object
-    if (url.pathname === "/ws" || url.pathname === "/push" || url.pathname === "/pad" || url.pathname === "/pad.colors") {
+    if (url.pathname === "/ws" || url.pathname === "/push" || url.pathname === "/pad" || url.pathname === "/pad.colors" || url.pathname === "/dmlog") {
       return hub(env, pad).fetch(req);
+    }
+    // agent → human DM (bridge forwards `stitchpad dm` output): record + broadcast
+    if (url.pathname === "/dm-in" && req.method === "POST") {
+      const { from, to, text, at } = await req.json();
+      if (!from || !to || !text) return json({ error: "need from + to + text" }, 400);
+      await tryDeliver(env, pad, "dm-in", { from, to, text, at: at || Date.now() });
+      return json({ ok: true });
     }
 
     if (url.pathname === "/say" && req.method === "POST") {
