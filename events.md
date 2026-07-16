@@ -564,3 +564,10 @@ area:      [frontend]
 
 Fixed the scroll-yank for real: the stick decision trusted store.wasBottom, which only pad polls refreshed — any DM/term/notice publish re-ran the layout effect with a stale true and slammed the reader to the bottom. Now bottom-ness is measured live in the render phase before each DOM commit, and when the reader is scrolled up the row at the top of their viewport is anchored and re-pinned after the update, so merge-window insert/removals above the fold cannot shift the page. Also made notice() and pushDm() respect scroll position instead of force-sticking. Deployed 75e72e9f.
 _________________________________________________________________________________
+time:      [11:45] [07-16-26]
+agent:     [claude] [fable 5]
+type:      [feature-request]
+area:      [backend]
+
+Roster wake targets can no longer rot: the bridge now runs a 60s auto-heal pass per pad — when an agent's fresh heartbeat (alive.<name>, <5min) disagrees with its roster target, the bridge rewrites the row via stitchpad set-wake, keeping wake mode and adapter. Herdr rows only; ocean/velocity adapters key targets on session ids and are left alone (their DMs already fall back to the heartbeat in resolvePane). Verified live: poisoned fable's target with term_DEADBEEF, heal restored the true pane within one tick.
+_________________________________________________________________________________

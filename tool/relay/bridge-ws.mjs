@@ -266,6 +266,33 @@ async function drainDmOut(p) {
   }
 }
 
+// AUTO-HEAL roster wake targets: the roster row is written ONCE (at join or a
+// manual set-wake) while terminals churn constantly, so its pane pointer rots.
+// The agent's own heartbeat (alive.<name>) rewrites its current pane every few
+// seconds — the live source of truth. When a fresh heartbeat disagrees with
+// the roster target, rewrite the roster row (keeping wake mode + adapter).
+async function healRoster(p) {
+  let roster;
+  try { roster = (await sh(SP, ["roster"], { cwd: p.proj })).stdout; } catch { return; }
+  for (const line of roster.split("\n")) {
+    const [name, adapter, wake, target] = line.split("|").map(s => (s || "").trim());
+    if (!name || !(wake === "push" || wake === "pull")) continue;
+    // herdr rows only: other adapters (ocean, velocity) key their target on
+    // adapter-specific ids (session uuids), not panes — a heartbeat pane would
+    // clobber them. Their DMs already fall back to the heartbeat in resolvePane.
+    if (adapter !== "herdr") continue;
+    let hb;
+    try { hb = JSON.parse(readFileSync(join(p.padd, ".state", "alive." + name), "utf8")); } catch { continue; }
+    if (!hb.surface || Date.now() / 1000 - (hb.ts || 0) > 300) continue; // no fresh heartbeat → leave it
+    if (hb.surface === target) continue;
+    try {
+      await sh(SP, ["set-wake", name, wake, hb.surface, adapter && adapter !== "-" ? adapter : "herdr"], { cwd: p.proj });
+      log(p.name, `heal: @${name} target ${target || "-"} → ${hb.surface} (from heartbeat)`);
+    } catch (e) { log(p.name, `heal failed for @${name}:`, e.message); }
+  }
+}
+setInterval(() => pads.forEach(healRoster), 60000);
+
 // ── main ─────────────────────────────────────────────────────
 log(`relay=${RELAY} roots=${ROOTS.join(",")} (websocket mode)`);
 findPads().forEach(track);
