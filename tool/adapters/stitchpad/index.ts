@@ -24,6 +24,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync } from "node:fs";
+import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -34,6 +35,24 @@ const exec = promisify(execFile);
 function stitchpadBin(): string {
   const fallback = join(homedir(), ".stitchpad", "bin", "stitchpad");
   return existsSync(fallback) ? fallback : "stitchpad";
+}
+
+function herdrBin(): string {
+  const fallback = join(homedir(), ".local", "bin", "herdr");
+  return existsSync(fallback) ? fallback : "herdr";
+}
+
+/// This pane's herdr TERMINAL id — the stable wake address (survives pane moves,
+/// unlike pane ids). Falls back to the pane id, then "" outside herdr.
+async function herdrTarget(): Promise<string> {
+  const paneId = process.env.HERDR_ENV === "1" ? process.env.HERDR_PANE_ID || "" : "";
+  if (!paneId) return "";
+  try {
+    const { stdout } = await exec(herdrBin(), ["agent", "get", paneId], { timeout: 5_000 });
+    const term = JSON.parse(stdout)?.result?.agent?.terminal_id;
+    if (typeof term === "string" && term) return term;
+  } catch {}
+  return paneId;
 }
 
 export default function stitchpadExtension(pi: ExtensionAPI) {
@@ -57,6 +76,30 @@ export default function stitchpadExtension(pi: ExtensionAPI) {
   }
   const ok = (text: string) => ({ content: [{ type: "text" as const, text: text.trim() || "(ok)" }], details: {} });
 
+  // Shared join/rejoin: used by the explicit tool AND the session_start
+  // auto-rejoin. Idempotent — join no-ops on an existing row, set-wake re-pins
+  // the live target, heartbeat restarts under THIS process, and the sticky
+  // autoname makes the next restart fully automatic.
+  async function joinPad(name: string, cwd: string): Promise<string> {
+    const target = await herdrTarget();
+    const adapter = target ? "herdr" : "pi";
+    const wake = target ? "push" : "pull";
+    await sp(["join", name, adapter, wake, target || "-"], cwd).catch(() => {});
+    await sp(["set-wake", name, wake, target || "-", adapter], cwd).catch(() => {});
+    await sp(["meta", "set", name, "runtime", "pi"], cwd).catch(() => {});
+    if (process.env.STITCHPAD_MODEL) {
+      await sp(["meta", "set", name, "model", process.env.STITCHPAD_MODEL], cwd).catch(() => {});
+    }
+    // join early-exits before its heartbeat when the row already exists —
+    // always restart it explicitly so a rejoin shows online immediately.
+    process.env.STITCHPAD_HEARTBEAT_PARENT_PID = String(process.pid);
+    await sp(["heartbeat", "start", name], cwd, name).catch(() => {});
+    sessionKey = target || "-";
+    await sp(["bind-session", sessionKey, name], cwd).catch(() => {});
+    await writeFile(join(cwd, ".stitchpad", ".state", "autoname.pi"), name).catch(() => {});
+    return target;
+  }
+
   // ── Tools (native pi, no MCP) ──────────────────────────────────────
   pi.registerTool({
     name: "stitchpad_join",
@@ -64,22 +107,9 @@ export default function stitchpadExtension(pi: ExtensionAPI) {
     description: "Join the stitchpad (shared agent chat for this project): pick your handle. Call once at startup. After joining, @your-name mentions wake you at turn-end.",
     parameters: Type.Object({ name: Type.String({ description: "Your handle, e.g. 'pi'." }) }),
     async execute(_id, params, _sig, _upd, ctx) {
-      const paneId = process.env.HERDR_ENV === "1" ? process.env.HERDR_PANE_ID || "" : "";
-      const adapter = paneId ? "herdr" : "pi";
-      const wake = paneId ? "push" : "pull";
-      const target = paneId || "-";
-      await sp(["join", params.name, adapter, wake, target], ctx.cwd).catch(() => {});
-      // join is a no-op when the row already exists — set-wake re-pins the live
-      // pane either way, so a restarted pi never wakes a dead target.
-      await sp(["set-wake", params.name, wake, target, adapter], ctx.cwd).catch(() => {});
-      await sp(["meta", "set", params.name, "runtime", "pi"], ctx.cwd).catch(() => {});
-      if (process.env.STITCHPAD_MODEL) {
-        await sp(["meta", "set", params.name, "model", process.env.STITCHPAD_MODEL], ctx.cwd).catch(() => {});
-      }
-      sessionKey = paneId || "-";
-      await sp(["bind-session", sessionKey, params.name], ctx.cwd).catch(() => {});
+      const target = await joinPad(params.name, ctx.cwd);
       return ok(
-        `joined as @${params.name}${paneId ? "" : " (not in a herdr pane — push wake off; mentions deliver at turn-end)"}. Reply with the stitchpad_say tool.`
+        `joined as @${params.name}${target ? "" : " (not in a herdr pane — push wake off; mentions deliver at turn-end)"}. Reply with the stitchpad_say tool. Restarts auto-rejoin from now on.`
       );
     },
   });
@@ -200,6 +230,24 @@ export default function stitchpadExtension(pi: ExtensionAPI) {
     }
   }
 
+  // Zero-friction restarts: if this pad has a sticky pi handle (written on the
+  // first explicit join), a fresh/reloaded session rejoins automatically —
+  // re-pins the wake target, restarts the heartbeat, re-binds. No tool call.
+  async function autoRejoin(ctx: ExtensionContext) {
+    try {
+      const nameFile = join(ctx.cwd, ".stitchpad", ".state", "autoname.pi");
+      if (!existsSync(nameFile)) return;
+      const name = pinned || (await readFile(nameFile, "utf8")).trim();
+      if (!name) return;
+      await joinPad(name, ctx.cwd);
+    } catch {
+      // no pad / CLI missing → stay silent, the explicit join tool still works
+    }
+  }
+
   pi.on("agent_end", async (_e, ctx) => { await drain(ctx); });
-  pi.on("session_start", async (_e, ctx) => { await drain(ctx); });
+  pi.on("session_start", async (_e, ctx) => {
+    await autoRejoin(ctx);
+    await drain(ctx);
+  });
 }

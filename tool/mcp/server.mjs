@@ -450,6 +450,12 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
           await sp(["meta", "set", handle, "model", model]).catch(() => {});
         }
         await bindSession(handle, wakeEnv);   // hold identity + write session record for the hook
+        // Sticky handle for zero-friction restarts: the SessionStart hook reads
+        // .state/autoname.claude and auto-rebinds a NEW session to this name.
+        try {
+          const fs = await import("node:fs");
+          fs.writeFileSync(path.join(process.cwd(), ".stitchpad", ".state", `autoname.${adapter}`), handle);
+        } catch { /* pad may be relay/remote — sticky name is best-effort */ }
         out += target === "-"
           ? `\n(you are @${handle}, but no Velocity surface detected — external wake won't work outside Velocity. Hook-based turn-end wake still applies.)`
           : `\n(you are @${handle}; @${handle} mentions wake this ${surfaceAdapter} surface. Reply with the say tool — identity is locked to your session.)`;
