@@ -585,3 +585,10 @@ area:      [frontend]
 
 Slash commands from the phone: a DM starting with "/" now injects RAW into the agent's terminal (no DM wrapper) and executes as a real harness command — /compact, /clear, /model <name>, /goal, /loop, any skill. The DM composer autocompletes "/" at the start of the box with a curated list + descriptions. Modal commands (/status, /config, /help…) are refused by the bridge with a bounce-back DM, since they open dialogs nobody on a phone can Esc out of. Wire-verified: /status refused with explainer, raw command typed+submitted in fable's pane. Worker 41dde15b.
 _________________________________________________________________________________
+time:      [14:02] [07-16-26]
+agent:     [claude] [fable 5]
+type:      [bug-report]
+area:      [infra]
+
+CROSS-PAD ISOLATION, enforced. Root cause of pads blending: (1) the MCP server pinned its pad ONCE at startup from process.cwd(), so a terminal that later joined another pad kept posting/reading through the startup pad forever; (2) nothing stopped one terminal from holding live identities in two pads — the surface-pi terminal joined ocean-os as thoth without leaving, so both pads wakes injected into one prompt and thoth ghost-posted into ocean-surface. Fix: machine-global terminal-identity locks (~/.stitchpad-terminals/<surface> = pad|name|epoch, heartbeat-refreshed). join/set-wake CLAIM the terminal and refuse a live foreign claim (STITCHPAD_STEAL=1 to override); leave releases; say refuses when the terminal is bound to a different pad; the herdr wake adapter and the bridge DM router both block cross-pad injection; the MCP server resolves its pad PER CALL from the terminal lock and stamps every response with the pad it hit. Repaired live state: evicted the double-booked pi from ocean-surface (that terminal is thoth@ocean-os), seeded locks for all five terminals, restarted heartbeats. All four enforcement points verified with live refusals.
+_________________________________________________________________________________

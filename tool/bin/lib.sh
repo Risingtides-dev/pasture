@@ -348,6 +348,66 @@ sp_engagement() {
   ' "$PAD_MD"
 }
 
+# ── Terminal-identity locks (machine-global) ─────────────────────────
+# ONE TERMINAL = ONE (pad, name). ~/.stitchpad-terminals/<surface_id> holds
+# "pad_dir|name|epoch" (pad_dir = the .stitchpad dir). join/set-wake CLAIM the
+# terminal, heartbeats refresh the claim, leave releases it; wake delivery,
+# DM routing and the MCP server all consult it. This is the wall that stops
+# two pads from cross-wiring into the same terminal: a terminal freshly bound
+# to pad A cannot be claimed by pad B, addressed by pad B's wakes, or used to
+# post into pad B, unless the operator explicitly steals it (STITCHPAD_STEAL=1)
+# or the old claim goes stale (>300s without a heartbeat).
+SP_TERMDIR="$HOME/.stitchpad-terminals"
+sp_term_surface_of() { printf '%s' "${1##*@@}"; }   # velocity targets are wt@@tab@@surface; herdr targets ARE the surface
+sp_term_lock_claim() { # $1=target/surface $2=name — refuses on a live foreign claim
+  local surface who cur pad name ts now
+  surface="$(sp_term_surface_of "$1")"; who="$2"
+  [ -n "$surface" ] && [ "$surface" != "-" ] || return 0
+  mkdir -p "$SP_TERMDIR"
+  cur="$(cat "$SP_TERMDIR/$surface" 2>/dev/null || true)"
+  if [ -n "$cur" ]; then
+    IFS='|' read -r pad name ts <<<"$cur"
+    now="$(date +%s)"
+    if { [ "$pad" != "$PAD_DIR" ] || [ "$name" != "$who" ]; } \
+       && [ $((now - ${ts:-0})) -lt 300 ] && [ "${STITCHPAD_STEAL:-0}" != "1" ]; then
+      echo "stitchpad: REFUSED — terminal $surface is live as @$name in $pad. One terminal = one pad. 'stitchpad leave $name' there first, or STITCHPAD_STEAL=1 to take it over." >&2
+      return 1
+    fi
+  fi
+  printf '%s|%s|%s' "$PAD_DIR" "$who" "$(date +%s)" > "$SP_TERMDIR/$surface"
+}
+sp_term_lock_touch() { # heartbeat path: refresh ours / claim vacant — NEVER steal
+  local surface who cur pad name ts
+  surface="$(sp_term_surface_of "$1")"; who="$2"
+  [ -n "$surface" ] && [ "$surface" != "-" ] || return 0
+  cur="$(cat "$SP_TERMDIR/$surface" 2>/dev/null || true)"
+  if [ -n "$cur" ]; then
+    IFS='|' read -r pad name ts <<<"$cur"
+    { [ "$pad" = "$PAD_DIR" ] && [ "$name" = "$who" ]; } || return 0
+  fi
+  mkdir -p "$SP_TERMDIR"
+  printf '%s|%s|%s' "$PAD_DIR" "$who" "$(date +%s)" > "$SP_TERMDIR/$surface"
+}
+sp_term_lock_release() { # drop every claim this (pad, name) holds
+  local who="$1" f pad name ts
+  for f in "$SP_TERMDIR"/*; do
+    [ -f "$f" ] || continue
+    IFS='|' read -r pad name ts < "$f"
+    [ "$pad" = "$PAD_DIR" ] && [ "$name" = "$who" ] && rm -f "$f"
+  done
+  return 0
+}
+sp_term_lock_check() { # $1=target $2=name → 0 ok; 1 = LIVE claim by someone else (prints holder)
+  local surface who cur pad name ts now
+  surface="$(sp_term_surface_of "$1")"; who="$2"
+  [ -n "$surface" ] && [ "$surface" != "-" ] || return 0
+  cur="$(cat "$SP_TERMDIR/$surface" 2>/dev/null || true)"; [ -n "$cur" ] || return 0
+  IFS='|' read -r pad name ts <<<"$cur"; now="$(date +%s)"
+  [ $((now - ${ts:-0})) -ge 300 ] && return 0
+  if [ "$pad" != "$PAD_DIR" ] || [ "$name" != "$who" ]; then printf '%s' "$cur"; return 1; fi
+  return 0
+}
+
 # ── Notifications ────────────────────────────────────────────────────
 sp_notify() {
   local title="$1" msg="$2" sound="${3:-Glass}"

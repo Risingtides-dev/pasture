@@ -86,6 +86,16 @@ async function resolvePane(p, name) {
     } catch {}
   }
   if (adapter !== "herdr" || !target || target === "-") return null;
+  // ONE TERMINAL = ONE PAD: refuse routing a DM into a terminal that is live in
+  // a different pad or under a different name (~/.stitchpad-terminals registry).
+  try {
+    const surface = target.split("@@").pop();
+    const [lpad, lname, lts] = readFileSync(join(HOME, ".stitchpad-terminals", surface), "utf8").trim().split("|");
+    if (Date.now() / 1000 - (+lts || 0) < 300 && (lpad !== p.padd || lname !== name)) {
+      log(p.name, `CROSS-PAD BLOCKED: DM for @${name} — terminal ${surface} is live as @${lname} in ${lpad}`);
+      return null;
+    }
+  } catch {}
   const { stdout: info } = await sh(HERDR, ["agent", "get", target]);
   return (info.match(/"pane_id"\s*:\s*"([^"]*)"/) || [])[1] || null;
 }

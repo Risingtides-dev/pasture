@@ -138,6 +138,10 @@ EOF
     who="${1:?usage: stitchpad join <name> <adapter> [wake] [target] [--role <role>] [--level <level>]}"
     adapter="${2:?adapter required (e.g. pi, claude, codex, mcp)}"
     wake="${3:-pull}"; target="${4:--}"
+    # ONE TERMINAL = ONE PAD: claim the target terminal before touching the
+    # roster; a terminal live in another pad refuses the join outright.
+    if [ "$target" != "-" ]; then sp_term_lock_claim "$target" "$who" || exit 1
+    elif [ -n "${VELOCITY_SURFACE_ID:-}" ]; then sp_term_lock_claim "$VELOCITY_SURFACE_ID" "$who" || exit 1; fi
     sp_lock || exit 1
     if sp_user_exists "$who"; then sp_unlock; echo "$who already in roster"; exit 0; fi
     # Insert before the closing fence of the roster block (atomic under lock).
@@ -190,6 +194,9 @@ EOF
     target="${3:--}"
     adapter="${4:-}"
     sp_user_exists "$who" || { echo "stitchpad: @$who not in roster" >&2; exit 1; }
+    # ONE TERMINAL = ONE PAD: refuse pointing a wake at a terminal that is live
+    # in a different pad (this also stops the bridge auto-heal from stealing).
+    if [ "$target" != "-" ]; then sp_term_lock_claim "$target" "$who" || exit 1; fi
     sp_lock || exit 1
     tmp="$(mktemp)"
     awk -v who="$who" -v wake="$wake" -v target="$target" -v adapter="$adapter" '
@@ -257,6 +264,8 @@ EOF
     # KEEP-ALIVE: stop this agent's heartbeat ticker so the watcher can self-stop
     # once all remaining agents go stale.
     STITCHPAD_NAME="$who" "$BIN_DIR/stitchpad" heartbeat --stop "$who" >/dev/null 2>&1 || true
+    # release this agent's terminal claims so the terminal can join another pad
+    sp_term_lock_release "$who" 2>/dev/null || true
     # AUTO-WATCHER: stop watcher if roster is empty (no members = no heartbeats).
     _remaining="$(sp_roster | grep -cv '^[[:space:]]*$' 2>/dev/null || echo 0)"
     if [ "${_remaining:-0}" -le 0 ]; then
@@ -330,6 +339,13 @@ EOF
     #   stitchpad say [--image <path>] <text...>
     from="$(sp_me)"
     [ -z "$from" ] && { echo "stitchpad: no identity — call the MCP join tool first (or set STITCHPAD_NAME for CLI/testing)" >&2; exit 1; }
+    # ONE TERMINAL = ONE PAD: if this terminal holds a live identity lock for a
+    # DIFFERENT pad, refuse to post here — the resolver (cwd walk-up, stale MCP
+    # server, wrong env) picked the wrong pad. Kills cross-pad ghost posts.
+    if [ -n "${VELOCITY_SURFACE_ID:-}" ]; then
+      _holder="$(sp_term_lock_check "$VELOCITY_SURFACE_ID" "$from")" || {
+        echo "stitchpad: REFUSED — this terminal is bound to ${_holder%%|*} (as @$(echo "$_holder" | cut -d'|' -f2)), not $PAD_DIR. cd there or 'stitchpad leave' first." >&2; exit 1; }
+    fi
     image_path=""
     if [ "${1:-}" = "--image" ]; then
       shift
@@ -582,6 +598,7 @@ PY
           trap 'rm -rf "$lockd"; rm -f "$PAD_STATE/alive.$STITCHPAD_NAME"' EXIT INT TERM
           while :; do
             heartbeat_write "$STITCHPAD_NAME" "$ticker_pid" "$parent" "$session" "$surface" "$target"
+            sp_term_lock_touch "$surface" "$STITCHPAD_NAME" 2>/dev/null || true
             "$BIN_DIR/stitchpad" ensure-watcher >/dev/null 2>&1 || true
             sleep "$interval" &
             wait $! || exit 0

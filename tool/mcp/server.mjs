@@ -47,6 +47,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { execFile } from "node:child_process";
 import { chmod, mkdir, writeFile } from "node:fs/promises";
+import fsSync from "node:fs";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -107,19 +108,38 @@ async function persistRelayHookEnv() {
   }
 }
 
-// Where is the pad? An agent's cwd is the project; the CLI walks up for .stitchpad.
-// Allow override via STITCHPAD_CWD (the dir to resolve the pad from). LOCAL only.
-const PAD_CWD = process.env.STITCHPAD_CWD || process.cwd();
+// Where is the pad? Resolved PER CALL, never pinned at startup. The old code
+// captured process.cwd() once when the harness spawned this server — so a
+// terminal that later joined a different pad kept silently posting/reading
+// through the STARTUP pad forever (the cross-pad bleed). Resolution order:
+//   1. this terminal's identity lock (~/.stitchpad-terminals/<surface> =
+//      "pad_dir|name|epoch", heartbeat-fresh) → THAT pad, wherever it is;
+//   2. STITCHPAD_CWD env override;
+//   3. the server's cwd (walk-up happens in the CLI).
+function padCwd() {
+  const surf = process.env.VELOCITY_SURFACE_ID || "";
+  if (surf) {
+    try {
+      const raw = fsSync.readFileSync(path.join(process.env.HOME || "", ".stitchpad-terminals", surf), "utf8");
+      const [padDir, , ts] = raw.trim().split("|");
+      if (padDir && Date.now() / 1000 - (+ts || 0) < 300) return path.dirname(padDir);
+    } catch {}
+  }
+  return process.env.STITCHPAD_CWD || process.cwd();
+}
 
 // `me` pins STITCHPAD_NAME for this call so the CLI derives the sender from
 // identity, not a trusted arg. (LOCAL MODE only — relay tools call relay* below.)
+// Every result is stamped with the pad it actually hit, so a misrouted call is
+// self-evident to the agent instead of silent.
 async function sp(args, me, extraEnv = {}) {
+  const cwd = padCwd();
   const { stdout, stderr } = await execFileP(CLI, args, {
-    cwd: PAD_CWD,
+    cwd,
     env: { ...process.env, STITCHPAD_HOME, ...extraEnv, ...(me ? { STITCHPAD_NAME: me } : {}) },
     maxBuffer: 1024 * 1024,
   });
-  return (stdout || "") + (stderr ? `\n${stderr}` : "");
+  return (stdout || "") + (stderr ? `\n${stderr}` : "") + `\n[pad: ${path.basename(cwd)}]`;
 }
 
 // ── Relay HTTP client (remote-agent mode) ───────────────────────────────
