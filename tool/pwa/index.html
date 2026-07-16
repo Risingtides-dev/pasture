@@ -1,118 +1,197 @@
 <!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="theme-color" content="#1a1d29"><link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#12151c"><link rel="manifest" href="manifest.json">
 <link rel="icon" type="image/svg+xml" href="logo.svg"><link rel="apple-touch-icon" href="logo.svg">
 <title>stitchpad</title>
 <style>
 :root{
-  /* paper-white shell, dark chat, teal accent */
-  --paper:#faf9f7;--paper-2:#f1efea;--paper-edge:#e3e0d9;--ink:#0f172a;--ink-dim:#64748b;
-  --accent:#0d9488;--accent-ink:#0b7a70;
-  --col:#1a1d29;--panel:#222529;--hover:#27292e;--edge:#2c2f36;--txt:#e8e8e9;--dim:#9a9ca1;--active:#0d9488;
+  /* identity: paper-white shell, dark chat, teal accent */
+  --paper:#faf9f7;--paper-2:#f1eeea;--paper-3:#e9e5df;--paper-edge:#e2ded6;
+  --ink:#1c2433;--ink-dim:#5b6475;
+  --accent:#0d9488;--accent-ink:#0b7a70;          /* teal on paper */
+  --teal:#16bdaa;--teal-soft:rgba(22,189,170,.14); /* teal on dark */
+  --col:#12151c;--panel:#191d26;--panel-2:#1f242f;--hover:#1a1e28;
+  --edge:#262c38;--edge-soft:#20252f;
+  --txt:#e7e9ec;--dim:#9aa2ae;--faint:#828b98;
+  --ok:#3fb950;--working:#2ea043;--warn:#d29922;--err:#f0554d;
+  --r-s:7px;--r-m:10px;--r-l:14px;
+  --z-ac:20;--z-scrim:39;--z-drawer:40;--z-cardback:50;--z-card:51;--z-login:99;
+  --ease:cubic-bezier(.22,.7,.25,1);
 }
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-html,body{margin:0;height:100%;font:15px/1.46 -apple-system,system-ui,"Segoe UI",sans-serif;background:var(--col);color:var(--txt);overflow:hidden}
+html,body{margin:0;height:100%;font:15px/1.5 -apple-system,system-ui,"Segoe UI",sans-serif;background:var(--col);color:var(--txt);overflow:hidden}
+button{font:inherit}
 #app{display:flex;height:100dvh}
+
+/* ── workspace rail ── */
 #side{width:64px;flex:0 0 64px;background:var(--paper-2);border-right:1px solid var(--paper-edge);display:flex;flex-direction:column;align-items:center;padding-top:env(safe-area-inset-top)}
-#side .ws{width:40px;height:40px;margin:12px 0}
-#side .ws svg{width:40px;height:40px;display:block}
-#chans{flex:0 0 230px;width:230px;background:var(--paper);border-right:1px solid var(--paper-edge);display:flex;flex-direction:column;color:var(--ink);padding-top:env(safe-area-inset-top)}
-#chans h1{font-size:18px;font-weight:800;color:var(--ink);padding:14px 16px 10px;margin:0;border-bottom:1px solid var(--paper-edge);display:flex;align-items:center;gap:8px}
+#side .ws{width:40px;height:40px;margin:14px 0;border-radius:12px;transition:transform .18s var(--ease)}
+#side .ws:hover{transform:scale(1.06)}
+#side .ws svg{width:40px;height:40px;display:block;filter:drop-shadow(0 1px 2px rgba(28,36,51,.18))}
+
+/* ── channel sidebar ── */
+#chans{flex:0 0 232px;width:232px;background:var(--paper);border-right:1px solid var(--paper-edge);display:flex;flex-direction:column;color:var(--ink);padding-top:env(safe-area-inset-top);overflow-y:auto;scrollbar-width:thin}
+#chans h1{font-size:17px;font-weight:800;letter-spacing:-.01em;color:var(--ink);padding:15px 16px 12px;margin:0;border-bottom:1px solid var(--paper-edge);display:flex;align-items:center;gap:9px}
 #chans h1 svg{width:22px;height:22px}
-.sect{color:var(--ink-dim);font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;padding:14px 16px 4px}
-.chan{display:flex;align-items:center;gap:8px;padding:6px 16px;cursor:pointer;font-size:15px;color:#334155;border-radius:6px;margin:0 6px}
-.chan:hover{background:var(--paper-2)}
+.sect{color:var(--ink-dim);font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;padding:16px 16px 6px}
+.chan{display:flex;align-items:center;gap:8px;padding:7px 12px;cursor:pointer;font-size:14.5px;color:#3a4356;border-radius:var(--r-s);margin:1px 8px;transition:background .13s var(--ease),color .13s var(--ease);min-height:34px}
+.chan:hover{background:var(--paper-3)}
 .chan.on{background:var(--accent);color:#fff;font-weight:600}
-.chan .h{opacity:.55;font-weight:400}
-.dm-item{gap:8px}
-.dmav{width:22px;height:22px;border-radius:6px;flex:0 0 22px;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:800;overflow:hidden;position:relative}
+.chan .h{opacity:.5;font-weight:400}
+.chan.on .h{opacity:.8}
+.dm-item{gap:9px}
+.dmav{width:24px;height:24px;border-radius:7px;flex:0 0 24px;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:800;overflow:hidden;position:relative}
 .dmav img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
-.sdot{width:8px;height:8px;border-radius:50%;flex:0 0 8px}
+.sdot{width:8px;height:8px;border-radius:50%;flex:0 0 8px;transition:background .2s}
+
+/* ── main column ── */
 #main{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--col)}
 #top{display:flex;align-items:center;gap:8px;padding:12px 16px;padding-top:calc(12px + env(safe-area-inset-top));background:var(--paper);border-bottom:1px solid var(--paper-edge);color:var(--ink)}
-#top .name{font-weight:800;font-size:17px}#top .meta{color:var(--ink-dim);font-size:13px}
-#statusbar{display:flex;align-items:center;gap:10px;padding:6px 16px;background:var(--panel);border-bottom:1px solid var(--edge);font-size:12px;color:var(--dim);overflow-x:auto;white-space:nowrap}
+#top .name{font-weight:800;font-size:16.5px;letter-spacing:-.01em}
+#top .meta{color:var(--ink-dim);font-size:13px}
+#statusbar{display:flex;align-items:center;gap:10px;padding:7px 16px;background:var(--panel);border-bottom:1px solid var(--edge-soft);font-size:12px;color:var(--dim);overflow-x:auto;white-space:nowrap;scrollbar-width:none}
+#statusbar::-webkit-scrollbar{display:none}
 #statusbar:empty{display:none}
-#claimbar{display:flex;flex-wrap:wrap;gap:6px;padding:5px 16px;background:#2a2410;border-bottom:1px solid var(--edge);font-size:12px}
+#claimbar{display:flex;flex-wrap:wrap;gap:6px 14px;padding:6px 16px;background:#241f10;border-bottom:1px solid var(--edge-soft);font-size:12px}
 #claimbar:empty{display:none}
-#claimbar .claim{display:flex;align-items:center;gap:5px;color:#e8c97a}
+#claimbar .claim{display:flex;align-items:center;gap:5px;color:#e3c57e}
 #claimbar .claim b{color:#fff}
 #statusbar .count{flex:0 0 auto}
-#statusbar .dots{display:flex;gap:5px;align-items:center}
-#statusbar .sb-dot{width:11px;height:11px;border-radius:50%;cursor:pointer;border:1.5px solid transparent;position:relative}
-#statusbar .sb-dot:hover{border-color:var(--txt)}
+#statusbar .dots{display:flex;gap:6px;align-items:center}
+#statusbar .sb-dot{width:11px;height:11px;border-radius:50%;cursor:pointer;border:1.5px solid transparent;position:relative;transition:transform .15s var(--ease)}
+#statusbar .sb-dot:hover{border-color:var(--txt);transform:scale(1.25)}
 #statusbar .sb-dot.working{box-shadow:0 0 0 2px rgba(46,160,67,.35)}
 #statusbar .sb-dot.dnd{opacity:.55}
-#log{flex:1;overflow-y:auto;padding:12px 0 8px}
-.row{display:flex;gap:10px;padding:7px 16px;position:relative}
+
+/* ── message log ── */
+#log{flex:1;overflow-y:auto;padding:14px 0 10px;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-color:#2c333f transparent}
+#log::-webkit-scrollbar{width:10px}
+#log::-webkit-scrollbar-thumb{background:#2c333f;border-radius:5px;border:2px solid var(--col)}
+#log::-webkit-scrollbar-track{background:transparent}
+.row{display:flex;gap:11px;padding:7px 16px 6px;position:relative}
 .row:hover{background:var(--hover)}
-.row-cpy{position:absolute;top:4px;right:8px;opacity:0;background:var(--panel);border:1px solid var(--edge);color:var(--dim);border-radius:6px;font:11px inherit;padding:2px 8px;cursor:pointer;transition:opacity .12s;z-index:2}
+.row.cmpct{padding-top:1px;padding-bottom:2px}
+.row.cmpct .gutter{width:36px;flex:0 0 36px;text-align:right;font-size:10.5px;color:var(--faint);opacity:0;padding-top:4px;font-variant-numeric:tabular-nums;user-select:none}
+.row.cmpct:hover .gutter{opacity:1}
+.row.enter{animation:msg-in .22s var(--ease) both}
+@keyframes msg-in{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
+.row-cpy{position:absolute;top:-8px;right:12px;opacity:0;background:var(--panel-2);border:1px solid var(--edge);color:var(--dim);border-radius:var(--r-s);font:600 11px inherit;padding:3px 9px;cursor:pointer;transition:opacity .13s,color .13s;z-index:2}
 .row:hover .row-cpy{opacity:1}
 .row-cpy:hover{color:var(--txt)}
-.row-cpy.done{color:#2ea043;border-color:#2ea043}
+.row-cpy.done{color:var(--ok);border-color:var(--ok)}
 .card-trigger{cursor:pointer}
 .who.card-trigger:hover{text-decoration:underline}
-#cardback{position:fixed;inset:0;background:rgba(0,0,0,.5);display:none;z-index:50}
-#cardback.show{display:block}
-#card{position:fixed;z-index:51;display:none;width:300px;max-width:calc(100vw - 24px);background:var(--panel);border:1px solid var(--edge);border-radius:14px;box-shadow:0 12px 40px rgba(0,0,0,.5);overflow:hidden}
-#card.show{display:block}
+.av{position:relative;width:36px;height:36px;border-radius:var(--r-m);flex:0 0 36px;display:flex;align-items:center;justify-content:center;font-weight:800;color:#fff;font-size:14px;overflow:hidden}
+.av img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.bubble{min-width:0;flex:1}
+.bubble .hd{display:flex;align-items:baseline;gap:8px}
+.bubble .who{font-weight:800;font-size:14.5px}
+.bubble .ts{color:var(--faint);font-size:11.5px;font-variant-numeric:tabular-nums}
+.bubble .bd{white-space:pre-wrap;word-wrap:break-word;margin-top:1px;max-width:75ch}
+.bubble .bd a{color:#4cc3e8;text-decoration:none}
+.bubble .bd a:hover{text-decoration:underline}
+.msg-img{max-width:min(360px,100%);max-height:280px;border-radius:var(--r-m);margin:6px 0;display:block;border:1px solid var(--edge)}
+.bubble code{background:#1c212b;border:1px solid var(--edge-soft);border-radius:5px;padding:1px 5px;font-size:13px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.bubble pre{background:#0e1117;border:1px solid var(--edge-soft);border-radius:var(--r-m);padding:11px 12px;overflow:auto;font-size:13px;margin:0;line-height:1.55;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.cb{position:relative;margin:7px 0}
+.cb .cpy{position:absolute;top:7px;right:7px;background:var(--panel-2);color:var(--dim);border:1px solid var(--edge);border-radius:var(--r-s);padding:3px 9px;font:600 11px inherit;cursor:pointer;opacity:0;transition:opacity .13s,color .13s}
+.cb:hover .cpy{opacity:.95}
+.cb .cpy:hover{color:var(--txt)}
+.cb .cpy.done{color:var(--teal);border-color:var(--teal);opacity:1}
+.sys{display:flex;align-items:center;gap:10px;color:var(--faint);font-size:12px;padding:8px 16px;user-select:none}
+.sys::before,.sys::after{content:"";flex:1;height:1px;background:var(--edge-soft)}
+.row.pending{opacity:.55}.row.pending .ts{font-style:italic}
+.empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;padding:56px 24px;color:var(--dim);text-align:center}
+.empty b{color:var(--txt);font-size:16px}
+.empty span{font-size:13.5px}
+
+/* skeleton first-load shimmer */
+.skel{display:flex;gap:11px;padding:9px 16px}
+.skel .a{width:36px;height:36px;border-radius:var(--r-m);flex:0 0 36px}
+.skel .l{flex:1;display:flex;flex-direction:column;gap:7px;padding-top:2px}
+.skel .b{height:11px;border-radius:5px}
+.skel .a,.skel .b{background:linear-gradient(100deg,var(--panel) 40%,var(--panel-2) 50%,var(--panel) 60%);background-size:200% 100%;animation:shimmer 1.4s linear infinite}
+@keyframes shimmer{to{background-position:-200% 0}}
+
+/* ── composer ── */
+#cwrap{padding:10px 16px;padding-bottom:calc(10px + env(safe-area-inset-bottom));position:relative}
+#composer{border:1px solid #3a4150;border-radius:12px;background:var(--panel);display:flex;align-items:flex-end;transition:border-color .15s var(--ease),box-shadow .15s var(--ease)}
+#composer:focus-within{border-color:var(--teal);box-shadow:0 0 0 3px var(--teal-soft)}
+#composer textarea{flex:1;background:transparent;border:0;color:var(--txt);font:15px/1.45 inherit;padding:12px 14px;resize:none;max-height:120px;outline:none}
+#composer textarea::placeholder{color:#7d8794}
+#send{background:var(--accent);color:#fff;border:0;border-radius:9px;margin:7px;width:34px;height:34px;flex:0 0 34px;display:flex;align-items:center;justify-content:center;cursor:pointer;transition:background .15s var(--ease),opacity .15s,transform .12s var(--ease)}
+#send:hover{background:var(--teal)}
+#send:active{transform:scale(.92)}
+#send:disabled{opacity:.35;cursor:default}
+#send svg{width:17px;height:17px;display:block}
+.tags{padding:7px 2px 0;color:var(--faint);font-size:12px}
+#hamb{display:none;font-size:20px;background:0;border:0;color:var(--ink);padding:2px 6px;cursor:pointer}
+
+/* ── login ── */
+#login{position:fixed;inset:0;background:var(--col);display:none;flex-direction:column;align-items:center;justify-content:center;z-index:var(--z-login);gap:12px;padding:24px}
+#login::before{content:"";position:absolute;inset:0;background:radial-gradient(520px 340px at 50% 34%,rgba(13,148,136,.13),transparent 70%);pointer-events:none}
+#login.show{display:flex}
+#login .card{width:100%;max-width:320px;display:flex;flex-direction:column;gap:11px;background:var(--panel);border:1px solid var(--edge);border-radius:var(--r-l);padding:26px 24px 22px;position:relative;animation:login-in .3s var(--ease) both}
+@keyframes login-in{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+#login h2{margin:0 0 6px;font-size:21px;letter-spacing:-.01em;display:flex;align-items:center;gap:10px}
+#login .sub{color:var(--dim);font-size:13px;margin:-10px 0 6px}
+#login input{background:#0e1117;border:1px solid #3a4150;border-radius:var(--r-m);color:var(--txt);font:15px inherit;padding:12px 13px;outline:none;transition:border-color .15s var(--ease),box-shadow .15s var(--ease)}
+#login input::placeholder{color:#7d8794}
+#login input:focus{border-color:var(--teal);box-shadow:0 0 0 3px var(--teal-soft)}
+#login button{background:var(--accent);color:#fff;border:0;border-radius:var(--r-m);padding:12px;font-weight:700;font-size:15px;cursor:pointer;transition:background .15s var(--ease)}
+#login button:hover{background:var(--teal)}
+#login .err{color:var(--err);font-size:13px;min-height:16px}
+
+/* ── autocomplete ── */
+#ac{position:absolute;left:16px;right:16px;bottom:100%;margin-bottom:6px;background:var(--panel);border:1px solid var(--edge);border-radius:var(--r-m);max-height:240px;overflow-y:auto;display:none;z-index:var(--z-ac);box-shadow:0 -8px 24px rgba(0,0,0,.4)}
+#ac.show{display:block}
+.ac-item{display:flex;align-items:center;gap:9px;padding:9px 13px;cursor:pointer;font-size:14px}
+.ac-item.sel{background:var(--teal-soft);color:var(--txt)}
+.ac-item .dot{width:12px;height:12px;border-radius:4px;flex:0 0 12px}
+.ac-item .sub{color:var(--dim);font-size:12px;margin-left:auto}
+
+/* ── agent card ── */
+#cardback{position:fixed;inset:0;background:rgba(6,8,12,.55);display:none;z-index:var(--z-cardback);opacity:0;transition:opacity .18s var(--ease)}
+#cardback.show{display:block;opacity:1}
+#card{position:fixed;z-index:var(--z-card);display:none;width:300px;max-width:calc(100vw - 24px);background:var(--panel);border:1px solid var(--edge);border-radius:var(--r-l);box-shadow:0 18px 48px rgba(0,0,0,.5);overflow:hidden;transform-origin:top left}
+#card.show{display:block;animation:card-in .2s var(--ease) both}
+@keyframes card-in{from{opacity:0;transform:scale(.94) translateY(4px)}to{opacity:1;transform:none}}
 #card .top{height:56px}
 #card .body{padding:0 16px 16px;margin-top:-28px}
 #card .pfp{width:64px;height:64px;border-radius:16px;border:3px solid var(--panel);overflow:hidden;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:22px;color:#fff}
 #card .pfp img{width:100%;height:100%;object-fit:cover}
-#card .nm{font-weight:800;font-size:18px;margin-top:8px}
+#card .nm{font-weight:800;font-size:18px;margin-top:8px;letter-spacing:-.01em}
 #card .role{color:var(--dim);font-size:13px;margin-top:1px}
 #card .meta{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
-#card .chip{background:#2c2f36;border:1px solid var(--edge);border-radius:6px;padding:2px 8px;font-size:12px;color:var(--dim)}
+#card .chip{background:var(--panel-2);border:1px solid var(--edge);border-radius:6px;padding:2px 8px;font-size:12px;color:var(--dim)}
 #card .sec{margin-top:12px;font-size:13px;color:var(--txt)}
-#card .sec h4{margin:0 0 4px;font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--dim)}
-#card .persona{white-space:pre-wrap;line-height:1.4;color:#c9ccd1;font-size:13px}
-#card .skill{font-size:12px;color:#c9ccd1;padding:1px 0}
+#card .sec h4{margin:0 0 4px;font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--dim)}
+#card .persona{white-space:pre-wrap;line-height:1.45;color:#c6cad1;font-size:13px}
+#card .skill{font-size:12px;color:#c6cad1;padding:1px 0}
 #card .skill b{color:var(--txt)}
-#card .exp{margin-top:12px;width:100%;background:#2c2f36;border:1px solid var(--edge);color:var(--txt);border-radius:8px;padding:8px;font:13px inherit;font-weight:600;cursor:pointer}
-#card .exp:hover{background:#363a42}
+#card .exp{margin-top:12px;width:100%;background:var(--panel-2);border:1px solid var(--edge);color:var(--txt);border-radius:var(--r-s);padding:8px;font:600 13px inherit;cursor:pointer;transition:background .15s var(--ease)}
+#card .exp:hover{background:#2a303c}
 #card.expanded{width:360px}
 #card .full{display:none}#card.expanded .full{display:block}#card.expanded .exp{display:none}
-.av{position:relative;width:36px;height:36px;border-radius:9px;flex:0 0 36px;display:flex;align-items:center;justify-content:center;font-weight:800;color:#fff;font-size:14px;overflow:hidden}
-.av img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
-.bubble{min-width:0;flex:1}
-.bubble .hd{display:flex;align-items:baseline;gap:8px}
-.bubble .who{font-weight:800}.bubble .ts{color:var(--dim);font-size:12px}
-.bubble .bd{white-space:pre-wrap;word-wrap:break-word;margin-top:1px}
-.bubble .bd a{color:#1d9bd1}
-.msg-img{max-width:min(360px,100%);max-height:280px;border-radius:8px;margin:6px 0;display:block;border:1px solid var(--edge)}
-.bubble code{background:#1e2129;border:1px solid var(--edge);border-radius:5px;padding:1px 5px;font-size:13px}
-.bubble pre{background:#1e2129;border:1px solid var(--edge);border-radius:8px;padding:10px;overflow:auto;font-size:13px;margin:0}
-.cb{position:relative;margin:6px 0}
-.cb .cpy{position:absolute;top:6px;right:6px;background:#2c2f36;color:var(--dim);border:1px solid var(--edge);border-radius:6px;padding:3px 8px;font:11px inherit;font-weight:600;cursor:pointer;opacity:.85}
-.cb .cpy:hover{opacity:1;color:var(--txt)}
-.cb .cpy.done{color:var(--accent);border-color:var(--accent)}
-.sys{color:var(--dim);font-style:italic;font-size:13px;padding:4px 16px}
-.row.pending{opacity:.55}.row.pending .ts{font-style:italic}
-#cwrap{padding:8px 16px;padding-bottom:calc(8px + env(safe-area-inset-bottom))}
-#composer{border:1px solid #565a60;border-radius:10px;background:#222529;display:flex;align-items:flex-end}
-#composer textarea{flex:1;background:transparent;border:0;color:var(--txt);font:15px/1.4 inherit;padding:12px;resize:none;max-height:120px;outline:none}
-#composer button{background:var(--accent);color:#fff;border:0;border-radius:8px;margin:6px;padding:8px 14px;font-weight:700}
-.tags{padding:6px 2px 0;color:var(--dim);font-size:12px}
-#hamb{display:none;font-size:20px;background:0;border:0;color:var(--ink)}
-#login{position:fixed;inset:0;background:var(--col);display:none;flex-direction:column;align-items:center;justify-content:center;z-index:99;gap:12px;padding:24px}
-#login.show{display:flex}
-#login .card{width:100%;max-width:300px;display:flex;flex-direction:column;gap:10px}
-#login h2{margin:0 0 4px;font-size:22px;display:flex;align-items:center;gap:8px}
-#login input{background:#222529;border:1px solid #565a60;border-radius:8px;color:var(--txt);font:15px inherit;padding:12px;outline:none}
-#login button{background:var(--accent);color:#fff;border:0;border-radius:8px;padding:12px;font-weight:700;font-size:15px}
-#login .err{color:#e01010;font-size:13px;min-height:16px}
-#ac{position:absolute;left:16px;right:16px;bottom:100%;margin-bottom:6px;background:#222529;border:1px solid #565a60;border-radius:10px;max-height:240px;overflow-y:auto;display:none;z-index:20;box-shadow:0 -6px 24px rgba(0,0,0,.4)}
-#ac.show{display:block}
-.ac-item{display:flex;align-items:center;gap:8px;padding:9px 12px;cursor:pointer;font-size:14px}
-.ac-item.sel{background:var(--active)}
-.ac-item .dot{width:12px;height:12px;border-radius:3px;flex:0 0 12px}
-.ac-item .sub{color:var(--dim);font-size:12px;margin-left:auto}
-#cwrap{position:relative}
-@media(max-width:560px){#side{display:none}#chans{position:absolute;z-index:9;height:100%;flex-basis:0;width:0;overflow:hidden;transition:width .2s}#chans.open{width:80vw}#hamb{display:block}}
+
+/* ── mobile drawer ── */
+#scrim{position:fixed;inset:0;background:rgba(8,10,14,.52);opacity:0;pointer-events:none;transition:opacity .24s var(--ease);z-index:var(--z-scrim)}
+@media(max-width:560px){
+  #side{display:none}
+  #chans{position:fixed;top:0;bottom:0;left:0;width:min(84vw,320px);transform:translateX(-103%);transition:transform .26s var(--ease);z-index:var(--z-drawer);box-shadow:8px 0 32px rgba(0,0,0,.28);will-change:transform;border-right:0}
+  #chans.open{transform:translateX(0)}
+  body.drawer #scrim{opacity:1;pointer-events:auto}
+  #hamb{display:block}
+  .chan{min-height:40px}
+}
+
+@media(prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}
+}
 </style></head><body>
 <div id="login"><div class="card">
-  <h2><svg style="width:28px;height:28px" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg"><rect x="6" y="6" width="52" height="52" rx="14" fill="#0d9488"/><path d="M16 44 L32 20 L48 44" stroke="#faf9f7" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="7 6"/><circle cx="16" cy="44" r="3.4" fill="#faf9f7"/><circle cx="48" cy="44" r="3.4" fill="#faf9f7"/><circle cx="32" cy="20" r="3.4" fill="#faf9f7"/></svg>stitchpad</h2>
+  <h2><svg style="width:30px;height:30px" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg"><rect x="6" y="6" width="52" height="52" rx="14" fill="#0d9488"/><path d="M16 44 L32 20 L48 44" stroke="#faf9f7" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="7 6"/><circle cx="16" cy="44" r="3.4" fill="#faf9f7"/><circle cx="48" cy="44" r="3.4" fill="#faf9f7"/><circle cx="32" cy="20" r="3.4" fill="#faf9f7"/></svg>stitchpad</h2>
+  <div class="sub">your agents are talking. tap in.</div>
   <input id="lu" placeholder="username" autocapitalize="off" autocomplete="username">
   <input id="lp" type="password" placeholder="password" autocomplete="current-password">
   <button id="lb">Sign in</button>
@@ -128,13 +207,14 @@ html,body{margin:0;height:100%;font:15px/1.46 -apple-system,system-ui,"Segoe UI"
     <div id="dmlist"></div>
   </div>
   <div id="main">
-    <div id="top"><button id="hamb">☰</button><span class="name" id="chTitle"># …</span><span class="meta" id="chMeta"></span></div>
+    <div id="top"><button id="hamb" aria-label="channels">☰</button><span class="name" id="chTitle"># …</span><span class="meta" id="chMeta"></span></div>
     <div id="statusbar"></div>
     <div id="claimbar"></div>
-    <div id="log"></div>
-    <div id="cwrap"><div id="ac"></div><div id="composer"><textarea id="text" rows="1" placeholder="Message…"></textarea><button id="send">➤</button></div><div class="tags" id="tags">you are @smaths · type @name to address agents</div></div>
+    <div id="log"><div id="rows"></div><div id="pend"></div></div>
+    <div id="cwrap"><div id="ac"></div><div id="composer"><textarea id="text" rows="1" placeholder="Message…"></textarea><button id="send" disabled aria-label="send"><svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M4.4 11.05 19.3 4.24c.9-.41 1.83.52 1.42 1.42l-6.81 14.9c-.44.96-1.85.84-2.12-.18l-1.44-5.46a1.15 1.15 0 0 0-.82-.82l-5.46-1.44c-1.02-.27-1.14-1.68-.18-2.12Z" fill="currentColor"/></svg></button></div><div class="tags" id="tags">you are @smaths · type @name to address agents</div></div>
   </div>
 </div>
+<div id="scrim"></div>
 <div id="cardback"></div>
 <div id="card"></div>
 <script>
@@ -162,15 +242,15 @@ const colorFor=n=>RELAY_COLORS[n]||OVR[n]||PAL[[...(n||"")].reduce((s,c)=>s+c.ch
 // readable text/name color: dark ink on light backgrounds (e.g. smaths=white), else the color itself
 const lum=h=>{const c=h.replace("#","");const r=parseInt(c.slice(0,2),16),g=parseInt(c.slice(2,4),16),b=parseInt(c.slice(4,6),16);return(0.299*r+0.587*g+0.114*b)/255;};
 const onLight=n=>lum(colorFor(n))>0.85;          // true when the author color is near-white
-const nameColor=n=>onLight(n)?"#e8e8e9":colorFor(n);   // name reads on dark chat
-const initInk=n=>onLight(n)?"#1a1d29":"#fff";          // initials read on the avatar square
+const nameColor=n=>onLight(n)?"#e7e9ec":colorFor(n);   // name reads on dark chat
+const initInk=n=>onLight(n)?"#12151c":"#fff";          // initials read on the avatar square
 const esc=s=>(s||"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 const initials=n=>(n||"?").slice(0,2).toUpperCase();
 // avatar: show avatars/<name>.png if it loads, else fall back to colored initials square.
 // loading="lazy" + decoding="async": off-screen avatars in a long log don't fetch
 // or block until scrolled near. The colored initials square shows immediately, the
 // png swaps in when in view. Pure client-side, no payload-contract dependency.
-const av=n=>`<div class="av card-trigger" data-agent="${esc(n)}" style="background:${colorFor(n)};color:${initInk(n)}"><img src="avatars/${encodeURIComponent(n)}.png" alt="" loading="lazy" decoding="async" onerror="this.onerror=null;this.src='avatars/_default.png'"><span>${initials(n)}</span></div>`;
+const av=n=>`<div class="av card-trigger" data-agent="${esc(n)}" style="background:${colorFor(n)};color:${initInk(n)}"><img src="avatars/${encodeURIComponent(n)}.png" alt="" loading="lazy" decoding="async" onerror="this.remove()"><span>${initials(n)}</span></div>`;
 function fmt(t){
   t=esc(t);
   t=t.replace(/```([\s\S]*?)```/g,(m,c)=>`<div class="cb"><button class="cpy" title="copy">copy</button><pre>${c.trim()}</pre></div>`);
@@ -191,7 +271,7 @@ async function loadPads(){
   if(!pad&&pads[0])pad=pads[0].name;
   pads.forEach(p=>{const d=document.createElement("div");d.className="chan"+(p.name===pad?" on":"");
     d.innerHTML=`<span class="h">#</span>${esc(p.name)}`;
-    d.onclick=()=>{pad=p.name;dmWith="";PAD_ETAG="";localStorage.removeItem("sp_dm");localStorage.setItem("sp_pad",pad);document.getElementById("chans").classList.remove("open");render();loadPads();};
+    d.onclick=()=>{pad=p.name;dmWith="";PAD_ETAG="";resetLog();localStorage.removeItem("sp_dm");localStorage.setItem("sp_pad",pad);setDrawer(false);render();loadPads();};
     cl.appendChild(d);});
 }
 function parse(md){const out=[];let cur=null;
@@ -214,6 +294,28 @@ function inDM(b,x){
   // keep if it @-addresses the other party, or addresses nobody (undirected aside)
   return mentions(other) || !/(^|[^a-z0-9_-])@[a-z0-9_-]/.test(body);
 }
+// ── incremental log renderer ────────────────────────────────
+// The old renderer nuked #log.innerHTML on every content change: full re-parse,
+// full re-layout, scroll jump, avatar refetch flicker — the choppiness. Now each
+// block gets a stable key (author+ts+body hash, + grouping flag). The common
+// case (new messages arrive) is a pure APPEND: only the new rows touch the DOM,
+// entering with a 220ms fade-up. Any other change (edit, channel switch, DM
+// filter) falls back to one full rebuild with no animation.
+const djb2=s=>{let h=5381;for(let i=0;i<s.length;i++)h=((h<<5)+h+s.charCodeAt(i))|0;return h.toString(36);};
+let LOG_KEYS=[];         // keys currently in the DOM, in order
+let FIRST_PAINT=true;    // first successful render clears the skeleton
+function resetLog(){LOG_KEYS=[];FIRST_PAINT=true;showSkeleton();}
+function showSkeleton(){
+  const w=[70,45,85,60,75];
+  document.getElementById("rows").innerHTML=w.map(p=>`<div class="skel"><div class="a"></div><div class="l"><div class="b" style="width:${p*.4}%"></div><div class="b" style="width:${p}%"></div></div></div>`).join("");
+  document.getElementById("pend").innerHTML="";
+}
+const nearBottom=()=>{const log=document.getElementById("log");return log.scrollHeight-log.scrollTop-log.clientHeight<80;};
+function stick(smooth){
+  const log=document.getElementById("log");
+  if(smooth&&!matchMedia("(prefers-reduced-motion: reduce)").matches)log.scrollTo({top:log.scrollHeight,behavior:"smooth"});
+  else log.scrollTop=log.scrollHeight;
+}
 async function render(){
   if(!pad)return;
   // ETag-aware polling: send If-None-Match so unchanged pads return 304 (tiny body).
@@ -235,26 +337,42 @@ async function render(){
   CLAIMS=d.claims||[];
   renderDMList(); renderStatusBar(); renderClaimBar();
   document.getElementById("chMeta").textContent=dmWith?"direct message":((d.roster||[]).length+" members");
-  const log=document.getElementById("log"), atBottom=log.scrollHeight-log.scrollTop-log.clientHeight<80;
   let msgs=parse(d.pad);
   if(dmWith) msgs=msgs.filter(b=>!b.sys && inDM(b,dmWith));   // 1:1 filtered view
   // drop optimistic pending messages that have now landed in the real pad
-  const landed=new Set(msgs.map(b=>(b.body||[]).join("\n").trim()));
+  const landed=new Set(msgs.filter(b=>!b.sys).map(b=>(b.body||[]).join("\n").trim()));
   PENDING=PENDING.filter(p=>!landed.has(p.text));
   const cpyBtn=text=>`<button class="row-cpy" title="copy message" data-copy="${btoa(unescape(encodeURIComponent(text)))}">copy</button>`;
-  const rowHtml=b=>`<div class="row">${cpyBtn(b.body.join("\n").trim())}${av(b.who)}<div class="bubble"><div class="hd"><span class="who card-trigger" data-agent="${esc(b.who)}" style="color:${nameColor(b.who)}">${esc(b.who)}</span><span class="ts">${esc(b.t)}</span></div><div class="bd">${fmt(b.body.join("\n").trim())}</div></div></div>`;
-  const pendHtml=p=>`<div class="row pending">${av(me)}<div class="bubble"><div class="hd"><span class="who" style="color:${nameColor(me)}">${esc(me)}</span><span class="ts">sending…</span></div><div class="bd">${fmt(p.text)}</div></div></div>`;
-  const html=msgs.map(b=>b.sys?`<div class="sys">${esc(b.sys)}</div>`:rowHtml(b)).join("")+PENDING.map(pendHtml).join("");
-  // PERF: render() runs every 3s. Nuking log.innerHTML each time re-parses every
-  // message, re-runs fmt() markdown on every body, and re-paints the whole list —
-  // the jank smaths felt, and it worsens as the pad grows. Skip the DOM write when
-  // the rendered HTML is byte-identical to last paint (the common idle case). Only
-  // an actual content change touches the DOM now. ponytail: string-equality guard
-  // beats a virtual-DOM diff for a flat append-only log; upgrade to keyed appends
-  // only if message counts get huge enough that even building `html` is the cost.
-  if(html!==LAST_LOG_HTML){ log.innerHTML=html; LAST_LOG_HTML=html; if(atBottom)log.scrollTop=log.scrollHeight; }
+  // grouping: consecutive messages from the same author collapse into compact
+  // rows (no repeated avatar/name; hover reveals the timestamp in the gutter).
+  const items=msgs.map((b,i)=>{
+    if(b.sys)return{key:"s"+djb2(b.sys),html:`<div class="sys">${esc(b.sys)}</div>`};
+    const prev=msgs[i-1];
+    const grouped=!!(prev&&!prev.sys&&prev.who===b.who);
+    const body=b.body.join("\n").trim();
+    const key=djb2(b.who+"|"+b.t+"|"+body)+(grouped?"g":"");
+    const html=grouped
+      ?`<div class="row cmpct">${cpyBtn(body)}<div class="gutter">${esc((b.t||"").replace(/\s*[AP]M$/i,""))}</div><div class="bubble"><div class="bd">${fmt(body)}</div></div></div>`
+      :`<div class="row">${cpyBtn(body)}${av(b.who)}<div class="bubble"><div class="hd"><span class="who card-trigger" data-agent="${esc(b.who)}" style="color:${nameColor(b.who)}">${esc(b.who)}</span><span class="ts">${esc(b.t)}</span></div><div class="bd">${fmt(body)}</div></div></div>`;
+    return{key,html};
+  });
+  const rowsEl=document.getElementById("rows"),pendEl=document.getElementById("pend");
+  const keys=items.map(x=>x.key);
+  const wasBottom=nearBottom()||FIRST_PAINT;
+  const prefixOk=!FIRST_PAINT&&keys.length>=LOG_KEYS.length&&LOG_KEYS.every((k,i)=>k===keys[i]);
+  if(prefixOk){
+    if(keys.length>LOG_KEYS.length){
+      const fresh=items.slice(LOG_KEYS.length).map(x=>x.html.replace(/^<div class="(row[^"]*)"/,'<div class="$1 enter"').replace(/^<div class="sys"/,'<div class="sys enter"'));
+      rowsEl.insertAdjacentHTML("beforeend",fresh.join(""));
+    }
+  }else{
+    rowsEl.innerHTML=items.length?items.map(x=>x.html).join(""):`<div class="empty"><b>Quiet in here</b><span>type <code>@name</code> to address an agent — their next turn picks it up</span></div>`;
+  }
+  LOG_KEYS=keys;
+  pendEl.innerHTML=PENDING.map(p=>`<div class="row pending">${av(me)}<div class="bubble"><div class="hd"><span class="who" style="color:${nameColor(me)}">${esc(me)}</span><span class="ts">sending…</span></div><div class="bd">${fmt(p.text)}</div></div></div>`).join("");
+  if(wasBottom)stick(prefixOk&&!FIRST_PAINT);
+  FIRST_PAINT=false;
 }
-let LAST_LOG_HTML="";
 let PAD_ETAG="";
 let ROSTER=[],FILES=[],PENDING=[],ROSTER_INFO={},PROFILES={},CLAIMS=[],dmWith="";
 // File-write claims telemetry: "✏️ @x editing <file>" — shows who holds a write
@@ -282,8 +400,8 @@ function renderDMList(){
       `${dot}${esc(n)}</div>`;
   }).join("");
 }
-function openDM(n){dmWith=n;localStorage.setItem("sp_dm",n);document.getElementById("chans").classList.remove("open");render();}
-function closeDM(){dmWith="";localStorage.removeItem("sp_dm");render();}
+function openDM(n){dmWith=n;localStorage.setItem("sp_dm",n);resetLog();setDrawer(false);render();}
+function closeDM(){dmWith="";localStorage.removeItem("sp_dm");resetLog();render();}
 // LIVENESS is ground truth, computed Mac-side from heartbeat freshness (mtime<90s AND
 // kill -0 pid) and pushed as PROFILES[name].online — the PWA can't kill -0 remotely.
 // Offline trumps activity: a crashed agent that posted 60s ago is still DEAD (grey).
@@ -308,10 +426,10 @@ function renderStatusBar(){
   const parts=[]; if(working)parts.push(working+" working"); if(avail)parts.push(avail+" available"); if(dnd)parts.push(dnd+" dnd"); if(offline)parts.push(offline+" offline");
   el.innerHTML=`<span class="count">${parts.join(" · ")||agents.length+" agents"}</span><span class="dots">${dots}</span>`;
 }
-const ta=document.getElementById("text"),acEl=document.getElementById("ac");
+const ta=document.getElementById("text"),acEl=document.getElementById("ac"),sendBtn=document.getElementById("send");
 let ac={open:false,kind:null,start:0,items:[],sel:0};
 
-function autosize(){ta.style.height="auto";ta.style.height=Math.min(ta.scrollHeight,120)+"px";}
+function autosize(){ta.style.height="auto";ta.style.height=Math.min(ta.scrollHeight,120)+"px";sendBtn.disabled=!ta.value.trim();}
 function closeAc(){ac.open=false;acEl.classList.remove("show");acEl.innerHTML="";}
 function renderAc(){
   if(!ac.items.length){closeAc();return;}
@@ -359,9 +477,9 @@ async function send(){let text=ta.value.trim();if(!text||!pad)return;ta.value=""
   // in a DM, address the agent so the message lands in the 1:1 view (and wakes them)
   if(dmWith && !new RegExp("(^|[^a-z0-9_-])@"+dmWith+"([^a-z0-9_-]|$)","i").test(text)) text="@"+dmWith+" "+text;
   PENDING.push({text});                         // optimistic: show immediately
-  const log=document.getElementById("log");
-  log.insertAdjacentHTML("beforeend",`<div class="row pending">${av(me)}<div class="bubble"><div class="hd"><span class="who" style="color:${nameColor(me)}">${esc(me)}</span><span class="ts">sending…</span></div><div class="bd">${fmt(text)}</div></div></div>`);
-  log.scrollTop=log.scrollHeight;
+  const pendEl=document.getElementById("pend");
+  pendEl.insertAdjacentHTML("beforeend",`<div class="row pending enter">${av(me)}<div class="bubble"><div class="hd"><span class="who" style="color:${nameColor(me)}">${esc(me)}</span><span class="ts">sending…</span></div><div class="bd">${fmt(text)}</div></div></div>`);
+  stick(true);
   // SEND FEEDBACK: a control surface must never leave a message stuck on "sending…"
   // with no signal. On network/HTTP failure, surface it + offer one-tap retry by
   // restoring the text to the composer, instead of silent loss (the painful case).
@@ -372,12 +490,13 @@ async function send(){let text=ta.value.trim();if(!text||!pad)return;ta.value=""
   }catch(err){
     PENDING=PENDING.filter(p=>p.text!==text);   // drop the optimistic bubble
     ta.value=text; autosize();                   // restore text so the send isn't lost
+    pendEl.innerHTML=PENDING.map(p=>`<div class="row pending">${av(me)}<div class="bubble"><div class="hd"><span class="who" style="color:${nameColor(me)}">${esc(me)}</span><span class="ts">sending…</span></div><div class="bd">${fmt(p.text)}</div></div></div>`).join("");
     const b=document.createElement("div"); b.className="sys";
-    b.style.color="#e01010"; b.textContent="⚠ send failed ("+err.message+") — your text is back in the box, press send to retry";
-    log.appendChild(b); log.scrollTop=log.scrollHeight;
+    b.style.color="var(--err)"; b.textContent="⚠ send failed ("+err.message+") — your text is back in the box, press send to retry";
+    document.getElementById("log").appendChild(b); stick();
   }
 }
-document.getElementById("send").onclick=send;
+sendBtn.onclick=send;
 ta.addEventListener("keydown",e=>{
   if(ac.open){
     if(e.key==="ArrowDown"){e.preventDefault();ac.sel=(ac.sel+1)%ac.items.length;renderAc();return;}
@@ -387,7 +506,13 @@ ta.addEventListener("keydown",e=>{
   }
   if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();send();}
 });
-document.getElementById("hamb").onclick=()=>document.getElementById("chans").classList.toggle("open");
+// mobile drawer: transform-based glide + scrim (never animate width — layout jank)
+function setDrawer(open){
+  document.getElementById("chans").classList.toggle("open",open);
+  document.body.classList.toggle("drawer",open);
+}
+document.getElementById("hamb").onclick=()=>setDrawer(!document.getElementById("chans").classList.contains("open"));
+document.getElementById("scrim").onclick=()=>setDrawer(false);
 document.getElementById("log").addEventListener("click",e=>{
   // whole-message copy button (top-right of each row)
   const rb=e.target.closest(".row-cpy");
@@ -403,9 +528,26 @@ document.getElementById("log").addEventListener("click",e=>{
   navigator.clipboard.writeText(code).then(()=>{b.textContent="copied";b.classList.add("done");
     setTimeout(()=>{b.textContent="copy";b.classList.remove("done");},1400);});
 });
+// images loading in can grow the log after we've stuck to bottom — re-stick
+document.getElementById("log").addEventListener("load",e=>{
+  if(e.target.tagName==="IMG"&&nearBottom())stick();
+},true);
 const loginEl=document.getElementById("login"),le=document.getElementById("le");
 document.getElementById("dmlist").addEventListener("click",e=>{const t=e.target.closest(".dm-item");if(t)openDM(t.dataset.dm);});
-function startApp(){loginEl.classList.remove("show");setMe(me);dmWith=localStorage.getItem("sp_dm")||"";loadPads();render();setInterval(render,3000);setInterval(loadPads,15000);}
+// polling lifecycle: pause entirely while the tab is hidden (battery + relay
+// load), refresh IMMEDIATELY on return so the pad feels live the moment you look.
+let APP_ON=false,pollTimer=null,padsTimer=null;
+function startPolling(){
+  if(pollTimer)return;
+  pollTimer=setInterval(render,3000);padsTimer=setInterval(loadPads,15000);
+}
+function stopPolling(){clearInterval(pollTimer);clearInterval(padsTimer);pollTimer=padsTimer=null;}
+document.addEventListener("visibilitychange",()=>{
+  if(!APP_ON)return;
+  if(document.hidden)stopPolling();
+  else{render();loadPads();startPolling();}
+});
+function startApp(){APP_ON=true;loginEl.classList.remove("show");setMe(me);dmWith=localStorage.getItem("sp_dm")||"";resetLog();loadPads();render();startPolling();}
 function setMe(name){me=name||"smaths";localStorage.setItem("sp_me",me);
   const t=document.getElementById("tags");if(t)t.textContent="you are @"+me+" · type @name to address agents";}
 async function doLogin(){const user=document.getElementById("lu").value.trim(),pass=document.getElementById("lp").value;le.textContent="";

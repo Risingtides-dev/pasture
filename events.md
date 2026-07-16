@@ -433,3 +433,71 @@ survive. Verified end-to-end: fired velocity.sh against the live roster target â
 supacode.sh gone from both. Stale @glm(ex-pi)/@deepseek still need to re-join from their
 own live terminals to re-bind.
 _________________________________________________________________________________
+_________________________________________________________________________________
+time:      [01:18] [07-16-26]
+agent:     [codex] [gpt-5]
+worktree:  [main]
+type:      [bug report]
+area:      [backend]
+
+Fixed markdown-only idle wake for Codex. The watcher already detected Fable's
+new @codex mention, but the Codex adapter only displayed a macOS notification
+and exited 3; the Stop hook could not create a turn after Codex was idle. The
+adapter now selects the newest session binding for the addressed handle and
+runs `codex exec resume` for that exact thread, without Velocity or terminal
+keystrokes. It stays fail-closed: resume failure or a successful turn that does
+not post an addressed pad reply leaves the engagement gate pending. Added an
+isolated regression for newest-session selection, prompt policy, successful
+gate closure, and reply-less failure. The live Fable wake opened a new Codex
+turn through this path and produced an in-pad response. Updated `doctor` to
+validate pull agents through session bindings, push agents through targets, and
+installed adapter scripts from disk instead of a stale hard-coded allowlist.
+_________________________________________________________________________________
+
+time:      [01:21] [07-16-26]
+agent:     [claude] [fable 5]
+type:      [refactor]
+area:      [agent-building]
+
+Reformatted the stitchpad pi integration as a herdr plugin and stripped all Velocity references. index.ts now pins herdr|push|$HERDR_PANE_ID at join (pull|- outside herdr) and installs beside herdr-agent-state.ts at ~/.pi/agent/extensions/stitchpad.ts; removed the old pi package entry from ~/.pi/agent/settings.json. Added a set-wake CLI subcommand because join no-ops on existing roster rows, so a restarted agent could never escape a dead pull|- row. pi.sh is now a thin fallback that delegates to herdr.sh when a herdr target exists. Verified end-to-end on the ocean-surface pad: /reload loaded the extension into the running pi, set-wake re-pinned the roster, the watcher pushed the pending mention via herdr pane run, and @pi replied on the pad at 01:19.
+_________________________________________________________________________________
+
+time:      [01:52] [07-16-26]
+agent:     [claude] [fable 5]
+type:      [feature-request]
+area:      [frontend]
+
+Rebuilt the stitchpad TUI chat-first and made the task board agent-native. The prompt is always live (no compose mode; Enter sends as @smaths, Tab completes @names), ^Y copies the conversation as clean markdown (terminal drag-select grabbed borders/roster across panels), and the stale-roster bug is dead: pad events now refresh messages+board, and a background thread re-runs doctor+liveness every 5s so duplicate members and stuck health triangles converge automatically. Tasks tab gained Enter detail, ]/[ status moves, d/x done/cancel. Agents got task tools (tasks/task_new/task_update in the MCP server for claude/codex, stitchpad_task* in the pi extension) whose descriptions instruct unprompted status upkeep, and stitchpad wake now appends the woken agent open tickets to every wake payload. cargo build clean, 13/13 tests, scratch-pad E2E verified. Commit 453f99e.
+_________________________________________________________________________________
+
+time:      [02:01] [07-16-26]
+agent:     [claude] [fable 5]
+type:      [feature-request]
+area:      [frontend]
+
+Added mouse support to the stitchpad TUI: wheel scrolling, clickable header tabs, and in-app drag-selection over the messages panel that copies just the message text to the clipboard on release (mouse capture means terminal drag-select can no longer grab borders/roster across panels). Commit 8-file series continues; this is the follow-up to 453f99e.
+_________________________________________________________________________________
+_________________________________________________________________________________
+time:      [02:36] [07-16-26]
+agent:     [codex] [gpt-5]
+worktree:  [main]
+type:      [bug report]
+area:      [automations]
+
+Removed the hidden Codex `exec resume` watcher lane. It made pad replies appear
+to work but ran actions in headless child sessions outside the interactive
+terminal the operator was watching. The real Codex Stop hook in
+`~/.codex/hooks.json` remains authoritative. Watcher routing now skips every
+`pull` member and serves only explicit push targets such as herdr; the Codex
+adapter no longer launches processes or consumes the wake gate. Terminated the
+three outstanding headless resume chains and corrected the README contract.
+Headless SDK/exec orchestration must be an explicit future mode, never hidden
+behind a pull identity.
+_________________________________________________________________________________
+time:      [01:22] [07-16-26]
+agent:     [claude] [fable 5]
+type:      [feature-request]
+area:      [frontend]
+
+Revamped the PWA (tool/pwa/index.html) end-to-end for smoothness + visual polish, deployed live to stitchpad.agentsworld.org. Perf: replaced the nuke-innerHTML-every-poll renderer with a keyed incremental renderer (djb2 key per message block; new messages APPEND with a 220ms fade-up, anything else falls back to one silent full rebuild), mobile drawer now animates transform+scrim instead of width (layout-thrash jank killed), polling pauses when the tab is hidden and refreshes instantly on return, scroll re-sticks through image loads, skeleton shimmer on first load. Visual: refined dark palette with real elevation layers (kept paper shell + teal identity), Slack-style same-author message grouping with hover timestamp gutter, teal focus-ring composer with paper-plane send button (disabled-when-empty), hairline system-message dividers, styled scrollbars, springy agent-card/login animations, full prefers-reduced-motion support, empty state, avatar fallback now colored initials instead of the stock _default.png photo. Manifest theme colors unified to #12151c. Added tool/PRODUCT.md (impeccable design context). Verified live in Chrome against the real relay: grouping, colors, composer, statusbar all correct; zero console errors.
+_________________________________________________________________________________
