@@ -420,9 +420,13 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         // name passed. Only a session with no prior binding may set a name; absent
         // a name we derive a stable one from the session id. A session can never be
         // shoved into another session's identity.
-        const bound = SESSION_ID
+        // The result must LOOK like a handle before we adopt it — an older CLI
+        // answered unknown commands with its full help text at exit 0, and that
+        // blob became an agent's identity. Anything non-handle-shaped = unbound.
+        const boundRaw = SESSION_ID
           ? await sp(["whoami"], undefined, { STITCHPAD_SESSION: SESSION_ID }).then(s => s.trim()).catch(() => "")
           : "";
+        const bound = /^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/.test(boundRaw) ? boundRaw : "";
         if (bound) {
           ME = bound;
           // Rejoin (e.g. after an MCP restart): identity is locked, but the heartbeat

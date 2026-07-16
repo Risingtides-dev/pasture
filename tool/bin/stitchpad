@@ -52,7 +52,7 @@ sp_autostart_name() {
 sp_maybe_start_heartbeat() {
   [ "${STITCHPAD_HEARTBEAT_AUTOSTART:-1}" = "0" ] && return 0
   case "$cmd" in
-    init|heartbeat|hook|bind-session|leave|stop|daemon|watch|migration-check|help|-h|--help) return 0 ;;
+    init|heartbeat|hook|bind-session|whoami|leave|stop|daemon|watch|migration-check|help|-h|--help) return 0 ;;
   esac
   sp_init_paths >/dev/null 2>&1 || return 0
   local who
@@ -330,6 +330,21 @@ EOF
     STITCHPAD_NAME="$nm" STITCHPAD_HEARTBEAT_PARENT_PID="${STITCHPAD_HEARTBEAT_PARENT_PID:-$PPID}" \
       "$BIN_DIR/stitchpad" heartbeat start "$nm" >/dev/null 2>&1 \
       && echo "✓ heartbeat for @$nm"
+    ;;
+
+  whoami)
+    # Print the handle bound to this session (the MCP `join` tool calls this to
+    # detect a prior binding). Resolution: sessions/<$STITCHPAD_SESSION>, else
+    # the pad-level default. No binding → no output, exit 1. Read-only.
+    sp_init_paths || exit 1
+    _wn=""
+    if [ -n "${STITCHPAD_SESSION:-}" ]; then
+      _wn="$(cat "$PAD_STATE/sessions/$STITCHPAD_SESSION" 2>/dev/null || true)"
+    else
+      _wn="$(cat "$PAD_STATE/whoami" 2>/dev/null || true)"
+    fi
+    [ -n "$_wn" ] || exit 1
+    printf '%s\n' "$_wn"
     ;;
 
   say)
@@ -1630,7 +1645,14 @@ sys.exit(1)
     fi
     ;;
 
-  help|*)
+  help|-h|--help)
     sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
+    ;;
+
+  *)
+    # An unknown command MUST fail loudly. Printing help with exit 0 once let a
+    # caller adopt the entire help text as an agent's identity.
+    echo "stitchpad: unknown command '$cmd' (see: stitchpad help)" >&2
+    exit 1
     ;;
 esac
