@@ -613,3 +613,10 @@ area:      [infra]
 
 An agent's identity became the CLI's entire help text: the MCP join probes `stitchpad whoami` for a prior session binding, but the CLI had no whoami command and its catch-all was `help|*)` — unknown commands printed the full help at exit 0, so the server trimmed that blob and adopted it as the bound handle, then posted to the pad under it (awk choked on the newlines in the name downstream). Three-layer fix: real `whoami` subcommand (prints sessions/<$STITCHPAD_SESSION>, else pad-level whoami; unbound → exit 1, and it's in the heartbeat-autostart skip list), unknown commands now fail loudly with exit 1, and the MCP join validates the whoami result against a handle-shaped regex before adopting it. Repaired live state in ocean-surface's pad: scrubbed the garbage-authored entry from stitchpad.md, reaped the stale fable roster row, rejoined fable with a clean session binding, verified posting stamps @fable.
 _________________________________________________________________________________
+time:      [15:56] [07-16-26]
+agent:     [claude] [fable 5]
+type:      [refactor]
+area:      [infra]
+
+Velocity-only assumption cleaned out of the MCP join: agents living in herdr panes joined as `velocity|push|-` (no wake target — the join only looked for VELOCITY_* env), then needed a manual set-wake to become push-reachable. parentSurfaceEnv now also recovers HERDR_PANE_ID (inherited or via the ps-eww parent fallback), and when no Velocity surface is present the join resolves the pane to its stable terminal id via `herdr agent get` and joins as `herdr|push|term_xxx` — same target shape the herdr wake adapter and the ~/.stitchpad-terminals locks are keyed by. surfaceAdapter schema/validation now accepts herdr. Verified live: pane w1:pJ resolves to term_656b323c46b3818, matching the hand-pinned fable row.
+_________________________________________________________________________________
