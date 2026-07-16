@@ -355,9 +355,19 @@ async function render(){
   document.getElementById("chMeta").textContent=dmWith?"direct message":((d.roster||[]).length+" members");
   let msgs=parse(d.pad);
   if(dmWith) msgs=msgs.filter(b=>!b.sys && inDM(b,dmWith));   // 1:1 filtered view
-  // drop optimistic pending messages that have now landed in the real pad
-  const landed=new Set(msgs.filter(b=>!b.sys).map(b=>(b.body||[]).join("\n").trim()));
-  PENDING=PENDING.filter(p=>!landed.has(p.text));
+  // drop optimistic pending messages that have now landed in the real pad.
+  // FUZZY on purpose: the bridge can reflow whitespace or prefix the landed text,
+  // so exact string match leaves a ghost duplicate bubble (the bad-ui report).
+  // Compare whitespace-normalized + prefix-tolerant, only against MY messages,
+  // and expire any pending older than 20s — by then the poll is the truth.
+  const normTxt=s=>(s||"").replace(/\s+/g," ").trim();
+  const landedMine=msgs.filter(b=>!b.sys&&(b.who||"").toLowerCase()===me.toLowerCase()).map(b=>normTxt((b.body||[]).join("\n")));
+  PENDING=PENDING.filter(p=>{
+    const n=normTxt(p.text);
+    if(landedMine.some(l=>l===n||l.startsWith(n)||n.startsWith(l)))return false;
+    if(p.at&&Date.now()-p.at>20000)return false;
+    return true;
+  });
   const cpyBtn=text=>`<button class="row-cpy" title="copy message" data-copy="${btoa(unescape(encodeURIComponent(text)))}">copy</button>`;
   // grouping: consecutive messages from the same author collapse into compact
   // rows (no repeated avatar/name; hover reveals the timestamp in the gutter).
@@ -520,7 +530,7 @@ document.getElementById("atbtn").onclick=()=>{
 async function send(){let text=ta.value.trim();if(!text||!pad)return;ta.value="";autosize();closeAc();
   // in a DM, address the agent so the message lands in the 1:1 view (and wakes them)
   if(dmWith && !new RegExp("(^|[^a-z0-9_-])@"+dmWith+"([^a-z0-9_-]|$)","i").test(text)) text="@"+dmWith+" "+text;
-  PENDING.push({text});                         // optimistic: show immediately
+  PENDING.push({text,at:Date.now()});           // optimistic: show immediately
   const pendEl=document.getElementById("pend");
   pendEl.insertAdjacentHTML("beforeend",`<div class="row pending enter">${av(me)}<div class="bubble"><div class="hd"><span class="who" style="color:${nameColor(me)}">${esc(me)}</span><span class="ts">sending…</span></div><div class="bd">${fmt(text)}</div></div></div>`);
   stick(true);
