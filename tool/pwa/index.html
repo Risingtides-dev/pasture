@@ -1,5 +1,5 @@
 <!doctype html><html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,interactive-widget=resizes-content">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover,interactive-widget=resizes-content">
 <meta name="theme-color" content="#12151c"><link rel="manifest" href="manifest.json">
 <link rel="icon" type="image/svg+xml" href="logo.svg"><link rel="apple-touch-icon" href="logo.svg">
 <title>stitchpad</title>
@@ -18,8 +18,8 @@
   --z-ac:20;--z-scrim:39;--z-drawer:40;--z-cardback:50;--z-card:51;--z-login:99;
   --ease:cubic-bezier(.22,.7,.25,1);
 }
-*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-html,body{margin:0;height:100%;font:15px/1.5 -apple-system,system-ui,"Segoe UI",sans-serif;background:var(--col);color:var(--txt);overflow:hidden}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;touch-action:manipulation}
+html,body{margin:0;height:100%;font:15px/1.5 -apple-system,system-ui,"Segoe UI",sans-serif;background:var(--col);color:var(--txt);overflow:hidden;-webkit-text-size-adjust:100%}
 button{font:inherit}
 #app{display:flex;height:100dvh;height:var(--vvh,100dvh)}
 
