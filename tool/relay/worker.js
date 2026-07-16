@@ -52,8 +52,8 @@ export default {
     }
 
     // Non-API paths → serve the PWA static assets (index.html, manifest).
-    const API = ["/login", "/join-request", "/invite", "/pads", "/pad", "/pad.colors", "/push", "/say", "/outbox", "/upload-image"];
-    if (!API.includes(url.pathname) && !url.pathname.startsWith("/img/")) {
+    const API = ["/login", "/join-request", "/invite", "/pads", "/pad", "/pad.colors", "/push", "/say", "/outbox", "/dm", "/dmbox", "/upload-image", "/upload-file", "/filebox"];
+    if (!API.includes(url.pathname) && !url.pathname.startsWith("/img/") && !url.pathname.startsWith("/f/")) {
       return env.ASSETS ? env.ASSETS.fetch(req) : json({ error: "no assets" }, 404);
     }
     const tok = (req.headers.get("authorization") || "").replace(/^Bearer\s+/i, "");
@@ -89,6 +89,14 @@ export default {
     if (url.pathname === "/pads" && req.method === "GET") {
       const idx = JSON.parse((await env.STITCHPAD.get("index")) || "{}");
       return json(Object.entries(idx).map(([name, at]) => ({ name, at })).sort((a, b) => b.at - a.at));
+    }
+    // Serve attached files from R2 (token-gated; no ?pad needed — key is global)
+    if (url.pathname.startsWith("/f/") && req.method === "GET") {
+      const obj = await env.IMAGES.get("files/" + url.pathname.slice(3));
+      if (!obj) return json({ error: "not found" }, 404);
+      const headers = new Headers(cors);
+      headers.set("content-type", obj.httpMetadata?.contentType || "application/octet-stream");
+      return new Response(obj.body, { headers });
     }
     if (!pad) return json({ error: "missing ?pad=NAME" }, 400);
 
@@ -138,6 +146,23 @@ export default {
       await env.STITCHPAD.put(qk, JSON.stringify(q));
       return json({ ok: true, queued: q.length });
     }
+    // True DM: queued for the Mac bridge to inject DIRECTLY into the target
+    // agent's terminal session (herdr pane) — never lands on the shared pad.
+    if (url.pathname === "/dm" && req.method === "POST") {
+      const { from, to, text } = await req.json();
+      if (!to || !text) return json({ error: "need to + text" }, 400);
+      const qk = `dmbox:${pad}`;
+      const q = JSON.parse((await env.STITCHPAD.get(qk)) || "[]");
+      q.push({ from: from || "smaths", to, text, at: Date.now() });
+      await env.STITCHPAD.put(qk, JSON.stringify(q));
+      return json({ ok: true, queued: q.length });
+    }
+    if (url.pathname === "/dmbox" && req.method === "GET") {
+      const qk = `dmbox:${pad}`;
+      const q = JSON.parse((await env.STITCHPAD.get(qk)) || "[]");
+      await env.STITCHPAD.put(qk, "[]");
+      return json({ messages: q });
+    }
     if (url.pathname === "/outbox" && req.method === "GET") {
       const qk = `outbox:${pad}`;
       const q = JSON.parse((await env.STITCHPAD.get(qk)) || "[]");
@@ -184,6 +209,39 @@ export default {
       // public-bucket exposure. r2Key is images/<sha>.<ext>; /img strips "images/".
       const publicUrl = `https://stitchpad.agentsworld.org/img/${sha}.${ext}`;
       return json({ url: publicUrl, sha, mime: file.type, size: file.size });
+    }
+    // File attach: any type up to 15MB → R2 + queued in filebox:<pad> for the
+    // Mac bridge to land in the project's .stitchpad/dropbox/.
+    if (url.pathname === "/upload-file" && req.method === "POST") {
+      const contentType = req.headers.get("content-type") || "";
+      if (!contentType.includes("multipart/form-data")) {
+        return json({ error: "expected multipart/form-data" }, 400);
+      }
+      const formData = await req.formData();
+      const file = formData.get("file");
+      if (!file || typeof file === "string") return json({ error: "missing 'file' field" }, 400);
+      const maxSize = 15 * 1024 * 1024;
+      if (file.size > maxSize) return json({ error: `file too large: ${file.size} bytes (max ${maxSize})` }, 400);
+      const buf = await file.arrayBuffer();
+      const hashBuffer = await crypto.subtle.digest("SHA-256", buf);
+      const sha = Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, "0")).join("").slice(0, 16);
+      const safe = (file.name || "file").replace(/[^a-zA-Z0-9._-]/g, "_").slice(-80);
+      const key = `files/${sha}-${safe}`;
+      await env.IMAGES.put(key, buf, {
+        httpMetadata: { contentType: file.type || "application/octet-stream" },
+        customMetadata: { originalName: file.name || safe, uploadedAt: new Date().toISOString() }
+      });
+      const qk = `filebox:${pad}`;
+      const q = JSON.parse((await env.STITCHPAD.get(qk)) || "[]");
+      q.push({ name: safe, key, at: Date.now() });
+      await env.STITCHPAD.put(qk, JSON.stringify(q));
+      return json({ ok: true, name: safe, key, size: file.size });
+    }
+    if (url.pathname === "/filebox" && req.method === "GET") {
+      const qk = `filebox:${pad}`;
+      const q = JSON.parse((await env.STITCHPAD.get(qk)) || "[]");
+      await env.STITCHPAD.put(qk, "[]");
+      return json({ messages: q });
     }
     // Serve images from R2
     if (url.pathname.startsWith("/img/") && req.method === "GET") {

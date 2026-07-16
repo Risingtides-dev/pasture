@@ -101,6 +101,8 @@ button{font:inherit}
 .sys{display:flex;align-items:center;gap:10px;color:var(--faint);font-size:12px;padding:8px 16px;user-select:none}
 .sys::before,.sys::after{content:"";flex:1;height:1px;background:var(--edge-soft)}
 .row.pending{opacity:.55}.row.pending .ts{font-style:italic}
+.row.dmrow .bubble{background:var(--teal-soft);border-radius:10px;padding:6px 10px;margin:-2px 0}
+.dmts{color:var(--teal)!important}
 .empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;padding:56px 24px;color:var(--dim);text-align:center}
 .empty b{color:var(--txt);font-size:16px}
 .empty span{font-size:13.5px}
@@ -117,8 +119,10 @@ button{font:inherit}
 #cwrap{padding:10px 16px;padding-bottom:calc(10px + env(safe-area-inset-bottom));position:relative}
 #composer{border:1px solid #3a4150;border-radius:14px;background:var(--panel);display:flex;align-items:flex-end;transition:border-color .15s var(--ease),box-shadow .15s var(--ease)}
 #composer:focus-within{border-color:var(--teal);box-shadow:0 0 0 3px var(--teal-soft)}
-#atbtn{background:transparent;border:0;color:var(--dim);width:34px;height:34px;flex:0 0 34px;margin:7px 0 7px 7px;border-radius:9px;font-size:17px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background .15s var(--ease),color .15s var(--ease)}
-#atbtn:hover{background:var(--panel-2);color:var(--teal)}
+#atbtn,#attbtn{background:transparent;border:0;color:var(--dim);width:34px;height:34px;flex:0 0 34px;margin:7px 0 7px 7px;border-radius:9px;font-size:17px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background .15s var(--ease),color .15s var(--ease)}
+#atbtn:hover,#attbtn:hover{background:var(--panel-2);color:var(--teal)}
+#attbtn{margin-left:0}
+#attbtn svg{width:17px;height:17px}
 #edwrap{position:relative;flex:1;min-width:0}
 /* the backdrop renders the SAME text with mentions colored; the textarea's own
    glyphs are transparent (caret stays visible) so the highlight shows through */
@@ -227,7 +231,7 @@ button{font:inherit}
     <div id="statusbar"></div>
     <div id="claimbar"></div>
     <div id="log"><div id="rows"></div><div id="pend"></div></div>
-    <div id="cwrap"><div id="ac"></div><div id="composer"><button id="atbtn" aria-label="mention an agent" title="mention">@</button><div id="edwrap"><div id="hl" aria-hidden="true"></div><textarea id="text" rows="1" placeholder="Message…"></textarea></div><button id="send" disabled aria-label="send"><svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M4.4 11.05 19.3 4.24c.9-.41 1.83.52 1.42 1.42l-6.81 14.9c-.44.96-1.85.84-2.12-.18l-1.44-5.46a1.15 1.15 0 0 0-.82-.82l-5.46-1.44c-1.02-.27-1.14-1.68-.18-2.12Z" fill="currentColor"/></svg></button></div><div class="tags" id="tags">you are @smaths · type @name to address agents</div></div>
+    <div id="cwrap"><div id="ac"></div><div id="composer"><button id="atbtn" aria-label="mention an agent" title="mention">@</button><button id="attbtn" aria-label="attach a file" title="attach → .stitchpad/dropbox"><svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M20.5 11.5 12.7 19.3a5.25 5.25 0 0 1-7.42-7.42l8.13-8.13a3.5 3.5 0 0 1 4.95 4.95l-8.13 8.13a1.75 1.75 0 0 1-2.47-2.48l7.42-7.42" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button><input type="file" id="fpick" multiple hidden><div id="edwrap"><div id="hl" aria-hidden="true"></div><textarea id="text" rows="1" placeholder="Message…"></textarea></div><button id="send" disabled aria-label="send"><svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M4.4 11.05 19.3 4.24c.9-.41 1.83.52 1.42 1.42l-6.81 14.9c-.44.96-1.85.84-2.12-.18l-1.44-5.46a1.15 1.15 0 0 0-.82-.82l-5.46-1.44c-1.02-.27-1.14-1.68-.18-2.12Z" fill="currentColor"/></svg></button></div><div class="tags" id="tags">you are @smaths · type @name to address agents</div></div>
   </div>
 </div>
 <div id="scrim"></div>
@@ -352,9 +356,23 @@ async function render(){
   ROSTER_INFO={}; (d.roster||[]).forEach(m=>{ROSTER_INFO[m.name]=m;}); PROFILES=d.profiles||{};  // for agent cards
   CLAIMS=d.claims||[];
   renderDMList(); renderStatusBar(); renderClaimBar();
-  document.getElementById("chMeta").textContent=dmWith?"direct message":((d.roster||[]).length+" members");
+  document.getElementById("chMeta").textContent=dmWith?"direct → their terminal":((d.roster||[]).length+" members");
+  const tagsEl=document.getElementById("tags");
+  if(tagsEl)tagsEl.textContent=dmWith?("DMs go straight to @"+dmWith+"'s terminal session — the pad never sees them"):("you are @"+me+" · type @name to address agents");
   let msgs=parse(d.pad);
-  if(dmWith) msgs=msgs.filter(b=>!b.sys && inDM(b,dmWith));   // 1:1 filtered view
+  if(dmWith){
+    msgs=msgs.filter(b=>!b.sys && inDM(b,dmWith));   // their pad replies + past pad exchanges
+    DM_PAD_COUNT=msgs.length;
+    // weave in my true DMs (sent straight to their terminal, never on the pad),
+    // anchored at the pad position they were sent from so ordering stays honest
+    const locals=dmLoad(dmWith);
+    const woven=[];
+    for(let i=0;i<=msgs.length;i++){
+      locals.forEach(l=>{if(Math.min(l.anchor??msgs.length,msgs.length)===i)woven.push({dm:l});});
+      if(i<msgs.length)woven.push(msgs[i]);
+    }
+    msgs=woven;
+  }
   // drop optimistic pending messages that have now landed in the real pad.
   // FUZZY on purpose: the bridge can reflow whitespace or prefix the landed text,
   // so exact string match leaves a ghost duplicate bubble (the bad-ui report).
@@ -373,8 +391,12 @@ async function render(){
   // rows (no repeated avatar/name; hover reveals the timestamp in the gutter).
   const items=msgs.map((b,i)=>{
     if(b.sys)return{key:"s"+djb2(b.sys),html:`<div class="sys">${esc(b.sys)}</div>`};
+    if(b.dm){
+      const t=new Date(b.dm.at),hh=String(t.getHours()).padStart(2,"0"),mm=String(t.getMinutes()).padStart(2,"0");
+      return{key:"d"+b.dm.at+djb2(b.dm.text),html:`<div class="row dmrow">${av(me)}<div class="bubble"><div class="hd"><span class="who" style="color:${nameColor(me)}">${esc(me)}</span><span class="ts dmts">${hh}:${mm} → @${esc(dmWith)}'s terminal</span></div><div class="bd">${fmt(b.dm.text)}</div></div></div>`};
+    }
     const prev=msgs[i-1];
-    const grouped=!!(prev&&!prev.sys&&prev.who===b.who);
+    const grouped=!!(prev&&!prev.sys&&!prev.dm&&prev.who===b.who);
     const body=b.body.join("\n").trim();
     const key=djb2(b.who+"|"+b.t+"|"+body)+(grouped?"g":"");
     const html=grouped
@@ -400,7 +422,12 @@ async function render(){
   FIRST_PAINT=false;
 }
 let PAD_ETAG="";
-let ROSTER=[],FILES=[],PENDING=[],ROSTER_INFO={},PROFILES={},CLAIMS=[],dmWith="";
+let ROSTER=[],FILES=[],PENDING=[],ROSTER_INFO={},PROFILES={},CLAIMS=[],dmWith="",DM_PAD_COUNT=0;
+// local log of true DMs (terminal-routed) per pad+agent — the pad never sees
+// these, so the DM pane is the only record of what was sent
+const dmLKey=n=>"sp_dmlog_"+pad+"_"+n;
+const dmLoad=n=>{try{return JSON.parse(localStorage.getItem(dmLKey(n))||"[]")}catch(_){return[]}};
+const dmSave=(n,l)=>{try{localStorage.setItem(dmLKey(n),JSON.stringify(l.slice(-50)))}catch(_){}};
 // File-write claims telemetry: "✏️ @x editing <file>" — shows who holds a write
 // lease so we can SEE the locks. Reads pad.claims (from `stitchpad claims` via bridge).
 // Tolerant of shape: [{holder,file,age}] or {file:holder}.
@@ -518,6 +545,26 @@ ta.addEventListener("input",()=>{autosize();updateAc();});
 ta.addEventListener("click",updateAc);
 ta.addEventListener("scroll",()=>{hlEl.scrollTop=ta.scrollTop;});
 ta.addEventListener("blur",()=>setTimeout(closeAc,150));
+// attach files → uploaded to the relay, bridge lands them in .stitchpad/dropbox/
+const fpick=document.getElementById("fpick");
+document.getElementById("attbtn").onclick=()=>fpick.click();
+const sysNote=(t,err)=>{const b=document.createElement("div");b.className="sys";if(err)b.style.color="var(--err)";b.textContent=t;document.getElementById("log").appendChild(b);stick();};
+fpick.onchange=async()=>{
+  const files=[...fpick.files];fpick.value="";
+  for(const f of files){
+    if(f.size>15*1024*1024){sysNote("⚠ "+f.name+" is over the 15MB cap",1);continue;}
+    sysNote("⬆ uploading "+f.name+"…");
+    try{
+      const fd=new FormData();fd.append("file",f);
+      const r=await fetch(RELAY+"/upload-file?pad="+encodeURIComponent(pad),{method:"POST",headers:{authorization:"Bearer "+TOKEN},body:fd});
+      if(!r.ok)throw new Error("HTTP "+r.status);
+      const j=await r.json();
+      // announce on the pad so agents know the artifact landed
+      await api("/say?pad="+encodeURIComponent(pad),{method:"POST",body:JSON.stringify({from:me,text:"📎 dropped **"+j.name+"** → .stitchpad/dropbox/"+j.name})});
+      setTimeout(render,400);
+    }catch(err){sysNote("⚠ upload failed for "+f.name+" ("+err.message+")",1);}
+  }
+};
 // one-tap mention: inserts @ at the caret and pops the agent menu (phone-friendly)
 document.getElementById("atbtn").onclick=()=>{
   const c=ta.selectionStart,before=ta.value.slice(0,c);
@@ -528,8 +575,22 @@ document.getElementById("atbtn").onclick=()=>{
 };
 
 async function send(){let text=ta.value.trim();if(!text||!pad)return;ta.value="";autosize();closeAc();
-  // in a DM, address the agent so the message lands in the 1:1 view (and wakes them)
-  if(dmWith && !new RegExp("(^|[^a-z0-9_-])@"+dmWith+"([^a-z0-9_-]|$)","i").test(text)) text="@"+dmWith+" "+text;
+  // TRUE DM: route via the relay dmbox → Mac bridge → herdr injection into the
+  // agent's terminal session. Nothing lands on the shared pad (no thread bloat).
+  if(dmWith){
+    try{
+      const r=await api("/dm?pad="+encodeURIComponent(pad),{method:"POST",body:JSON.stringify({from:me,to:dmWith,text})});
+      if(!r.ok)throw new Error("HTTP "+r.status);
+      const l=dmLoad(dmWith);l.push({text,at:Date.now(),anchor:DM_PAD_COUNT});dmSave(dmWith,l);
+      LOG_KEYS=[];render();   // full rebuild weaves the new DM in
+    }catch(err){
+      ta.value=text;autosize();
+      const b=document.createElement("div");b.className="sys";
+      b.style.color="var(--err)";b.textContent="⚠ DM failed ("+err.message+") — your text is back in the box";
+      document.getElementById("log").appendChild(b);stick();
+    }
+    return;
+  }
   PENDING.push({text,at:Date.now()});           // optimistic: show immediately
   const pendEl=document.getElementById("pend");
   pendEl.insertAdjacentHTML("beforeend",`<div class="row pending enter">${av(me)}<div class="bubble"><div class="hd"><span class="who" style="color:${nameColor(me)}">${esc(me)}</span><span class="ts">sending…</span></div><div class="bd">${fmt(text)}</div></div></div>`);
@@ -597,7 +658,10 @@ if(window.visualViewport){
   const applyVV=()=>{
     const wasBottom=nearBottom();
     document.documentElement.style.setProperty("--vvh",Math.round(vv.height)+"px");
-    window.scrollTo(0,0);               // undo iOS's layout-viewport shove
+    // iOS standalone shoves the layout viewport instead of resizing it; pin the
+    // shell to the VISUAL viewport (translate by offsetTop) rather than fighting it
+    document.getElementById("app").style.transform=vv.offsetTop>1?`translateY(${Math.round(vv.offsetTop)}px)`:"";
+    window.scrollTo(0,0);
     if(wasBottom)requestAnimationFrame(()=>stick());
   };
   vv.addEventListener("resize",()=>{clearTimeout(vvT);vvT=setTimeout(applyVV,16);});

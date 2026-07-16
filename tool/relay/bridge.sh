@@ -124,6 +124,43 @@ print(json.dumps(skills))
       ( cd "$(dirname "$padd")" && STITCHPAD_NAME="$from" "$SP" say "$text" >/dev/null 2>&1 ) || true
       echo "[bridge] $name ← @$from: ${text:0:50}"
     done
+    # drain phone→agent TRUE DMs — inject straight into the agent's herdr pane,
+    # NEVER onto the shared pad (steering pings were bloating thread context).
+    # Fallback only if the pane is dead: land it as a pad mention so it's not lost.
+    dmq="$(api "$RELAY/dmbox?pad=$name" 2>/dev/null || echo '{"messages":[]}')"
+    echo "$dmq" | jq -c '.messages[]?' 2>/dev/null | while IFS= read -r m; do
+      from="$(echo "$m" | jq -r '.from')"; to="$(echo "$m" | jq -r '.to')"; text="$(echo "$m" | jq -r '.text')"
+      row="$(cd "$(dirname "$padd")" && "$SP" roster 2>/dev/null | awk -F'|' -v n="$to" '$1==n {print; exit}')"
+      adapter="$(echo "$row" | cut -d'|' -f2)"; target="$(echo "$row" | cut -d'|' -f4)"
+      delivered=0
+      if [ "$adapter" = "herdr" ] && [ -n "$target" ] && [ "$target" != "-" ]; then
+        hd="$(command -v herdr 2>/dev/null || echo "$HOME/.local/bin/herdr")"
+        pane="$([ -x "$hd" ] && "$hd" agent get "$target" 2>/dev/null | sed -n 's/.*"pane_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+        if [ -n "$pane" ]; then
+          # sanitize: pane run reaches a raw pty — strip control bytes, collapse whitespace
+          dmsg="$(printf 'stitchpad DM from @%s (private — not on the pad; reply lands on the pad unless they DM you back): %s' "$from" "$text" | LC_ALL=C tr -d '\000-\037\177' | tr -s ' ')"
+          "$hd" pane run "$pane" "$dmsg" >/dev/null 2>&1 && delivered=1
+        fi
+      fi
+      if [ "$delivered" = "1" ]; then
+        echo "[bridge] $name DM @$from → @$to terminal (${text:0:40})"
+      else
+        ( cd "$(dirname "$padd")" && STITCHPAD_NAME="$from" "$SP" say "@$to (dm — terminal unreachable) $text" >/dev/null 2>&1 ) || true
+        echo "[bridge] $name DM @$from → @$to FELL BACK to pad (no live pane)"
+      fi
+    done
+    # drain uploaded attachments → the project's .stitchpad/dropbox/
+    fq="$(api "$RELAY/filebox?pad=$name" 2>/dev/null || echo '{"messages":[]}')"
+    echo "$fq" | jq -c '.messages[]?' 2>/dev/null | while IFS= read -r m; do
+      fname="$(echo "$m" | jq -r '.name')"; fkey="$(echo "$m" | jq -r '.key')"
+      [ -n "$fname" ] && [ -n "$fkey" ] || continue
+      drop="$padd/dropbox"; mkdir -p "$drop" 2>/dev/null || true
+      if api "$RELAY/f/${fkey#files/}" -o "$drop/$fname" 2>/dev/null; then
+        echo "[bridge] $name 📎 $fname → .stitchpad/dropbox/"
+      else
+        echo "[bridge] $name 📎 FAILED to download $fname"
+      fi
+    done
     # Write heartbeat after successful push+drain for this pad
     printf '{"ts":"%s","pad":"%s","interval":%s}' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$name" "$INTERVAL" > "$padd/.state/bridge-heartbeat" 2>/dev/null || true
   done < <(find_pads)
