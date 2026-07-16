@@ -596,17 +596,24 @@ PY
         fi
         parent="${STITCHPAD_HEARTBEAT_PARENT_PID:-$PPID}"
         session="${STITCHPAD_SESSION:-}"
-        surface="$(sp_this_surface)"
-        target=""
-        if [ -n "$surface" ] && [ -n "${VELOCITY_TAB_ID:-}" ]; then
-          target="${VELOCITY_WORKTREE_ID:-}@@${VELOCITY_TAB_ID}@@$surface"
-        fi
+        # SURFACE PRIORITY: the ROSTER TARGET is authoritative — it says where
+        # this agent actually lives. The caller's own pane comes LAST: heartbeat
+        # starts frequently run on the agent's BEHALF from someone else's pane
+        # (watcher, wake adapter cold-start, operator shell), and capturing the
+        # caller's pane stamped agents with foreign terminals, which auto-heal
+        # then faithfully wrote into the roster (the codex-wakes-to-the-
+        # operator bug).
+        surface=""; target=""
         roster_target="$(sp_user_field "$who" target 2>/dev/null || true)"
-        if [ -z "$surface" ] \
-          && [ -n "$roster_target" ] && [ "$roster_target" != "-" ]; then
+        if [ -n "$roster_target" ] && [ "$roster_target" != "-" ]; then
           surface="${roster_target##*@@}"
           target="$roster_target"
           [ -z "${STITCHPAD_HEARTBEAT_PARENT_PID:-}" ] && parent=""
+        else
+          surface="$(sp_this_surface)"
+          if [ -n "$surface" ] && [ -n "${VELOCITY_TAB_ID:-}" ]; then
+            target="${VELOCITY_WORKTREE_ID:-}@@${VELOCITY_TAB_ID}@@$surface"
+          fi
         fi
         (
           ticker_pid="$BASHPID"
@@ -632,10 +639,17 @@ PY
           pid="$(heartbeat_existing_pid "$who" 2>/dev/null || true)"
         fi
         [ -n "$pid" ] || pid="$BASHPID"
-        _surface="$(sp_this_surface)"
-        _target=""
-        if [ -n "$_surface" ] && [ -n "${VELOCITY_TAB_ID:-}" ]; then
-          _target="${VELOCITY_WORKTREE_ID:-}@@${VELOCITY_TAB_ID}@@$_surface"
+        # roster target first — same reasoning as heartbeat start: --touch is
+        # routinely called from panes that are not the agent's own.
+        _surface=""; _target=""
+        _rt="$(sp_user_field "$who" target 2>/dev/null || true)"
+        if [ -n "$_rt" ] && [ "$_rt" != "-" ]; then
+          _surface="${_rt##*@@}"; _target="$_rt"
+        else
+          _surface="$(sp_this_surface)"
+          if [ -n "$_surface" ] && [ -n "${VELOCITY_TAB_ID:-}" ]; then
+            _target="${VELOCITY_WORKTREE_ID:-}@@${VELOCITY_TAB_ID}@@$_surface"
+          fi
         fi
         heartbeat_write "$who" "$pid" "${STITCHPAD_HEARTBEAT_PARENT_PID:-$PPID}" "${STITCHPAD_SESSION:-}" "$_surface" "$_target"
         ;;
