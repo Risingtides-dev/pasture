@@ -1,0 +1,614 @@
+// stitchpad PWA — Preact port. Same single-page app, same CSS, same transport;
+// the DOM now renders through a keyed vdom (vendored htm/preact standalone,
+// no build step) instead of hand-managed innerHTML — the whole class of
+// "state and screen drifted apart" bugs dies here.
+//
+// Layering:
+//   store      — tiny external store the imperative transport writes into
+//   transport  — websocket to the PadHub DO + polling fallback (unchanged logic)
+//   components — App / Login / Sidebar / Log / Composer / cards stay imperative
+import { html, render, useState, useEffect, useLayoutEffect, useRef } from "./vendor/preact-standalone.module.js";
+
+// ── helpers (unchanged from the vanilla app) ─────────────────
+const RELAY = location.origin;
+const esc = s => (s || "").replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+const initials = n => (n || "?").slice(0, 2).toUpperCase();
+const OVR = { smaths: "#f1ece4", randy: "#0d9488", dale: "#00d000", larry: "#e01010", ernie: "#9b30ff", dennis: "#ff8c00", Jill: "#ff1493", mark: "#ffd700",
+  codex: "#a8a3ff", fable: "#d97757", claude: "#d97757", "claude-main": "#c96442", pi: "#aeb8c4", ocean: "#38bdf8", deepseek: "#4d6bfe" };
+const PAL = ["#00afff", "#ff8700", "#5fff00", "#d75fff", "#ffaf00", "#00ffff", "#ff00af", "#ffd700", "#87ffff", "#af87ff", "#ff5faf", "#5fff5f", "#ff5fff", "#87d787", "#d7af5f", "#ffff00", "#5fffff", "#ff87ff", "#afffaf", "#afffff"];
+let RELAY_COLORS = {};
+function setRelayColors(c) {
+  const m = {};
+  if (Array.isArray(c)) c.forEach(e => { if (e && e.name) m[e.name] = e.color || e.hex; });
+  else if (c && typeof c === "object") Object.assign(m, c);
+  RELAY_COLORS = m;
+}
+const colorFor = n => RELAY_COLORS[n] || OVR[n] || PAL[[...(n || "")].reduce((s, c) => s + c.charCodeAt(0), 0) % PAL.length];
+const lum = h => { const c = h.replace("#", ""); return (0.299 * parseInt(c.slice(0, 2), 16) + 0.587 * parseInt(c.slice(2, 4), 16) + 0.114 * parseInt(c.slice(4, 6), 16)) / 255; };
+const onLight = n => lum(colorFor(n)) > 0.85;
+const nameColor = n => onLight(n) ? "#e7e9ec" : colorFor(n);
+const initInk = n => onLight(n) ? "#12151c" : "#fff";
+const djb2 = s => { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0; return h.toString(36); };
+function fmt(t) {
+  t = esc(t);
+  t = t.replace(/```([\s\S]*?)```/g, (m, c) => `<div class="cb"><button class="cpy" title="copy">copy</button><pre>${c.trim()}</pre></div>`);
+  t = t.replace(/`([^`]+)`/g, "<code>$1</code>");
+  t = t.replace(/!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/g, (m, alt, url) => `<img class="msg-img" src="${url}" alt="${alt}" loading="lazy" referrerpolicy="no-referrer">`);
+  t = t.replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
+  t = t.replace(/(https?:\/\/[^\s]+)/g, '<a href="$1" target="_blank" rel="noopener">$1</a>');
+  t = t.replace(/(^|[\s(])@([a-zA-Z0-9_-]+)/g, (m, p, n) => `${p}<b style="color:${colorFor(n)}">@${n}</b>`);
+  return t;
+}
+function parse(md) {
+  const out = []; let cur = null;
+  for (const line of (md || "").split("\n")) {
+    let m = line.match(/^##\s+@(\S+)\s+·\s+(.+)$/);
+    if (m) { if (cur) out.push(cur); cur = { who: m[1], t: m[2], body: [] }; continue; }
+    let s = line.match(/^\*(.+?)·.+\*$/);
+    if (s) { if (cur) { out.push(cur); cur = null; } out.push({ sys: s[1].trim() }); continue; }
+    if (cur) cur.body.push(line);
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+function inDM(b, x, me) {
+  const a = (b.who || "").toLowerCase(), meL = me.toLowerCase(), xL = x.toLowerCase();
+  if (a !== meL && a !== xL) return false;
+  const body = (b.body || []).join(" ").toLowerCase();
+  const other = (a === meL) ? xL : meL;
+  const mentions = n => new RegExp("(^|[^a-z0-9_-])@" + n + "([^a-z0-9_-]|$)").test(body);
+  return mentions(other) || !/(^|[^a-z0-9_-])@[a-z0-9_-]/.test(body);
+}
+const normTxt = s => (s || "").replace(/\s+/g, " ").trim();
+
+// ── store: transport writes, components subscribe ────────────
+const store = {
+  me: localStorage.getItem("sp_me") || "smaths",
+  token: localStorage.getItem("sp_token") || "",
+  pad: localStorage.getItem("sp_pad") || "",
+  dmWith: localStorage.getItem("sp_dm") || "",
+  pads: [], doc: null, pending: [], notices: [],
+  wasBottom: true, authed: false, loginErr: "",
+};
+const subs = new Set();
+const publish = () => subs.forEach(f => f());
+const useStore = () => { const [, set] = useState(0); useEffect(() => { const f = () => set(x => x + 1); subs.add(f); return () => subs.delete(f); }, []); return store; };
+const api = (p, o = {}) => fetch(RELAY + p, { ...o, headers: { authorization: "Bearer " + store.token, "content-type": "application/json", ...(o.headers || {}) } });
+
+// local log of true DMs (terminal-routed) per pad+agent
+const dmLKey = n => "sp_dmlog_" + store.pad + "_" + n;
+const dmLoad = n => { try { return JSON.parse(localStorage.getItem(dmLKey(n)) || "[]"); } catch (_) { return []; } };
+const dmSave = (n, l) => { try { localStorage.setItem(dmLKey(n), JSON.stringify(l.slice(-50))); } catch (_) {} };
+
+const logEl = () => document.getElementById("log");
+const nearBottom = () => { const l = logEl(); return !l || l.scrollHeight - l.scrollTop - l.clientHeight < 80; };
+function stick(smooth) {
+  const l = logEl(); if (!l) return;
+  if (smooth && !matchMedia("(prefers-reduced-motion: reduce)").matches) l.scrollTo({ top: l.scrollHeight, behavior: "smooth" });
+  else l.scrollTop = l.scrollHeight;
+}
+const notice = (text, err) => { store.notices = [...store.notices, { text, err, at: Date.now() }]; publish(); requestAnimationFrame(() => stick()); };
+
+// ── transport: websocket to PadHub DO + polling fallback ─────
+let PAD_ETAG = "";
+function acceptDoc(d) {
+  if (d.name && d.name !== store.pad) return;      // stale after a pad switch
+  if (d.at) PAD_ETAG = `"${d.at}"`;
+  setRelayColors(d.colors);
+  store.wasBottom = nearBottom() || !store.doc;
+  // drop optimistic pendings that have landed (fuzzy: bridge may reflow text)
+  const mine = parse(d.pad).filter(b => !b.sys && (b.who || "").toLowerCase() === store.me.toLowerCase()).map(b => normTxt((b.body || []).join("\n")));
+  store.pending = store.pending.filter(p => {
+    const n = normTxt(p.text);
+    if (mine.some(l => l === n || l.startsWith(n) || n.startsWith(l))) return false;
+    if (p.at && Date.now() - p.at > 20000) return false;
+    return true;
+  });
+  store.doc = d; publish();
+}
+async function poll() {
+  if (!store.pad || !store.authed) return;
+  const headers = {};
+  if (PAD_ETAG) headers["if-none-match"] = PAD_ETAG;
+  const r = await api("/pad?pad=" + encodeURIComponent(store.pad) + (PAD_ETAG ? "&tail=200" : ""), { headers }).catch(() => null);
+  if (!r || r.status === 304 || !r.ok) return;
+  const et = r.headers.get("etag"); if (et) PAD_ETAG = et;
+  acceptDoc(await r.json());
+}
+async function loadPads() {
+  if (!store.authed) return;
+  const r = await api("/pads").catch(() => null);
+  if (!r || !r.ok) return;
+  store.pads = await r.json();
+  if (!store.pad && store.pads[0]) switchPad(store.pads[0].name);
+  publish();
+}
+let WS = null, WS_TRY = 0, wsPing = null, pollTimer = null, padsTimer = null;
+const wsLive = () => WS && WS.readyState === 1;
+function wsClose() { try { WS && WS.close(); } catch (_) {} WS = null; clearInterval(wsPing); wsPing = null; }
+function connectWS() {
+  wsClose();
+  if (!store.pad || !store.token || document.hidden || !store.authed) return;
+  const myPad = store.pad;
+  const s = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws?pad=" + encodeURIComponent(myPad) + "&token=" + encodeURIComponent(store.token));
+  WS = s;
+  s.onopen = () => { WS_TRY = 0; restartPolling(); poll(); };
+  s.onmessage = e => {
+    let m; try { m = JSON.parse(e.data); } catch (_) { return; }
+    if (m.type === "pad" && m.data && myPad === store.pad) acceptDoc(m.data);
+  };
+  s.onclose = () => {
+    if (WS !== s) return;
+    WS = null; clearInterval(wsPing); wsPing = null; restartPolling();
+    if (store.authed && !document.hidden) setTimeout(connectWS, Math.min(15000, 1000 * 2 ** (WS_TRY++)));
+  };
+  s.onerror = () => { try { s.close(); } catch (_) {} };
+  wsPing = setInterval(() => { try { s.readyState === 1 && s.send('{"type":"ping"}'); } catch (_) {} }, 25000);
+}
+function startPolling() {
+  if (pollTimer) return;
+  pollTimer = setInterval(() => { if (!wsLive()) poll(); }, wsLive() ? 30000 : 3000);
+  padsTimer = setInterval(loadPads, 15000);
+}
+function stopPolling() { clearInterval(pollTimer); clearInterval(padsTimer); pollTimer = padsTimer = null; }
+function restartPolling() { stopPolling(); startPolling(); }
+document.addEventListener("visibilitychange", () => {
+  if (!store.authed) return;
+  if (document.hidden) { stopPolling(); wsClose(); }
+  else { poll(); loadPads(); startPolling(); connectWS(); }
+});
+function switchPad(name) {
+  store.pad = name; store.dmWith = ""; store.doc = null; store.pending = []; store.notices = [];
+  PAD_ETAG = "";
+  localStorage.removeItem("sp_dm"); localStorage.setItem("sp_pad", name);
+  publish(); poll(); loadPads(); connectWS();
+}
+function openDM(n) { store.dmWith = n; localStorage.setItem("sp_dm", n); store.notices = []; publish(); requestAnimationFrame(() => stick()); }
+function closeDM() { store.dmWith = ""; localStorage.removeItem("sp_dm"); store.notices = []; publish(); }
+function startApp() {
+  store.authed = true;
+  store.dmWith = localStorage.getItem("sp_dm") || "";
+  publish(); loadPads(); poll(); startPolling(); connectWS();
+}
+async function doLogin(user, pass) {
+  store.loginErr = ""; publish();
+  const r = await fetch(RELAY + "/login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ user, pass }) }).catch(() => null);
+  if (!r || !r.ok) { store.loginErr = "wrong username or password"; publish(); return; }
+  const auth = await r.json();
+  store.token = auth.token; localStorage.setItem("sp_token", auth.token);
+  store.me = auth.handle || "smaths"; localStorage.setItem("sp_me", store.me);
+  startApp();
+}
+async function redeemInvite(inv) {
+  try {
+    const r = await fetch(RELAY + "/join-request", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token: inv }) });
+    if (!r.ok) throw 0;
+    const j = await r.json();
+    store.token = j.token; localStorage.setItem("sp_token", j.token);
+    store.me = j.handle || "smaths"; localStorage.setItem("sp_me", store.me);
+    if (j.pad) { store.pad = j.pad; localStorage.setItem("sp_pad", j.pad); }
+    history.replaceState(null, "", location.pathname);
+    startApp();
+  } catch (_) { store.loginErr = "invite invalid or expired"; publish(); }
+}
+
+// liveness: pushed by the bridge as PROFILES[name].online; offline trumps activity
+const profiles = () => store.doc?.profiles || {};
+const isOnline = n => { const p = profiles()[n] || {}; return p.online !== undefined ? !!p.online : true; };
+const liveState = n => { if (!isOnline(n)) return "offline"; const s = (profiles()[n] || {}).status; return s === "dnd" ? "dnd" : s === "working" ? "working" : "available"; };
+
+// send + DM + attach
+let DM_PAD_COUNT = 0;
+async function sendText(text) {
+  if (!text || !store.pad) return { ok: true };
+  if (store.dmWith) {
+    // TRUE DM → relay dmbox → bridge → herdr injection. Never lands on the pad.
+    try {
+      const r = await api("/dm?pad=" + encodeURIComponent(store.pad), { method: "POST", body: JSON.stringify({ from: store.me, to: store.dmWith, text }) });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const l = dmLoad(store.dmWith); l.push({ text, at: Date.now(), anchor: DM_PAD_COUNT }); dmSave(store.dmWith, l);
+      publish(); requestAnimationFrame(() => stick(true));
+      return { ok: true };
+    } catch (err) {
+      notice("⚠ DM failed (" + err.message + ") — your text is back in the box", true);
+      return { ok: false, text };
+    }
+  }
+  store.pending = [...store.pending, { text, at: Date.now() }];
+  publish(); requestAnimationFrame(() => stick(true));
+  try {
+    const r = await api("/say?pad=" + encodeURIComponent(store.pad), { method: "POST", body: JSON.stringify({ from: store.me, text }) });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    setTimeout(poll, 400);
+    return { ok: true };
+  } catch (err) {
+    store.pending = store.pending.filter(p => p.text !== text);
+    notice("⚠ send failed (" + err.message + ") — your text is back in the box, press send to retry", true);
+    return { ok: false, text };
+  }
+}
+async function uploadFiles(files) {
+  for (const f of files) {
+    if (f.size > 15 * 1024 * 1024) { notice("⚠ " + f.name + " is over the 15MB cap", true); continue; }
+    notice("⬆ uploading " + f.name + "…");
+    try {
+      const fd = new FormData(); fd.append("file", f);
+      const r = await fetch(RELAY + "/upload-file?pad=" + encodeURIComponent(store.pad), { method: "POST", headers: { authorization: "Bearer " + store.token }, body: fd });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const j = await r.json();
+      await api("/say?pad=" + encodeURIComponent(store.pad), { method: "POST", body: JSON.stringify({ from: store.me, text: "📎 dropped **" + j.name + "** → .stitchpad/dropbox/" + j.name }) });
+      setTimeout(poll, 400);
+    } catch (err) { notice("⚠ upload failed for " + f.name + " (" + err.message + ")", true); }
+  }
+}
+
+// ── components ───────────────────────────────────────────────
+const LOGO = () => html`<svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg"><rect x="6" y="6" width="52" height="52" rx="14" fill="#0d9488"/><path d="M16 44 L32 20 L48 44" stroke="#faf9f7" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="7 6"/><circle cx="16" cy="44" r="3.4" fill="#faf9f7"/><circle cx="48" cy="44" r="3.4" fill="#faf9f7"/><circle cx="32" cy="20" r="3.4" fill="#faf9f7"/></svg>`;
+
+function Av({ n, cls = "av", trigger = true }) {
+  const [err, setErr] = useState(false);
+  useEffect(() => setErr(false), [n]);
+  return html`<div class=${cls + (trigger ? " card-trigger" : "")} data-agent=${n} style=${{ background: colorFor(n), color: initInk(n) }}>
+    ${!err && html`<img key=${n} src=${"avatars/" + encodeURIComponent(n) + ".png"} alt="" loading="lazy" decoding="async" onError=${() => setErr(true)} />`}<span>${initials(n)}</span>
+  </div>`;
+}
+
+function Login() {
+  const s = useStore();
+  const u = useRef(), p = useRef();
+  const go = () => doLogin(u.current.value.trim(), p.current.value);
+  return html`<div id="login" class="show"><div class="card">
+    <h2><span style="width:30px;height:30px;display:inline-flex"><${LOGO}/></span>stitchpad</h2>
+    <div class="sub">your agents are talking. tap in.</div>
+    <input ref=${u} placeholder="username" autocapitalize="off" autocomplete="username"/>
+    <input ref=${p} type="password" placeholder="password" autocomplete="current-password" onKeyDown=${e => e.key === "Enter" && go()}/>
+    <button onClick=${go}>Sign in</button>
+    <div class="err">${s.loginErr}</div>
+  </div></div>`;
+}
+
+function Sidebar({ drawer, setDrawer }) {
+  const s = useStore();
+  const roster = (s.doc?.roster || []).map(m => m.name);
+  return html`<div id="chans" class=${drawer ? "open" : ""}>
+    <h1><span style="width:22px;height:22px;display:inline-flex"><${LOGO}/></span>stitchpad</h1>
+    <div class="sect">Stitchpads</div>
+    <div id="chanlist">
+      ${s.pads.map(p => html`<div key=${p.name} class=${"chan" + (p.name === s.pad && !s.dmWith ? " on" : "")} onClick=${() => { setDrawer(false); if (p.name === s.pad) closeDM(); else switchPad(p.name); }}><span class="h">#</span>${p.name}</div>`)}
+    </div>
+    <div class="sect">Direct Messages</div>
+    <div id="dmlist">
+      ${roster.filter(n => n !== s.me).map(n => {
+        const ls = liveState(n);
+        const off = ls === "offline";
+        const dotcol = ls === "working" ? "#2ea043" : ls === "dnd" ? "#d29922" : off ? "transparent" : "#3fb950";
+        return html`<div key=${n} class=${"chan dm-item" + (s.dmWith === n ? " on" : "")} style=${off ? "opacity:.55" : ""} onClick=${() => { setDrawer(false); openDM(n); }}>
+          <${Av} n=${n} cls="dmav" trigger=${false}/>
+          <span class="sdot" title=${ls} style=${{ background: dotcol, border: off ? "1.5px solid #6b7280" : "" }}></span>${n}
+        </div>`;
+      })}
+    </div>
+  </div>`;
+}
+
+function StatusBar() {
+  const s = useStore();
+  const roster = (s.doc?.roster || []).map(m => m.name);
+  const agents = roster.filter(n => profiles()[n] || true);
+  if (!s.doc || !agents.length) return html`<div id="statusbar"></div>`;
+  let working = 0, avail = 0, dnd = 0, offline = 0;
+  const dots = agents.map(n => {
+    const ls = liveState(n);
+    if (ls === "working") working++; else if (ls === "dnd") dnd++; else if (ls === "offline") offline++; else avail++;
+    const pip = ls === "working" ? "#2ea043" : ls === "dnd" ? "#d29922" : ls === "offline" ? "#6b7280" : "#3fb950";
+    return html`<span key=${n} class=${"sb-av card-trigger " + ls} data-agent=${n} title=${"@" + n + " · " + ls}>
+      <${Av} n=${n} cls="sb-tile" trigger=${false}/>
+      <span class="st" style=${{ background: pip }}></span>
+    </span>`;
+  });
+  const parts = [];
+  if (working) parts.push(working + " working"); if (avail) parts.push(avail + " available");
+  if (dnd) parts.push(dnd + " dnd"); if (offline) parts.push(offline + " offline");
+  return html`<div id="statusbar"><span class="count">${parts.join(" · ") || agents.length + " agents"}</span><span class="dots">${dots}</span></div>`;
+}
+
+function ClaimBar() {
+  const s = useStore();
+  let list = [];
+  const C = s.doc?.claims;
+  if (Array.isArray(C)) list = C.map(c => ({ who: c.holder || c.name || c.who, file: c.file || c.path, age: c.age }));
+  else if (C && typeof C === "object") list = Object.entries(C).map(([file, who]) => ({ who, file }));
+  list = list.filter(c => c.who && c.file);
+  return html`<div id="claimbar">${list.map((c, i) => html`<span key=${i} class="claim">✏️ <b style=${{ color: colorFor(c.who) }}>@${c.who}</b> editing ${c.file}${c.age ? " · " + c.age : ""}</span>`)}</div>`;
+}
+
+const cpyData = text => btoa(unescape(encodeURIComponent(text)));
+
+function Row({ b, grouped, enter }) {
+  const body = b.body.join("\n").trim();
+  const bd = html`<div class="bd" dangerouslySetInnerHTML=${{ __html: fmt(body) }}></div>`;
+  const cpy = html`<button class="row-cpy" title="copy message" data-copy=${cpyData(body)}>copy</button>`;
+  if (grouped) return html`<div class=${"row cmpct" + (enter ? " enter" : "")}>${cpy}<div class="gutter">${(b.t || "").replace(/\s*[AP]M$/i, "")}</div><div class="bubble">${bd}</div></div>`;
+  return html`<div class=${"row" + (enter ? " enter" : "")}>${cpy}<${Av} n=${b.who}/><div class="bubble">
+    <div class="hd"><span class="who card-trigger" data-agent=${b.who} style=${{ color: nameColor(b.who) }}>${b.who}</span><span class="ts">${b.t}</span></div>${bd}
+  </div></div>`;
+}
+
+function DmRow({ dm, to }) {
+  const t = new Date(dm.at), hh = String(t.getHours()).padStart(2, "0"), mm = String(t.getMinutes()).padStart(2, "0");
+  return html`<div class="row dmrow"><${Av} n=${store.me} trigger=${false}/><div class="bubble">
+    <div class="hd"><span class="who" style=${{ color: nameColor(store.me) }}>${store.me}</span><span class="ts dmts">${hh}:${mm} → @${to}'s terminal</span></div>
+    <div class="bd" dangerouslySetInnerHTML=${{ __html: fmt(dm.text) }}></div>
+  </div></div>`;
+}
+
+function Skeleton() {
+  return html`<div>${[70, 45, 85, 60, 75].map((p, i) => html`<div key=${i} class="skel"><div class="a"></div><div class="l"><div class="b" style=${{ width: p * .4 + "%" }}></div><div class="b" style=${{ width: p + "%" }}></div></div></div>`)}</div>`;
+}
+
+function Log() {
+  const s = useStore();
+  const known = useRef(new Set());
+  const first = useRef(true);
+  useEffect(() => { known.current = new Set(); first.current = true; }, [s.pad, s.dmWith]);
+
+  let items = [];
+  if (s.doc) {
+    let msgs = parse(s.doc.pad);
+    if (s.dmWith) {
+      msgs = msgs.filter(b => !b.sys && inDM(b, s.dmWith, s.me));
+      DM_PAD_COUNT = msgs.length;
+      const locals = dmLoad(s.dmWith);
+      const woven = [];
+      for (let i = 0; i <= msgs.length; i++) {
+        locals.forEach(l => { if (Math.min(l.anchor ?? msgs.length, msgs.length) === i) woven.push({ dm: l }); });
+        if (i < msgs.length) woven.push(msgs[i]);
+      }
+      msgs = woven;
+    }
+    items = msgs.map((b, i) => {
+      if (b.sys) return { key: "s" + djb2(b.sys), sys: b.sys };
+      if (b.dm) return { key: "d" + b.dm.at + djb2(b.dm.text), dm: b.dm };
+      const prev = msgs[i - 1];
+      const grouped = !!(prev && !prev.sys && !prev.dm && prev.who === b.who);
+      return { key: djb2(b.who + "|" + b.t + "|" + b.body.join("\n").trim()) + (grouped ? "g" : ""), b, grouped };
+    });
+  }
+  // entrance animation only for keys that appear after first paint
+  const fresh = new Set();
+  if (!first.current) items.forEach(it => { if (!known.current.has(it.key)) fresh.add(it.key); });
+  useLayoutEffect(() => {
+    items.forEach(it => known.current.add(it.key));
+    const was = store.wasBottom || first.current;
+    if (s.doc) first.current = false;
+    if (was) stick(false);
+  });
+
+  return html`<div id="log">
+    <div id="rows">
+      ${!s.doc && html`<${Skeleton}/>`}
+      ${s.doc && !items.length && html`<div class="empty"><b>Quiet in here</b><span>type <code>@name</code> to address an agent — their next turn picks it up</span></div>`}
+      ${items.map(it =>
+        it.sys ? html`<div key=${it.key} class=${"sys" + (fresh.has(it.key) ? " enter" : "")}>${it.sys}</div>`
+        : it.dm ? html`<${DmRow} key=${it.key} dm=${it.dm} to=${s.dmWith}/>`
+        : html`<${Row} key=${it.key} b=${it.b} grouped=${it.grouped} enter=${fresh.has(it.key)}/>`)}
+    </div>
+    <div id="pend">
+      ${s.pending.map(p => html`<div key=${p.at + p.text.slice(0, 20)} class="row pending"><${Av} n=${s.me} trigger=${false}/><div class="bubble">
+        <div class="hd"><span class="who" style=${{ color: nameColor(s.me) }}>${s.me}</span><span class="ts">sending…</span></div>
+        <div class="bd" dangerouslySetInnerHTML=${{ __html: fmt(p.text) }}></div>
+      </div></div>`)}
+      ${s.notices.map(n => html`<div key=${n.at + n.text.slice(0, 12)} class="sys" style=${n.err ? "color:var(--err)" : ""}>${n.text}</div>`)}
+    </div>
+  </div>`;
+}
+
+function Composer() {
+  const s = useStore();
+  const ta = useRef(), hl = useRef(), fpick = useRef();
+  const [val, setVal] = useState("");
+  const [ac, setAc] = useState(null); // {kind, start, items, sel}
+  const roster = (s.doc?.roster || []).map(m => m.name);
+  const filesList = s.doc?.files || [];
+
+  const syncHl = v => {
+    if (!hl.current) return;
+    let t = esc(v);
+    t = t.replace(/(^|[\s(])@([a-zA-Z0-9_-]+)/g, (m, p, n) => `${p}<b style="color:${colorFor(n)}">@${n}</b>`);
+    hl.current.innerHTML = t + "<br>";
+    if (ta.current) hl.current.scrollTop = ta.current.scrollTop;
+  };
+  const autosize = () => { const t = ta.current; if (!t) return; t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight, 120) + "px"; };
+  useLayoutEffect(() => { syncHl(val); autosize(); }, [val]);
+
+  const activeToken = () => {
+    const t = ta.current, c = t.selectionStart, before = t.value.slice(0, c);
+    const m = before.match(/(^|[\s])([@>])([a-zA-Z0-9_./-]*)$/);
+    return m ? { kind: m[2], q: m[3], start: c - m[3].length - 1 } : null;
+  };
+  const updateAc = () => {
+    const t = activeToken();
+    if (!t) { setAc(null); return; }
+    const q = t.q.toLowerCase();
+    const items = t.kind === "@"
+      ? ["all", ...roster.filter(n => n !== s.me)].filter(n => n.toLowerCase().startsWith(q)).slice(0, 12)
+      : filesList.filter(f => f.toLowerCase().includes(q)).slice(0, 12);
+    setAc(items.length ? { kind: t.kind, start: t.start, items, sel: 0 } : null);
+  };
+  const applyAc = a => {
+    if (!a || !a.items.length) return;
+    const pick = a.items[a.sel];
+    const ins = (a.kind === "@" ? "@" + pick : pick) + " ";
+    const t = ta.current;
+    const nv = t.value.slice(0, a.start) + ins + t.value.slice(t.selectionStart);
+    setVal(nv); setAc(null);
+    requestAnimationFrame(() => { const pos = a.start + ins.length; t.setSelectionRange(pos, pos); t.focus(); });
+  };
+  const doSend = async () => {
+    const text = val.trim(); if (!text) return;
+    setVal(""); setAc(null);
+    const res = await sendText(text);
+    if (!res.ok) setVal(res.text);   // restore so the send isn't lost
+  };
+  const onKey = e => {
+    if (ac) {
+      if (e.key === "ArrowDown") { e.preventDefault(); setAc({ ...ac, sel: (ac.sel + 1) % ac.items.length }); return; }
+      if (e.key === "ArrowUp") { e.preventDefault(); setAc({ ...ac, sel: (ac.sel - 1 + ac.items.length) % ac.items.length }); return; }
+      if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) { e.preventDefault(); applyAc(ac); return; }
+      if (e.key === "Escape") { e.preventDefault(); setAc(null); return; }
+    }
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); doSend(); }
+  };
+  const atClick = () => {
+    const t = ta.current, c = t.selectionStart, before = t.value.slice(0, c);
+    const pre = (before && !/[\s(]$/.test(before)) ? " @" : "@";
+    setVal(before + pre + t.value.slice(t.selectionEnd));
+    requestAnimationFrame(() => { const pos = c + pre.length; t.setSelectionRange(pos, pos); t.focus(); updateAc(); });
+  };
+
+  return html`<div id="cwrap">
+    ${ac && html`<div id="ac" class="show">
+      <div class="ac-list">
+        ${ac.items.map((it, i) => ac.kind === "@"
+          ? html`<div key=${it} class=${"ac-item" + (i === ac.sel ? " sel" : "")} onMouseDown=${e => { e.preventDefault(); applyAc({ ...ac, sel: i }); }}>
+              ${it === "all"
+                ? html`<span class="aav" style="background:var(--teal-soft);color:var(--teal)">@</span>`
+                : html`<${Av} n=${it} cls="aav" trigger=${false}/>`}
+              <span class="anm">@${it}</span>
+              ${it !== "all" && html`<span class="adot" style=${{ background: liveState(it) === "working" ? "#2ea043" : liveState(it) === "dnd" ? "#d29922" : liveState(it) === "offline" ? "#4b5563" : "#3fb950" }}></span>`}
+              <span class="sub">${it === "all" ? "everyone" : ((s.doc?.roster || []).find(m => m.name === it) || {}).adapter || ""}</span>
+            </div>`
+          : html`<div key=${it} class=${"ac-item" + (i === ac.sel ? " sel" : "")} onMouseDown=${e => { e.preventDefault(); applyAc({ ...ac, sel: i }); }}><span class="fico">›</span><span class="anm">${it}</span></div>`)}
+      </div>
+      <div class="ac-hint"><span><b>↑↓</b> navigate</span><span><b>tab</b> select</span><span><b>esc</b> dismiss</span></div>
+    </div>`}
+    <div id="composer">
+      <button id="atbtn" aria-label="mention an agent" title="mention" onClick=${atClick}>@</button>
+      <button id="attbtn" aria-label="attach a file" title="attach → .stitchpad/dropbox" onClick=${() => fpick.current.click()}>
+        <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M20.5 11.5 12.7 19.3a5.25 5.25 0 0 1-7.42-7.42l8.13-8.13a3.5 3.5 0 0 1 4.95 4.95l-8.13 8.13a1.75 1.75 0 0 1-2.47-2.48l7.42-7.42" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+      <input type="file" ref=${fpick} multiple hidden onChange=${e => { uploadFiles([...e.target.files]); e.target.value = ""; }}/>
+      <div id="edwrap">
+        <div id="hl" ref=${hl} aria-hidden="true"></div>
+        <textarea id="text" ref=${ta} rows="1" placeholder="Message…" value=${val}
+          onInput=${e => { setVal(e.target.value); requestAnimationFrame(updateAc); }}
+          onClick=${updateAc} onKeyDown=${onKey}
+          onScroll=${() => hl.current && (hl.current.scrollTop = ta.current.scrollTop)}
+          onBlur=${() => setTimeout(() => setAc(null), 150)}
+          onFocus=${() => setTimeout(() => { if (nearBottom()) stick(); }, 350)}></textarea>
+      </div>
+      <button id="send" aria-label="send" disabled=${!val.trim()} onClick=${doSend}>
+        <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M4.4 11.05 19.3 4.24c.9-.41 1.83.52 1.42 1.42l-6.81 14.9c-.44.96-1.85.84-2.12-.18l-1.44-5.46a1.15 1.15 0 0 0-.82-.82l-5.46-1.44c-1.02-.27-1.14-1.68-.18-2.12Z" fill="currentColor"/></svg>
+      </button>
+    </div>
+    <div class="tags">${s.dmWith ? "DMs go straight to @" + s.dmWith + "'s terminal session — the pad never sees them" : "you are @" + s.me + " · type @name to address agents"}</div>
+  </div>`;
+}
+
+function App() {
+  const s = useStore();
+  const [drawer, setDrawer] = useState(false);
+  useEffect(() => { document.body.classList.toggle("drawer", drawer); }, [drawer]);
+  useEffect(() => { const f = () => setDrawer(false); window.addEventListener("sp:closedrawer", f); return () => window.removeEventListener("sp:closedrawer", f); }, []);
+  if (!s.authed) return html`<${Login}/>`;
+  const members = (s.doc?.roster || []).length;
+  return html`<div id="app">
+    <div id="side"><div class="ws"><${LOGO}/></div></div>
+    <${Sidebar} drawer=${drawer} setDrawer=${setDrawer}/>
+    <div id="main">
+      <div id="top">
+        <button id="hamb" aria-label="channels" onClick=${() => setDrawer(!drawer)}>☰</button>
+        <span class="name">${s.dmWith ? "@" + s.dmWith : "# " + (s.pad || "…")}</span>
+        <span class="meta">${s.doc ? (s.dmWith ? "direct → their terminal" : members + " members") : ""}</span>
+      </div>
+      <${StatusBar}/>
+      <${ClaimBar}/>
+      <${Log}/>
+      <${Composer}/>
+    </div>
+  </div>`;
+}
+
+// ── boot ─────────────────────────────────────────────────────
+render(html`<${App}/>`, document.getElementById("root"));
+document.getElementById("scrim").addEventListener("click", () => window.dispatchEvent(new Event("sp:closedrawer")));
+
+const INVITE = new URLSearchParams(location.search).get("invite");
+if (INVITE) redeemInvite(INVITE); else if (store.token) startApp();
+if ("serviceWorker" in navigator) navigator.serviceWorker.getRegistrations().then(rs => rs.forEach(r => r.unregister()));
+
+// KEYBOARD-AWARE VIEWPORT (iOS): size the shell to the real visible height,
+// compensate the standalone-mode layout shove, keep the log glued to bottom.
+if (window.visualViewport) {
+  const vv = window.visualViewport; let vvT = null;
+  const applyVV = () => {
+    const was = nearBottom();
+    document.documentElement.style.setProperty("--vvh", Math.round(vv.height) + "px");
+    const app = document.getElementById("app");
+    if (app) app.style.transform = vv.offsetTop > 1 ? `translateY(${Math.round(vv.offsetTop)}px)` : "";
+    window.scrollTo(0, 0);
+    if (was) requestAnimationFrame(() => stick());
+  };
+  vv.addEventListener("resize", () => { clearTimeout(vvT); vvT = setTimeout(applyVV, 16); });
+  vv.addEventListener("scroll", () => { clearTimeout(vvT); vvT = setTimeout(applyVV, 16); });
+}
+
+// delegated: copy buttons (rows + code blocks) — operate on rendered DOM
+document.addEventListener("click", e => {
+  const rb = e.target.closest(".row-cpy");
+  if (rb) {
+    const text = decodeURIComponent(escape(atob(rb.dataset.copy || "")));
+    navigator.clipboard.writeText(text).then(() => { rb.textContent = "copied"; rb.classList.add("done"); setTimeout(() => { rb.textContent = "copy"; rb.classList.remove("done"); }, 1400); });
+    return;
+  }
+  const b = e.target.closest(".cpy");
+  if (b && b.parentElement.querySelector("pre")) {
+    const code = b.parentElement.querySelector("pre").innerText;
+    navigator.clipboard.writeText(code).then(() => { b.textContent = "copied"; b.classList.add("done"); setTimeout(() => { b.textContent = "copy"; b.classList.remove("done"); }, 1400); });
+  }
+});
+// images loading in can grow the log after we stuck to bottom — re-stick
+document.addEventListener("load", e => { if (e.target.tagName === "IMG" && e.target.closest("#log") && nearBottom()) stick(); }, true);
+
+// ── agent cards (imperative popover, same as before) ─────────
+const cardEl = document.getElementById("card"), cardBack = document.getElementById("cardback");
+function agentCard(name) {
+  const info = ((store.doc?.roster) || []).find(m => m.name === name) || {};
+  const prof = profiles()[name] || {};
+  const col = colorFor(name), ink = initInk(name);
+  const harness = prof.harness || info.adapter || "—";
+  const model = prof.model || "—";
+  const role = prof.role || "";
+  const level = prof.level || "";
+  const skills = Array.isArray(prof.skills) ? prof.skills : [];
+  const ctx = prof.context || "";
+  const pfp = `<div class="pfp" style="background:${col};color:${ink}"><img src="avatars/${encodeURIComponent(name)}.png" alt="" onerror="this.remove()">${initials(name)}</div>`;
+  const chips = [level ? `<span class="chip">${esc(level)}</span>` : "", harness !== "—" ? `<span class="chip">${esc(harness)}</span>` : "", model !== "—" ? `<span class="chip">${esc(model)}</span>` : "", ctx ? `<span class="chip">${esc(ctx)}</span>` : ""].join("");
+  const full = `<div class="full">` +
+    (role ? `<div class="sec"><h4>Role</h4>${esc(role)}</div>` : "") +
+    (prof.persona ? `<div class="sec"><h4>Persona</h4><div class="persona">${esc(prof.persona)}</div></div>` : "") +
+    (skills.length ? `<div class="sec"><h4>Skills</h4>${skills.map(sk => `<div class="skill"><b>${esc(sk.name || sk)}</b>${sk.desc ? " — " + esc(sk.desc) : ""}</div>`).join("")}</div>` : "") +
+    (!role && !prof.persona && !skills.length ? `<div class="sec" style="color:var(--dim)">Full profile not pushed yet (bridge \`profiles\` blob pending).</div>` : "") +
+    `</div>`;
+  return `<div class="top" style="background:${col}"></div><div class="body">` + pfp +
+    `<div class="nm" style="color:${nameColor(name)}">@${esc(name)}</div>` +
+    (role ? `<div class="role">${esc(role)}</div>` : "") +
+    (chips ? `<div class="meta">${chips}</div>` : "") + full +
+    `<button class="exp">View full profile ▾</button></div>`;
+}
+function openCard(name, x, y) {
+  cardEl.innerHTML = agentCard(name);
+  cardEl.classList.remove("expanded");
+  cardEl.classList.add("show"); cardBack.classList.add("show");
+  const r = cardEl.getBoundingClientRect();
+  cardEl.style.left = Math.max(12, Math.min(x, window.innerWidth - r.width - 12)) + "px";
+  cardEl.style.top = Math.max(12, Math.min(y, window.innerHeight - r.height - 12)) + "px";
+}
+function closeCard() { cardEl.classList.remove("show", "expanded"); cardBack.classList.remove("show"); }
+cardBack.onclick = closeCard;
+cardEl.addEventListener("click", e => { if (e.target.closest(".exp")) cardEl.classList.add("expanded"); });
+document.addEventListener("click", e => {
+  const t = e.target.closest(".card-trigger"); if (!t || !t.dataset.agent) return;
+  e.stopPropagation();
+  openCard(t.dataset.agent, e.clientX + 8, e.clientY + 8);
+});

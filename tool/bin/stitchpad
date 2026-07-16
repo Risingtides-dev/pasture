@@ -41,8 +41,8 @@ sp_autostart_name() {
     cat "$PAD_STATE/sessions/$STITCHPAD_SESSION" 2>/dev/null
     return 0
   fi
-  if [ -n "${KITTY_WINDOW_ID:-}" ]; then
-    sp_roster | awk -F'|' -v w="$KITTY_WINDOW_ID" '
+  if [ -n "${VELOCITY_SURFACE_ID:-}" ]; then
+    sp_roster | awk -F'|' -v w="$VELOCITY_SURFACE_ID" '
       { gsub(/^[ \t]+|[ \t]+$/, "", $1); gsub(/^[ \t]+|[ \t]+$/, "", $4)
         n=$4; sub(/.*@@/, "", n)
         if (n == w) { print $1; exit } }'
@@ -296,37 +296,26 @@ EOF
       printf '%s' "$_model" > "$PAD_STATE/model.$nm"
       echo "✓ model for @$nm: $_model"
     fi
-    # Auto-capture this kitty window as the wake target if we're in one and the
-    # roster target is still empty. Runs in the agent's process, so it sees the
-    # window env even when the MCP join didn't pass it through (the codex case).
-    if [ -n "${KITTY_LISTEN_ON:-}" ] && [ -n "${KITTY_WINDOW_ID:-}" ]; then
-      _kitty="$(command -v kitty || echo kitty)"
+    # Auto-capture this Velocity surface as the wake target if we're in one and
+    # the roster target is still empty.
+    if [ -n "${VELOCITY_SURFACE_ID:-}" ] && [ -n "${VELOCITY_TAB_ID:-}" ]; then
       cur="$(sp_user_field "$nm" target)"
       if [ -z "$cur" ] || [ "$cur" = "-" ]; then
         # We already hold the pad lock from the outer join transaction.
         # Re-entering sp_lock here would self-deadlock and skip target capture.
-        tgt="${KITTY_LISTEN_ON}@@${KITTY_WINDOW_ID}"
+        tgt="${VELOCITY_WORKTREE_ID:-}@@${VELOCITY_TAB_ID}@@${VELOCITY_SURFACE_ID}"
         tmp="$(mktemp)"
         awk -v who="$nm" -v tgt="$tgt" '
           /^```roster/ { inblk=1; print; next }
           inblk && /^```/ { inblk=0; print; next }
           inblk && tolower($1)==tolower(who"") {
-            print who " | kitty | push | " tgt; next
+            print who " | velocity | push | " tgt; next
           }
           { print }
         ' "$PAD_MD" > "$tmp" && mv "$tmp" "$PAD_MD"
-        sp_commit "roster: @$nm kitty target captured"
+        sp_commit "roster: @$nm velocity target captured"
         sp_unlock
-        echo "✓ captured kitty target for @$nm ($tgt)"
-      fi
-      # Force window title + background color to the roster identity on EVERY bind,
-      # so terminal-bg == roster color, 1:1, no drift. Color is the single source
-      # (`stitchpad color`); title carries the 🧵 <name> the self-heal looks for.
-      "$_kitty" @ --to "$KITTY_LISTEN_ON" set-window-title --match "id:$KITTY_WINDOW_ID" "🧵 $nm" 2>/dev/null || true
-      _bg="$("$BIN_DIR/stitchpad" color "$nm" 2>/dev/null)"
-      if [ -n "$_bg" ]; then
-        "$_kitty" @ --to "$KITTY_LISTEN_ON" set-colors --match "id:$KITTY_WINDOW_ID" "background=$_bg" 2>/dev/null \
-          && echo "✓ window color for @$nm → $_bg"
+        echo "✓ captured Velocity target for @$nm ($tgt)"
       fi
     fi
     STITCHPAD_NAME="$nm" STITCHPAD_HEARTBEAT_PARENT_PID="${STITCHPAD_HEARTBEAT_PARENT_PID:-$PPID}" \
@@ -520,11 +509,11 @@ EOF
     sub="${1:-start}"; shift || true
 
     heartbeat_write() {
-      local who="$1" pid="$2" parent="$3" session="$4" kitty_window="$5" target="$6"
+      local who="$1" pid="$2" parent="$3" session="$4" surface="$5" target="$6"
       local alive="$PAD_STATE/alive.$who" tmp="$PAD_STATE/.alive.$who.$$"
-      python3 - "$who" "$pid" "$parent" "$session" "$kitty_window" "$target" > "$tmp" <<'PY'
+      python3 - "$who" "$pid" "$parent" "$session" "$surface" "$target" > "$tmp" <<'PY'
 import json, sys, time
-name, pid, parent, session, kitty_window, target = sys.argv[1:7]
+name, pid, parent, session, surface, target = sys.argv[1:7]
 def num(v):
     try:
         return int(v)
@@ -536,7 +525,7 @@ print(json.dumps({
     "pid": num(pid),
     "parentPid": num(parent),
     "session": session,
-    "kittyWindow": kitty_window,
+    "surface": surface,
     "target": target,
 }, separators=(",", ":")))
 PY
@@ -549,13 +538,6 @@ PY
       pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("pid",""))' "$alive" 2>/dev/null || true)"
       [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
       printf '%s\n' "$pid"
-    }
-
-    heartbeat_kitty_alive() {
-      local sock="$1" win="$2"
-      [ -n "$sock" ] && [ -n "$win" ] || return 0
-      command -v kitty >/dev/null 2>&1 || return 0
-      kitty @ --to "$sock" ls 2>/dev/null | grep -q "\"id\"[[:space:]]*:[[:space:]]*$win\\>"
     }
 
     case "$sub" in
@@ -582,15 +564,15 @@ PY
         fi
         parent="${STITCHPAD_HEARTBEAT_PARENT_PID:-$PPID}"
         session="${STITCHPAD_SESSION:-}"
-        kitty_window="${KITTY_WINDOW_ID:-}"
-        kitty_sock="${KITTY_LISTEN_ON:-${KITTY_SOCKET:-}}"
-        target="${kitty_sock:+$kitty_sock@@$kitty_window}"
+        surface="${VELOCITY_SURFACE_ID:-}"
+        target=""
+        if [ -n "$surface" ] && [ -n "${VELOCITY_TAB_ID:-}" ]; then
+          target="${VELOCITY_WORKTREE_ID:-}@@${VELOCITY_TAB_ID}@@$surface"
+        fi
         roster_target="$(sp_user_field "$who" target 2>/dev/null || true)"
-        if { [ -z "$kitty_sock" ] || [ -z "$kitty_window" ]; } \
-          && [ -n "$roster_target" ] && [ "$roster_target" != "-" ] \
-          && [ "${roster_target#*@@}" != "$roster_target" ]; then
-          kitty_sock="${roster_target%@@*}"
-          kitty_window="${roster_target##*@@}"
+        if [ -z "$surface" ] \
+          && [ -n "$roster_target" ] && [ "$roster_target" != "-" ]; then
+          surface="${roster_target##*@@}"
           target="$roster_target"
           [ -z "${STITCHPAD_HEARTBEAT_PARENT_PID:-}" ] && parent=""
         fi
@@ -599,12 +581,11 @@ PY
           echo "$ticker_pid" > "$lockd/pid"
           trap 'rm -rf "$lockd"; rm -f "$PAD_STATE/alive.$STITCHPAD_NAME"' EXIT INT TERM
           while :; do
-            heartbeat_write "$STITCHPAD_NAME" "$ticker_pid" "$parent" "$session" "$kitty_window" "$target"
+            heartbeat_write "$STITCHPAD_NAME" "$ticker_pid" "$parent" "$session" "$surface" "$target"
             "$BIN_DIR/stitchpad" ensure-watcher >/dev/null 2>&1 || true
             sleep "$interval" &
             wait $! || exit 0
             [ -n "$parent" ] && ! kill -0 "$parent" 2>/dev/null && exit 0
-            heartbeat_kitty_alive "$kitty_sock" "$kitty_window" || exit 0
           done
         ) &
         disown
@@ -618,7 +599,12 @@ PY
           pid="$(heartbeat_existing_pid "$who" 2>/dev/null || true)"
         fi
         [ -n "$pid" ] || pid="$BASHPID"
-        heartbeat_write "$who" "$pid" "${STITCHPAD_HEARTBEAT_PARENT_PID:-$PPID}" "${STITCHPAD_SESSION:-}" "${KITTY_WINDOW_ID:-}" "${KITTY_LISTEN_ON:-${KITTY_SOCKET:-}}"
+        _surface="${VELOCITY_SURFACE_ID:-}"
+        _target=""
+        if [ -n "$_surface" ] && [ -n "${VELOCITY_TAB_ID:-}" ]; then
+          _target="${VELOCITY_WORKTREE_ID:-}@@${VELOCITY_TAB_ID}@@$_surface"
+        fi
+        heartbeat_write "$who" "$pid" "${STITCHPAD_HEARTBEAT_PARENT_PID:-$PPID}" "${STITCHPAD_SESSION:-}" "$_surface" "$_target"
         ;;
       --stop|stop)
         who="${1:-$(sp_me)}"
@@ -833,6 +819,15 @@ except Exception:
     [ -n "$_sender" ] || _sender="$who"
     _snip="$(printf '%s\n' "$_latest" | grep -v '^## ' | grep -v '^[[:space:]]*$' | head -1 | sed 's/^[[:space:]]*//' | cut -c1-120)"
     printf 'stitchpad: NEW from @%s — %s — reply with @%s (read .stitchpad/stitchpad.md for full context)\n' "$_sender" "$_snip" "$_sender"
+    # TASKS-IN-WAKE: append the woken agent's open tickets so status upkeep happens
+    # at the exact moment they're already engaging with the pad — no human nagging.
+    # Relay mode has no local pad tasks; skip there.
+    if [ "$relay_mode" -eq 0 ]; then
+      _open="$(sp_tasks --mine "$who" 2>/dev/null | awk -F'|' '$3=="todo"||$3=="in_progress"||$3=="in_review" {printf "%s[%s] %s · ", $1, $3, $2}')"
+      if [ -n "$_open" ]; then
+        printf 'your open tasks: %s— move each with the task tool (in_progress when you start, done when finished), unprompted.\n' "$_open"
+      fi
+    fi
     [ "$peek" -eq 0 ] && printf '%s' "$last_mention_to_me" > "$seen_file"   # mark delivered
     exit 0
     ;;
@@ -1101,7 +1096,7 @@ except: print("")' 2>/dev/null)"
     # Collision-aware color assignment for a roster member.
     #   stitchpad color <name>   prints the RGB hex for <name>
     #   stitchpad color --all    prints all members and their colors
-    # Single source of truth: kitty windows + TUI both shell out to this.
+    # Single source of truth: terminal surfaces and the TUI both shell out to this.
     sp_init_paths || exit 1
 
     # FIXED 1:1 color map — explicit, maximally distinct, no hash, no drift.
@@ -1117,6 +1112,14 @@ except: print("")' 2>/dev/null)"
       [mark]='#ffd700'     # yellow
       [nancy]='#00ffff'    # cyan
       [henry]='#1e90ff'    # blue — remote writer (Eric's machine)
+      # harness agents: brand-matched, not palette neon — mirrors their logos
+      [codex]='#a8a3ff'        # OpenAI codex periwinkle (mark gradient)
+      [fable]='#d97757'        # Anthropic coral (starburst tile)
+      [claude]='#d97757'       # Anthropic coral
+      [claude-main]='#c96442'  # Anthropic coral, deeper (distinct from fable)
+      [pi]='#aeb8c4'           # pi monochrome silver
+      [ocean]='#38bdf8'        # ocean waves blue (distinct from brand teal)
+      [deepseek]='#4d6bfe'     # deepseek brand blue
     )
 
     # 20-color palette (256-index → hex). Used when no override exists.
@@ -1184,8 +1187,8 @@ except: print("")' 2>/dev/null)"
 
   doctor)
     # Roster health check — read-only diagnostic, no mutations.
-    # Reports: untargeted entries, stale kitty targets, missing session identity,
-    # duplicate names, orphaned session files.
+    # Reports: untargeted push entries, missing adapter scripts, missing pull
+    # session identity, duplicate names, orphaned session files.
     #   stitchpad doctor
     #   stitchpad doctor --json   machine-readable roster array for TUI/widgets
     sp_init_paths || exit 1
@@ -1227,62 +1230,34 @@ except: print("")' 2>/dev/null)"
         continue
       fi
 
-      # Check 1: untargeted
-      if [ "$_target" = "-" ] || [ -z "$_target" ]; then
+      # Check 1: push adapters require an external target. Pull adapters wake
+      # through their bound runtime session and intentionally use target '-'.
+      if [ "$_wake" != "pull" ] && { [ "$_target" = "-" ] || [ -z "$_target" ]; }; then
         issues+=("target '-' (no wake target, unreachable)")
         (( warn++ ))
       fi
 
-      # Check 2: stale kitty target (with timeout)
-      if [ "$_adapter" = "kitty" ] && [ "$_target" != "-" ] && [ -n "$_target" ]; then
-        # Extract socket from target (format: unix:/path/to/socket@@window_id)
-        _sock="${_target%%@@*}"; _win="${_target##*@@}"
-        # Strip unix: prefix if present (kitty @ --to expects just the path)
-        _sock="${_sock#unix:}"
-        if [ -n "$_sock" ] && [ -n "$_win" ]; then
-          # Try to reach the socket first (2s timeout)
-          _ls_out=$(timeout 2 /Applications/kitty.app/Contents/MacOS/kitty @ --to "unix:$_sock" ls 2>/dev/null || true)
-          if [ -n "_ls_out" ]; then
-            # Socket reachable — extract window IDs from tabs[].groups[].windows[]
-            _win_ids=$(printf '%s' "$_ls_out" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-for os_win in data:
-    for tab in os_win.get('tabs', []):
-        for grp in tab.get('groups', []):
-            for wid in grp.get('windows', []):
-                print(wid)
-" 2>/dev/null || true)
-            if ! printf '%s' "$_win_ids" | grep -q "^$_win$"; then
-              issues+=("stale target — kitty window $_win gone from socket $_sock")
-              (( err++ ))
-            fi
-          else
-            # Socket unreachable/timeout → unknown, not dead
-            issues+=("kitty socket unreachable (unknown status for window $_win)")
-            (( warn++ ))
-          fi
-        fi
+      # Check 2: adapter is installed. Avoid a hard-coded allowlist so a real
+      # adapter such as herdr becomes diagnosable as soon as its script lands.
+      if [ ! -f "$ADAPTER_DIR/$_adapter.sh" ]; then
+        issues+=("missing adapter script '$_adapter.sh'")
+        (( err++ ))
       fi
 
       # Check 3: missing session identity (read-only)
-      if [ "$_adapter" != "kitty" ] || [ "$_target" != "-" ]; then
-        # Look for session file matching this name
-        _found_session=0
-        for _sf in "$PAD_STATE/sessions/"*; do
-          [ -f "$_sf" ] || continue
-          if [ "$(cat "$_sf" 2>/dev/null)" = "$_name" ]; then
-            _found_session=1; break
-          fi
-        done
-        # Also check whoami
-        if [ "$(cat "$PAD_STATE/whoami" 2>/dev/null)" = "$_name" ]; then
-          _found_session=1
+      _found_session=0
+      for _sf in "$PAD_STATE/sessions/"*; do
+        [ -f "$_sf" ] || continue
+        if [ "$(cat "$_sf" 2>/dev/null)" = "$_name" ]; then
+          _found_session=1; break
         fi
-        if [ "$_found_session" -eq 0 ]; then
-          issues+=("no session identity file")
-          (( warn++ ))
-        fi
+      done
+      if [ "$(cat "$PAD_STATE/whoami" 2>/dev/null)" = "$_name" ]; then
+        _found_session=1
+      fi
+      if [ "$_wake" = "pull" ] && [ "$_found_session" -eq 0 ]; then
+        issues+=("no session identity file")
+        (( warn++ ))
       fi
 
       # Check 4: duplicates (count occurrences)
@@ -1297,15 +1272,7 @@ for os_win in data:
         (( err++ ))
       fi
 
-      # Detect harness (runtime + model) from kitty window
       _harness=""
-      if [ "$_adapter" = "kitty" ] && [ "$_target" != "-" ] && [ -n "$_target" ]; then
-        _sock="${_target%%@@*}"; _win="${_target##*@@}"
-        _sock="${_sock#unix:}"
-        if [ -n "$_sock" ] && [ -n "$_win" ]; then
-          _harness="$("$STITCHPAD_HOME/bin/stitchpad-harness" "unix:$_sock" "$_win" 2>/dev/null || echo "unknown")"
-        fi
-      fi
 
       # Compute online from heartbeat freshness + pid liveness
       _online="offline"
@@ -1507,9 +1474,8 @@ for os_win in data:
     ;;
 
   migration-check)
-    # 4-point migration verifier: confirms an agent is safe to migrate from
-    # kitty to Supacode. All 4 gates must pass (green) before migration is
-    # declared proven. Any red → revert to kitty.
+    # 4-point Velocity reachability verifier. All 4 gates must pass before a
+    # member is considered reachable.
     #   stitchpad migration-check <name>
     sp_init_paths || exit 1
     _mc_pilot="${1:-}"
@@ -1524,8 +1490,8 @@ for os_win in data:
     echo "stitchpad migration-check — verifying @$_mc_pilot"
     echo ""
 
-    # Gate 1: doctor confirms supacode target
-    echo -n "  [1/4] supacode target .......... "
+    # Gate 1: doctor confirms Velocity target
+    echo -n "  [1/4] Velocity target .......... "
     _mc_doctor_out="$("$0" doctor --json 2>/dev/null || true)"
     if echo "$_mc_doctor_out" | python3 -c "
 import json, sys
@@ -1534,20 +1500,20 @@ for m in data:
     if m.get('name') == '$_mc_pilot':
         t = m.get('target', '')
         a = m.get('adapter', '')
-        if a == 'supacode' and t and t != '-':
+        if a == 'velocity' and t and t != '-':
             print('OK')
             sys.exit(0)
 print('FAIL')
 sys.exit(1)
 " 2>/dev/null; then
-      echo "${_mc_green}PASS${_mc_reset} — supacode target validated"
+      echo "${_mc_green}PASS${_mc_reset} — Velocity target validated"
       (( _mc_pass++ ))
     else
-      echo "${_mc_red}FAIL${_mc_reset} — not supacode or no target"
+      echo "${_mc_red}FAIL${_mc_reset} — not velocity or no target"
       (( _mc_fail++ ))
     fi
 
-    # Gate 2: recent heartbeat from supacode
+    # Gate 2: recent heartbeat from the agent process
     echo -n "  [2/4] heartbeat ................ "
     _mc_alive_file="$PAD_STATE/alive.$_mc_pilot"
     if [ -f "$_mc_alive_file" ]; then
@@ -1626,7 +1592,7 @@ sys.exit(1)
       echo "${_mc_green}ALL 4 GATES PASSED — @$_mc_pilot migration proven.${_mc_reset}"
       exit 0
     else
-      echo "${_mc_red}$_mc_fail/$(( _mc_pass + _mc_fail )) GATES FAILED — revert @$_mc_pilot to kitty.${_mc_reset}"
+      echo "${_mc_red}$_mc_fail/$(( _mc_pass + _mc_fail )) GATES FAILED — @$_mc_pilot is not reachable.${_mc_reset}"
       exit 1
     fi
     ;;
