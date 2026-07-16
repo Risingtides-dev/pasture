@@ -61,6 +61,7 @@ const store = {
   dmWith: localStorage.getItem("sp_dm") || "",
   pads: [], doc: null, blocks: null, pending: [], notices: [], dmlogs: {},
   summary: null, summaryOpen: false, summarizing: false,
+  dmView: "chat", terms: {},
   wasBottom: true, authed: false, loginErr: "",
 };
 const subs = new Set();
@@ -146,6 +147,11 @@ function connectWS() {
     let m; try { m = JSON.parse(e.data); } catch (_) { return; }
     if (m.type === "pad" && m.data && myPad === store.pad) acceptDoc(m.data);
     if (m.type === "dm" && m.msg && myPad === store.pad) pushDm(m.msg);
+    if (m.type === "term" && m.data && myPad === store.pad) {
+      const stickAfter = nearBottom() && store.dmWith === m.data.agent;
+      store.terms = { ...store.terms, [m.data.agent]: m.data }; publish();
+      if (stickAfter) requestAnimationFrame(() => stick());
+    }
     if (m.type === "summary" && m.data && myPad === store.pad) {
       store.summary = m.data; store.summaryOpen = true; store.summarizing = false; publish();
       // notify even if he's off in another app — that's the point of the button
@@ -171,11 +177,12 @@ function stopPolling() { clearInterval(pollTimer); clearInterval(padsTimer); pol
 function restartPolling() { stopPolling(); startPolling(); }
 document.addEventListener("visibilitychange", () => {
   if (!store.authed) return;
-  if (document.hidden) { stopPolling(); wsClose(); }
-  else { poll(); loadPads(); startPolling(); connectWS(); }
+  if (document.hidden) { stopPolling(); wsClose(); stopTermPoll(); }
+  else { poll(); loadPads(); startPolling(); connectWS(); if (store.dmWith) startTermPoll(); }
 });
 function switchPad(name) {
-  store.pad = name; store.dmWith = ""; store.doc = null; store.blocks = null; store.pending = []; store.notices = []; store.dmlogs = {};
+  store.pad = name; store.dmWith = ""; store.doc = null; store.blocks = null; store.pending = []; store.notices = []; store.dmlogs = {}; store.terms = {};
+  stopTermPoll();
   PAD_ETAG = "";
   localStorage.removeItem("sp_dm"); localStorage.setItem("sp_pad", name);
   publish(); poll(); loadPads(); connectWS();
@@ -189,18 +196,29 @@ async function loadDmLog(peer) {
 function pushDm(msg) {
   const peer = (msg.from || "").toLowerCase() === store.me.toLowerCase() ? msg.to : msg.from;
   const cur = store.dmlogs[peer] || [];
-  if (cur.some(m => m.at === msg.at && m.from === msg.from && m.text === msg.text)) return;   // ws echo of our optimistic add
+  // the ws echo carries the SERVER timestamp — dedupe on from+text within a
+  // 15s window (not exact at), else the optimistic add doubles on screen
+  if (cur.some(m => m.from === msg.from && m.text === msg.text && Math.abs((m.at || 0) - (msg.at || 0)) < 15000)) return;
   store.dmlogs = { ...store.dmlogs, [peer]: [...cur, msg].slice(-200) };
   publish();
   if (store.dmWith === peer) requestAnimationFrame(() => stick(true));
 }
-function openDM(n) { store.dmWith = n; localStorage.setItem("sp_dm", n); store.notices = []; publish(); loadDmLog(n); }
-function closeDM() { store.dmWith = ""; localStorage.removeItem("sp_dm"); store.notices = []; publish(); }
+// the DM pane content is the agent's terminal SESSION chat — ask the bridge to
+// re-read the session transcript every 5s while a DM is open and visible
+let termTimer = null;
+async function requestTerm() {
+  if (!store.dmWith || document.hidden) return;
+  api("/term?pad=" + encodeURIComponent(store.pad), { method: "POST", body: JSON.stringify({ agent: store.dmWith }) }).catch(() => {});
+}
+function startTermPoll() { stopTermPoll(); requestTerm(); termTimer = setInterval(requestTerm, 5000); }
+function stopTermPoll() { clearInterval(termTimer); termTimer = null; }
+function openDM(n) { store.dmWith = n; localStorage.setItem("sp_dm", n); store.notices = []; publish(); loadDmLog(n); startTermPoll(); }
+function closeDM() { store.dmWith = ""; localStorage.removeItem("sp_dm"); store.notices = []; stopTermPoll(); publish(); }
 function startApp() {
   store.authed = true;
   store.dmWith = localStorage.getItem("sp_dm") || "";
   publish(); loadPads(); poll(); startPolling(); connectWS();
-  if (store.dmWith) loadDmLog(store.dmWith);
+  if (store.dmWith) { loadDmLog(store.dmWith); startTermPoll(); }
 }
 async function doLogin(user, pass) {
   store.loginErr = ""; publish();
@@ -401,10 +419,21 @@ function Row({ b, grouped, enter }) {
 function DmRow({ dm }) {
   const mine = (dm.from || "").toLowerCase() === store.me.toLowerCase();
   const t = new Date(dm.at), hh = String(t.getHours()).padStart(2, "0"), mm = String(t.getMinutes()).padStart(2, "0");
-  const ts = mine ? `${hh}:${mm} → @${dm.to}'s terminal` : `${hh}:${mm} · from their terminal`;
   return html`<div class=${"row" + (mine ? " dmrow" : "")}><${Av} n=${dm.from} trigger=${!mine}/><div class="bubble">
-    <div class="hd"><span class=${"who" + (mine ? "" : " card-trigger")} data-agent=${dm.from} style=${{ color: nameColor(dm.from) }}>${dm.from}</span><span class="ts dmts">${ts}</span></div>
+    <div class="hd"><span class=${"who" + (mine ? "" : " card-trigger")} data-agent=${dm.from} style=${{ color: nameColor(dm.from) }}>${dm.from}</span><span class="ts">${hh}:${mm}</span></div>
     <div class="bd" dangerouslySetInnerHTML=${{ __html: fmt(dm.text) }}></div>
+  </div></div>`;
+}
+
+// one turn of the agent's terminal session, rendered as a normal chat bubble:
+// your injected messages on the teal tint, the agent's session replies plain
+function SessRow({ m, agent }) {
+  const mine = m.role === "user";
+  const who = mine ? store.me : agent;
+  const t = new Date(m.at), hh = String(t.getHours()).padStart(2, "0"), mm = String(t.getMinutes()).padStart(2, "0");
+  return html`<div class=${"row" + (mine ? " dmrow" : "")}><${Av} n=${who} trigger=${!mine}/><div class="bubble">
+    <div class="hd"><span class=${"who" + (mine ? "" : " card-trigger")} data-agent=${who} style=${{ color: nameColor(who) }}>${who}</span><span class="ts">${hh}:${mm}</span></div>
+    <div class="bd" dangerouslySetInnerHTML=${{ __html: fmt(m.text) }}></div>
   </div></div>`;
 }
 
@@ -420,9 +449,15 @@ function Log() {
 
   let items = [];
   if (s.dmWith) {
-    // DM pane = the TERMINAL log (per-pair DM history from the relay), not the
-    // old pad-filtered thread. Both directions render; live via ws {type:"dm"}.
-    items = (s.dmlogs[s.dmWith] || []).map(m => ({ key: "d" + m.at + djb2((m.from || "") + (m.text || "")), dm: m }));
+    // DM pane = the agent's terminal SESSION chat (your injected messages +
+    // their replies from that session), same bubbles as everywhere else.
+    // Non-claude harnesses have no readable transcript → fall back to the DM log.
+    const t = s.terms[s.dmWith];
+    if (t && Array.isArray(t.msgs)) {
+      items = t.msgs.map(m => ({ key: "x" + m.at + djb2((m.role || "") + (m.text || "").slice(0, 60)), sess: m }));
+    } else {
+      items = (s.dmlogs[s.dmWith] || []).map(m => ({ key: "d" + m.at + djb2((m.from || "") + (m.text || "")), dm: m }));
+    }
   } else if (s.blocks) {
     const msgs = s.blocks;
     items = msgs.map((b, i) => {
@@ -435,7 +470,7 @@ function Log() {
   // entrance animation only for keys that appear after first paint
   const fresh = new Set();
   if (!first.current) items.forEach(it => { if (!known.current.has(it.key)) fresh.add(it.key); });
-  const loaded = s.dmWith ? s.dmlogs[s.dmWith] !== undefined : !!s.blocks;
+  const loaded = s.dmWith ? (s.terms[s.dmWith] !== undefined || s.dmlogs[s.dmWith] !== undefined) : !!s.blocks;
   useLayoutEffect(() => {
     items.forEach(it => known.current.add(it.key));
     // NEVER steal focus: scroll only on the view's first paint, or when the
@@ -449,11 +484,10 @@ function Log() {
   return html`<div id="log">
     <div id="rows">
       ${!loaded && html`<${Skeleton}/>`}
-      ${loaded && !items.length && (s.dmWith
-        ? html`<div class="empty"><b>No DMs yet</b><span>messages here go straight to @${s.dmWith}'s terminal — the pad never sees them</span></div>`
-        : html`<div class="empty"><b>Quiet in here</b><span>type <code>@name</code> to address an agent — their next turn picks it up</span></div>`)}
+      ${loaded && !items.length && !s.dmWith && html`<div class="empty"><b>Quiet in here</b><span>type <code>@name</code> to address an agent — their next turn picks it up</span></div>`}
       ${items.map(it =>
         it.sys ? html`<div key=${it.key} class=${"sys" + (fresh.has(it.key) ? " enter" : "")}>${it.sys}</div>`
+        : it.sess ? html`<${SessRow} key=${it.key} m=${it.sess} agent=${s.dmWith}/>`
         : it.dm ? html`<${DmRow} key=${it.key} dm=${it.dm}/>`
         : html`<${Row} key=${it.key} b=${it.b} grouped=${it.grouped} enter=${fresh.has(it.key)}/>`)}
     </div>
@@ -565,7 +599,7 @@ function Composer() {
         <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M4.4 11.05 19.3 4.24c.9-.41 1.83.52 1.42 1.42l-6.81 14.9c-.44.96-1.85.84-2.12-.18l-1.44-5.46a1.15 1.15 0 0 0-.82-.82l-5.46-1.44c-1.02-.27-1.14-1.68-.18-2.12Z" fill="currentColor"/></svg>
       </button>
     </div>
-    <div class="tags">${s.dmWith ? "DMs go straight to @" + s.dmWith + "'s terminal session — the pad never sees them" : "you are @" + s.me + " · type @name to address agents"}</div>
+    ${!s.dmWith && html`<div class="tags">you are @${s.me} · type @name to address agents</div>`}
   </div>`;
 }
 
@@ -583,7 +617,7 @@ function App() {
       <div id="top">
         <button id="hamb" aria-label="channels" onClick=${() => setDrawer(!drawer)}>☰</button>
         <span class="name">${s.dmWith ? "@" + s.dmWith : "# " + (s.pad || "…")}</span>
-        <span class="meta">${s.doc ? (s.dmWith ? "direct → their terminal" : members + " members") : ""}</span>
+        ${!s.dmWith && html`<span class="meta">${s.doc ? members + " members" : ""}</span>`}
         ${!s.dmWith && html`<button id="sumbtn" title="summarize this thread" disabled=${s.summarizing} onClick=${requestSummary}>${s.summarizing ? "…" : "✨"}<span class="lbl">${s.summarizing ? "summarizing" : "summarize"}</span></button>`}
       </div>
       <${StatusBar}/>

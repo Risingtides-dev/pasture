@@ -11,7 +11,7 @@
 //
 //   STITCHPAD_RELAY=... STITCHPAD_TOKEN=... node bridge-ws.mjs [roots...]
 import { execFile, spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, watch, writeFileSync, readFileSync, truncateSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, watch, writeFileSync, readFileSync, readdirSync, truncateSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import os from "node:os";
@@ -73,25 +73,84 @@ async function onSay(p, msg) {
   pushPad(p, "say"); // echo lands on phones immediately, not next sweep
 }
 
+// resolve an agent's live herdr pane: roster herdr target, else the terminal
+// its HEARTBEAT records (pull-mode agents live somewhere too)
+async function resolvePane(p, name) {
+  const { stdout: roster } = await sh(SP, ["roster"], { cwd: p.proj });
+  const row = roster.split("\n").find(l => l.split("|")[0] === name);
+  let [, adapter, , target] = (row || "").split("|");
+  if (adapter !== "herdr" || !target || target === "-") {
+    try {
+      const hb = JSON.parse(readFileSync(join(p.padd, ".state", "alive." + name), "utf8"));
+      if (hb.surface) { adapter = "herdr"; target = hb.surface; }
+    } catch {}
+  }
+  if (adapter !== "herdr" || !target || target === "-") return null;
+  const { stdout: info } = await sh(HERDR, ["agent", "get", target]);
+  return (info.match(/"pane_id"\s*:\s*"([^"]*)"/) || [])[1] || null;
+}
+
+// DM pane content: the agent's TERMINAL SESSION rendered as chat — the
+// operator's injected messages (user turns) and the agent's replies (assistant
+// turns), read from the harness session transcript. Claude Code writes
+// ~/.claude/projects/<proj-slug>/<session-id>.jsonl; the freshest session
+// bound to this agent name in .state/sessions is the live one.
+function sessionTranscript(p, agent) {
+  const sdir = join(p.padd, ".state", "sessions");
+  let best = null;
+  try {
+    for (const f of readdirSync(sdir)) {
+      try {
+        if (readFileSync(join(sdir, f), "utf8").trim() !== agent) continue;
+        const t = join(HOME, ".claude", "projects", p.proj.replaceAll("/", "-"), f + ".jsonl");
+        if (!existsSync(t)) continue;
+        const m = statSync(t).mtimeMs;
+        if (!best || m > best.m) best = { t, m };
+      } catch {}
+    }
+  } catch {}
+  return best?.t || null;
+}
+function parseTranscript(file) {
+  const msgs = [];
+  for (const line of readFileSync(file, "utf8").split("\n")) {
+    if (!line.trim()) continue;
+    let e; try { e = JSON.parse(line); } catch { continue; }
+    if (e.isMeta || !e.message) continue;
+    const at = e.timestamp ? Date.parse(e.timestamp) : 0;
+    const c = e.message.content;
+    if (e.type === "user") {
+      // only real typed/injected text — skip tool results and harness noise
+      const text = typeof c === "string" ? c : (Array.isArray(c) ? c.filter(b => b.type === "text").map(b => b.text).join("\n") : "");
+      if (!text || text.startsWith("<") || text.startsWith("Caveat:")) continue;
+      msgs.push({ role: "user", text: text.slice(0, 4000), at });
+    } else if (e.type === "assistant") {
+      const text = Array.isArray(c) ? c.filter(b => b.type === "text").map(b => b.text).join("\n") : "";
+      if (!text.trim()) continue;
+      // consecutive assistant chunks of one turn → merge
+      const last = msgs[msgs.length - 1];
+      if (last && last.role === "assistant" && at - last.at < 120000) last.text = (last.text + "\n\n" + text).slice(0, 8000);
+      else msgs.push({ role: "assistant", text: text.slice(0, 8000), at });
+    }
+  }
+  return msgs.slice(-60);
+}
+async function onTerm(p, msg) {
+  const agent = msg.agent; if (!agent) return;
+  let out = { agent, msgs: null, error: "", at: Date.now() };
+  const file = sessionTranscript(p, agent);
+  if (file) { try { out.msgs = parseTranscript(file); } catch (e) { out.error = "transcript parse failed: " + e.message; } }
+  else out.error = "no session transcript for @" + agent + " (non-claude harness or session not bound)";
+  const r = await api(`/term-in?pad=${encodeURIComponent(p.name)}`, { method: "POST", body: JSON.stringify(out) }).catch(e => ({ ok: false, statusText: e.message }));
+  log(p.name, `session-chat @${agent}: ${out.error || (out.msgs?.length + " msgs")} → posted ${r.ok ? "ok" : "FAILED " + (r.status || r.statusText)}`);
+}
+
 async function onDm(p, msg) {
   const { from, to, text } = msg;
   if (!to || !text) return;
   let delivered = false;
-  const { stdout: roster } = await sh(SP, ["roster"], { cwd: p.proj });
-  const row = roster.split("\n").find(l => l.split("|")[0] === to);
-  let [, adapter, , target] = (row || "").split("|");
-  // pull-mode agents (claude/codex) have no herdr target in the roster, but
-  // their HEARTBEAT records the terminal they live in — DM there instead of
-  // falling back to a pad mention (which defeats the whole point of a DM).
-  if (adapter !== "herdr" || !target || target === "-") {
-    try {
-      const hb = JSON.parse(readFileSync(join(p.padd, ".state", "alive." + to), "utf8"));
-      if (hb.surface) { adapter = "herdr"; target = hb.surface; }
-    } catch {}
-  }
-  if (adapter === "herdr" && target && target !== "-") {
-    const { stdout: info } = await sh(HERDR, ["agent", "get", target]);
-    const pane = (info.match(/"pane_id"\s*:\s*"([^"]*)"/) || [])[1];
+  const pane = await resolvePane(p, to);
+  {
     if (pane) {
       const dmsg = `stitchpad DM from @${from} (private — not on the pad; reply lands on the pad unless they DM you back): ${text}`
         .replace(/[\x00-\x1f\x7f]/g, " ").replace(/ +/g, " ");
@@ -131,6 +190,7 @@ function connect(p) {
     else if (m.type === "dm") await onDm(p, m.msg || {});
     else if (m.type === "file") await onFile(p, m.msg || {});
     else if (m.type === "summarize") summarize(p, m.msg || {});   // async, don't block the socket
+    else if (m.type === "term") onTerm(p, m.msg || {});           // live terminal capture
   };
   ws.onclose = () => { if (p.ws !== ws || p.closed) return; p.ws = null; setTimeout(() => connect(p), Math.min(30000, 1000 * 2 ** (p.tries++))); };
   ws.onerror = () => { try { ws.close(); } catch {} };

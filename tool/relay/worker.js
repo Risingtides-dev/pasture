@@ -107,6 +107,12 @@ export class PadHub {
         this.broadcast("client", JSON.stringify({ type: "summary", pad, data: msg }));
         return json({ delivered: true });
       }
+      // bridge posting back a terminal capture → store + fan out
+      if (kind === "term-in") {
+        await this.ctx.storage.put("term:" + msg.agent, msg);
+        this.broadcast("client", JSON.stringify({ type: "term", pad, data: msg }));
+        return json({ delivered: true });
+      }
       const bridges = this.ctx.getWebSockets("bridge");
       if (!bridges.length) return json({ delivered: false });
       const s = JSON.stringify({ type: kind, pad, msg });
@@ -122,6 +128,10 @@ export class PadHub {
     // last stored thread summary
     if (url.pathname === "/summary" && req.method === "GET") {
       return json((await this.ctx.storage.get("summary")) || null);
+    }
+    // last stored terminal capture for ?agent=
+    if (url.pathname === "/term" && req.method === "GET") {
+      return json((await this.ctx.storage.get("term:" + (url.searchParams.get("agent") || ""))) || null);
     }
 
     return json({ error: "not found" }, 404);
@@ -186,7 +196,7 @@ export default {
     }
 
     // Non-API paths → serve the PWA static assets (index.html, manifest).
-    const API = ["/login", "/join-request", "/invite", "/pads", "/pad", "/pad.colors", "/push", "/say", "/outbox", "/dm", "/dmbox", "/dm-in", "/dmlog", "/summarize", "/summary-in", "/summary", "/upload-image", "/upload-file", "/filebox", "/ws"];
+    const API = ["/login", "/join-request", "/invite", "/pads", "/pad", "/pad.colors", "/push", "/say", "/outbox", "/dm", "/dmbox", "/dm-in", "/dmlog", "/summarize", "/summary-in", "/summary", "/term", "/term-in", "/upload-image", "/upload-file", "/filebox", "/ws"];
     if (!API.includes(url.pathname) && !url.pathname.startsWith("/img/") && !url.pathname.startsWith("/f/")) {
       return env.ASSETS ? env.ASSETS.fetch(req) : json({ error: "no assets" }, 404);
     }
@@ -235,7 +245,7 @@ export default {
     if (!pad) return json({ error: "missing ?pad=NAME" }, 400);
 
     // realtime hot path → the pad's Durable Object
-    if (url.pathname === "/ws" || url.pathname === "/push" || url.pathname === "/pad" || url.pathname === "/pad.colors" || url.pathname === "/dmlog" || url.pathname === "/summary") {
+    if (url.pathname === "/ws" || url.pathname === "/push" || url.pathname === "/pad" || url.pathname === "/pad.colors" || url.pathname === "/dmlog" || url.pathname === "/summary" || (url.pathname === "/term" && req.method === "GET")) {
       return hub(env, pad).fetch(req);
     }
     // agent → human DM (bridge forwards `stitchpad dm` output): record + broadcast
@@ -243,6 +253,20 @@ export default {
       const { from, to, text, at } = await req.json();
       if (!from || !to || !text) return json({ error: "need from + to + text" }, 400);
       await tryDeliver(env, pad, "dm-in", { from, to, text, at: at || Date.now() });
+      return json({ ok: true });
+    }
+    // terminal-view request (PWA) → bridge captures the agent's pane, posts back
+    if (url.pathname === "/term" && req.method === "POST") {
+      const { agent } = await req.json().catch(() => ({}));
+      if (!agent) return json({ error: "need agent" }, 400);
+      const ok = await tryDeliver(env, pad, "term", { agent, at: Date.now() });
+      return json(ok ? { ok: true } : { ok: false, error: "bridge offline" }, ok ? 200 : 503);
+    }
+    // bridge posts the session-chat capture here
+    if (url.pathname === "/term-in" && req.method === "POST") {
+      const { agent, msgs, error, at } = await req.json();
+      if (!agent) return json({ error: "need agent" }, 400);
+      await tryDeliver(env, pad, "term-in", { agent, msgs: msgs || null, error: error || "", at: at || Date.now() });
       return json({ ok: true });
     }
     // summarize request (PWA) → bridge runs the local summarizer and posts back
