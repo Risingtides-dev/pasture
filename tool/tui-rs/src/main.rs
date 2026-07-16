@@ -2,10 +2,14 @@ mod color;
 mod widgets;
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
+        KeyModifiers, MouseButton, MouseEventKind,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use ratatui::layout::Rect;
 use notify::{RecursiveMode, Watcher};
 use ratatui::{
     Terminal,
@@ -32,6 +36,13 @@ struct App {
     detail_open: bool,
     watcher_alive: bool,
     flash: Option<(String, std::time::Instant)>,
+    /// Inner rect of the messages panel from the last draw — mouse events route
+    /// by hit-testing against this (drag-select, wheel scroll).
+    msg_inner: Rect,
+    /// Header tab labels' clickable column ranges from the last draw.
+    tab_hits: [(u16, u16); 2],
+    /// Live mouse drag anchor (inner-relative row), while the left button is down.
+    drag_anchor: Option<u16>,
 }
 
 impl App {
@@ -49,14 +60,14 @@ impl App {
 fn main() -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     // Restore the terminal even on panic — a raw-mode corpse is the worst UX.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
         default_hook(info);
     }));
 
@@ -69,6 +80,9 @@ fn main() -> io::Result<()> {
         detail_open: false,
         watcher_alive: RosterRail::watcher_alive(),
         flash: None,
+        msg_inner: Rect::default(),
+        tab_hits: [(0, 0); 2],
+        drag_anchor: None,
     };
 
     // Live-tail: watch .stitchpad/ and re-read pad-derived views on change.
@@ -156,7 +170,12 @@ fn main() -> io::Result<()> {
                 ),
                 Span::raw("   "),
             ];
+            // running display column for click hit-testing (" ⛵ " renders 4 cells)
+            let mut col: u16 = 4 + pad_name.chars().count() as u16 + 3;
             for (i, label) in ["Chat", "Tasks"].iter().enumerate() {
+                let w = label.chars().count() as u16 + 2; // " label "
+                app.tab_hits[i] = (col, col + w - 1);
+                col += w + 1; // + separator space
                 if i as u8 == app.tab {
                     header.push(Span::styled(
                         format!(" {} ", label),
@@ -206,16 +225,25 @@ fn main() -> io::Result<()> {
             } else {
                 // Floor plan: below 90 cols the agents rail folds away and the
                 // conversation takes the full width (still fine at 80×24).
-                if main_row.width >= 90 {
+                let msg_rect = if main_row.width >= 90 {
                     let cols = Layout::default()
                         .direction(Direction::Horizontal)
                         .constraints([Constraint::Min(40), Constraint::Length(26)])
                         .split(main_row);
                     f.render_widget(&messages, cols[0]);
                     f.render_widget(&roster, cols[1]);
+                    cols[0]
                 } else {
                     f.render_widget(&messages, main_row);
-                }
+                    main_row
+                };
+                // inner rect (inside the border) for mouse hit-testing
+                app.msg_inner = Rect {
+                    x: msg_rect.x + 1,
+                    y: msg_rect.y + 1,
+                    width: msg_rect.width.saturating_sub(2),
+                    height: msg_rect.height.saturating_sub(2),
+                };
 
                 // ── Prompt: ALWAYS live. Type → Enter sends. ────────────
                 if let Some(area) = input_row {
@@ -254,7 +282,7 @@ fn main() -> io::Result<()> {
             } else if app.tab == 1 {
                 "j/k:nav  Enter:detail  ]/[:move  d:done  x:cancel  1/^T:chat  q:quit".to_string()
             } else {
-                "Enter:send  Tab:@complete  ↑↓/PgUp:scroll  ^Y:copy convo  ^T:tasks  ^R:refresh  ^C:quit"
+                "Enter:send  Tab:@complete  drag:copy sel  ^Y:copy convo  wheel/↑↓:scroll  ^T:tasks  ^C:quit"
                     .to_string()
             };
             f.render_widget(Paragraph::new(footer_text).style(dim), footer_row);
@@ -262,7 +290,88 @@ fn main() -> io::Result<()> {
 
         // ── Input ────────────────────────────────────────────────────────
         if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
+            match event::read()? {
+                Event::Mouse(me) => {
+                    let inside_msgs = app.tab == 0
+                        && me.column >= app.msg_inner.x
+                        && me.column < app.msg_inner.x + app.msg_inner.width
+                        && me.row >= app.msg_inner.y
+                        && me.row < app.msg_inner.y + app.msg_inner.height;
+                    match me.kind {
+                        MouseEventKind::ScrollUp => {
+                            if app.tab == 0 {
+                                messages.scroll_up();
+                            } else {
+                                board.previous();
+                            }
+                        }
+                        MouseEventKind::ScrollDown => {
+                            if app.tab == 0 {
+                                messages.scroll_down();
+                            } else {
+                                board.next();
+                            }
+                        }
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            if me.row == 0 {
+                                // header tab click
+                                for (i, (x0, x1)) in app.tab_hits.iter().enumerate() {
+                                    if me.column >= *x0 && me.column <= *x1 {
+                                        app.tab = i as u8;
+                                        app.detail_open = false;
+                                    }
+                                }
+                            } else if inside_msgs {
+                                // start a drag-selection at this visible row
+                                let row = me.row - app.msg_inner.y;
+                                app.drag_anchor = Some(row);
+                                messages.selection = Some((row, row));
+                            } else {
+                                app.drag_anchor = None;
+                                messages.selection = None;
+                            }
+                        }
+                        MouseEventKind::Drag(MouseButton::Left) => {
+                            if let Some(anchor) = app.drag_anchor {
+                                if app.tab == 0 && app.msg_inner.height > 0 {
+                                    let row = me
+                                        .row
+                                        .clamp(
+                                            app.msg_inner.y,
+                                            app.msg_inner.y + app.msg_inner.height - 1,
+                                        )
+                                        - app.msg_inner.y;
+                                    messages.selection = Some((anchor, row));
+                                }
+                            }
+                        }
+                        MouseEventKind::Up(MouseButton::Left) => {
+                            if let (Some(_), Some((a, b))) =
+                                (app.drag_anchor.take(), messages.selection)
+                            {
+                                // a plain click (no movement) just clears; a real drag copies
+                                if a != b {
+                                    let text = messages.selected_text(
+                                        app.msg_inner.width,
+                                        app.msg_inner.height,
+                                        a,
+                                        b,
+                                    );
+                                    match copy_text(&text) {
+                                        Ok(()) => app.flash(format!(
+                                            "copied {} lines to clipboard",
+                                            a.abs_diff(b) + 1
+                                        )),
+                                        Err(e) => app.flash(format!("copy failed: {}", e)),
+                                    }
+                                }
+                                messages.selection = None;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Event::Key(key) => {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
@@ -390,12 +499,18 @@ fn main() -> io::Result<()> {
                     KeyCode::Char(c) => app.input.push(c),
                     _ => {}
                 }
+                }
+                _ => {}
             }
         }
     }
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }
@@ -434,6 +549,12 @@ fn copy_conversation(list: &widgets::messages::MessageList) -> Result<usize, Str
     if out.is_empty() {
         return Err("no messages".into());
     }
+    copy_text(&out)?;
+    Ok(list.messages.len())
+}
+
+/// Pipe text to the system clipboard (pbcopy on macOS; wl-copy/xclip fallbacks).
+fn copy_text(text: &str) -> Result<(), String> {
     let candidates: &[(&str, &[&str])] = &[
         ("pbcopy", &[]),
         ("wl-copy", &[]),
@@ -448,9 +569,9 @@ fn copy_conversation(list: &widgets::messages::MessageList) -> Result<usize, Str
             .spawn();
         if let Ok(mut child) = child {
             if let Some(stdin) = child.stdin.as_mut() {
-                if stdin.write_all(out.as_bytes()).is_ok() {
+                if stdin.write_all(text.as_bytes()).is_ok() {
                     let _ = child.wait();
-                    return Ok(list.messages.len());
+                    return Ok(());
                 }
             }
             let _ = child.wait();

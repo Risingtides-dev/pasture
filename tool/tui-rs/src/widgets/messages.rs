@@ -30,6 +30,9 @@ pub struct MessageList {
     /// When true, new messages keep us pinned to the bottom; any manual scroll-up
     /// turns it off so the view doesn't jump while you read history.
     pub follow: bool,
+    /// Mouse drag-selection over VISIBLE rows (relative to the panel's inner top,
+    /// inclusive, unordered — render/copy normalize). None = no selection.
+    pub selection: Option<(u16, u16)>,
 }
 
 impl MessageList {
@@ -39,7 +42,36 @@ impl MessageList {
             messages,
             scroll: 0,
             follow: true,
+            selection: None,
         }
+    }
+
+    /// Plain text of the visible rows `a..=b` (inner-relative, unordered) at the
+    /// given panel inner size — the drag-copy payload. Gutter/indent prefixes are
+    /// stripped so the clipboard gets message text, not box-drawing chrome.
+    pub fn selected_text(&self, width: u16, height: u16, a: u16, b: u16) -> String {
+        let all = self.rendered_lines(width);
+        let h = height as usize;
+        let total = all.len();
+        let bottom = total.saturating_sub(self.scroll as usize);
+        let start = bottom.saturating_sub(h);
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        let mut out = String::new();
+        for row in lo..=hi {
+            let idx = start + row as usize;
+            if idx >= total {
+                break;
+            }
+            let text: String = all[idx].spans.iter().map(|s| s.content.as_ref()).collect();
+            // strip the "▎ " gutter and the 2-space body indent when present
+            let stripped = text
+                .strip_prefix("▎ ")
+                .map(|t| t.strip_prefix("  ").unwrap_or(t))
+                .unwrap_or(&text);
+            out.push_str(stripped);
+            out.push('\n');
+        }
+        out
     }
 
     /// Re-read the pad. Called on a file-change event (live-tail) or manual refresh.
@@ -287,6 +319,21 @@ impl Widget for &MessageList {
         for (row, line) in all[start..end].iter().enumerate() {
             buf.set_line(inner.x, inner.y + row as u16, line, inner.width);
         }
+
+        // Drag-selection highlight: reverse the selected visible rows so the user
+        // sees exactly what mouse-up will copy.
+        if let Some((a, b)) = self.selection {
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            for row in lo..=hi.min(inner.height.saturating_sub(1)) {
+                let rect = Rect {
+                    x: inner.x,
+                    y: inner.y + row,
+                    width: inner.width,
+                    height: 1,
+                };
+                buf.set_style(rect, Style::default().add_modifier(Modifier::REVERSED));
+            }
+        }
     }
 }
 
@@ -469,6 +516,7 @@ mod tests {
             }],
             scroll: 0,
             follow: true,
+            selection: None,
         };
 
         let lines = list.rendered_lines(40);
