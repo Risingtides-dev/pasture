@@ -599,3 +599,10 @@ area:      [backend]
 
 DMs landed in the agent's input box but never submitted: the Enter from herdr pane run can fire before the TUI finishes ingesting the paste, parking the text. Bridge onDm now does what the wake adapter always did — wait 2s after injection and send one bare Enter (submits a parked message; no-op on an empty input). Verified live: DM to fable submitted into its queue.
 _________________________________________________________________________________
+time:      [15:09] [07-16-26]
+agent:     [claude] [fable 5]
+type:      [bug-report]
+area:      [backend]
+
+DMs to @ocean were landing in the operator's own terminal: ocean is a daemon-session agent (adapter ocean), not a terminal, and the DM router's heartbeat-surface fallback picked whatever terminal last started ocean's presence ticker — the surface-builder session. Bridge onDm now recognizes ocean-adapter roster rows and delivers the DM as a turn on the agent's daemon session (POST /v1/agent/turns with reply-via-stitchpad-dm instructions), falling back to the pane/pad path only if the daemon POST fails. Also killed the stale ticker that pinned the operator terminal as ocean's surface and cleaned the stale term→pi session binding. Verified live: DM → "ocean daemon turn" in bridge log, daemon accepted.
+_________________________________________________________________________________

@@ -157,10 +157,28 @@ async function onTerm(p, msg) {
 
 // commands that open interactive dialogs/pickers — dead ends from a phone
 const MODAL_CMDS = new Set(["status", "config", "permissions", "help", "doctor", "login", "logout", "exit", "quit", "vim", "hooks", "mcp", "agents", "resume", "theme", "terminal-setup", "install-github-app", "ide", "bug"]);
+const OCEAN_URL = process.env.OCEAN_DAEMON_URL || "http://127.0.0.1:4780";
 async function onDm(p, msg) {
   const { from, to, text } = msg;
   if (!to || !text) return;
   let delivered = false;
+  // OCEAN-ADAPTER agents live as daemon sessions, not terminals — deliver the
+  // DM as a turn on their session. (Without this, the heartbeat-surface
+  // fallback routed @ocean DMs into whatever terminal last started its
+  // heartbeat — the operator's own, in practice.)
+  try {
+    const { stdout: roster } = await sh(SP, ["roster"], { cwd: p.proj });
+    const row = (roster.split("\n").find(l => l.split("|")[0] === to) || "").split("|").map(s => (s || "").trim());
+    if (row[1] === "ocean" && row[3] && row[3] !== "-") {
+      const prompt = `stitchpad DM from @${from} (private — not on the pad): ${text}\n\nReply PRIVATELY (do not post on the pad) with:\n  cd ${p.proj} && STITCHPAD_NAME=${to} ~/.stitchpad/bin/stitchpad dm ${from} '<your reply>'`;
+      const r = await fetch(`${OCEAN_URL}/v1/agent/turns`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ session_id: row[3], prompt, cwd: p.proj, client_type: "stitchpad" }),
+      });
+      if (r.ok) { log(p.name, `DM @${from} → @${to} ocean daemon turn (${text.slice(0, 40)})`); return; }
+      log(p.name, `DM @${from} → @${to} daemon POST ${r.status} — falling back`);
+    }
+  } catch {}
   const pane = await resolvePane(p, to);
   {
     if (pane) {
