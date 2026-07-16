@@ -79,7 +79,16 @@ async function onDm(p, msg) {
   let delivered = false;
   const { stdout: roster } = await sh(SP, ["roster"], { cwd: p.proj });
   const row = roster.split("\n").find(l => l.split("|")[0] === to);
-  const [, adapter, , target] = (row || "").split("|");
+  let [, adapter, , target] = (row || "").split("|");
+  // pull-mode agents (claude/codex) have no herdr target in the roster, but
+  // their HEARTBEAT records the terminal they live in — DM there instead of
+  // falling back to a pad mention (which defeats the whole point of a DM).
+  if (adapter !== "herdr" || !target || target === "-") {
+    try {
+      const hb = JSON.parse(readFileSync(join(p.padd, ".state", "alive." + to), "utf8"));
+      if (hb.surface) { adapter = "herdr"; target = hb.surface; }
+    } catch {}
+  }
   if (adapter === "herdr" && target && target !== "-") {
     const { stdout: info } = await sh(HERDR, ["agent", "get", target]);
     const pane = (info.match(/"pane_id"\s*:\s*"([^"]*)"/) || [])[1];
