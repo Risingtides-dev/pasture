@@ -1,4 +1,4 @@
-// stitchpad ← pi extension (self-contained: tools + wake).
+// stitchpad ← pi extension (herdr-native; self-contained: tools + wake).
 //
 // earendil pi (@earendil-works/pi-coding-agent) has NO built-in MCP — by design
 // (usage.md: "intentionally does not include built-in MCP ... build or install
@@ -7,11 +7,19 @@
 //   - registers join/say/read/who/leave as native pi tools (pi.registerTool)
 //   - wakes at agent_end by draining the pad and steering messages in
 //
+// Wake transport is herdr (the terminal workspace manager hosting the pane):
+// join pins `herdr | push | $HERDR_PANE_ID` in the roster, and the watcher's
+// herdr.sh adapter injects the nudge from outside with `herdr pane run`
+// (text + Enter). Outside herdr there is no pane to poke → `pi | pull | -`,
+// and mentions deliver only at turn-end via drain() below.
+//
 // Identity: pi exposes no per-session id, so we use the pad-default identity
 // (.state/whoami, written by `join`). One pi per pad — that's correct, not a
 // collision. STITCHPAD_NAME overrides if you want to pin one.
 //
-// Install:  pi install <this-dir>     ·     One session:  pi -e <this-dir>/index.ts
+// Install (herdr-plugin style, beside herdr-agent-state.ts):
+//   cp index.ts ~/.pi/agent/extensions/stitchpad.ts
+// One session only:  pi -e <this-dir>/index.ts
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -31,7 +39,7 @@ function stitchpadBin(): string {
 export default function stitchpadExtension(pi: ExtensionAPI) {
   const bin = stitchpadBin();
   const pinned = process.env.STITCHPAD_NAME || "";
-  // Track the per-instance session key set during join (e.g. KITTY_WINDOW_ID).
+  // Track the per-instance session key set during join.
   // This lets sp_me() resolve via sessions/<key> instead of shared whoami.
   let sessionKey = "";
 
@@ -56,27 +64,23 @@ export default function stitchpadExtension(pi: ExtensionAPI) {
     description: "Join the stitchpad (shared agent chat for this project): pick your handle. Call once at startup. After joining, @your-name mentions wake you at turn-end.",
     parameters: Type.Object({ name: Type.String({ description: "Your handle, e.g. 'pi'." }) }),
     async execute(_id, params, _sig, _upd, ctx) {
-      // Capture this kitty window as the wake target (socket|window_id) so the
-      // watcher can kitty-wake this pi. We run inside pi = we see the env.
-      const sock = process.env.KITTY_LISTEN_ON || "";
-      const win = process.env.KITTY_WINDOW_ID || "";
-      const target = sock && win ? `${sock}@@${win}` : "-";   // @@ not | (roster is pipe-delimited)
-      if (sock && win) {
-        const k = "/Applications/kitty.app/Contents/MacOS/kitty";
-        await exec(k, ["@", "--to", sock, "set-window-title", "--match", `id:${win}`, `🧵 ${params.name}`]).catch(() => {});
-        await exec(k, ["@", "--to", sock, "set-tab-title", "--match", `id:${win}`, `🧵 ${params.name}`]).catch(() => {});
-      }
-      await sp(["join", params.name, "kitty", "push", target], ctx.cwd).catch(() => {});
+      const paneId = process.env.HERDR_ENV === "1" ? process.env.HERDR_PANE_ID || "" : "";
+      const adapter = paneId ? "herdr" : "pi";
+      const wake = paneId ? "push" : "pull";
+      const target = paneId || "-";
+      await sp(["join", params.name, adapter, wake, target], ctx.cwd).catch(() => {});
+      // join is a no-op when the row already exists — set-wake re-pins the live
+      // pane either way, so a restarted pi never wakes a dead target.
+      await sp(["set-wake", params.name, wake, target, adapter], ctx.cwd).catch(() => {});
       await sp(["meta", "set", params.name, "runtime", "pi"], ctx.cwd).catch(() => {});
       if (process.env.STITCHPAD_MODEL) {
         await sp(["meta", "set", params.name, "model", process.env.STITCHPAD_MODEL], ctx.cwd).catch(() => {});
       }
-      // Use KITTY_WINDOW_ID as session key (not shared "-") so multiple pi
-      // agents on the same pad each get their own identity in sessions/<winid>.
-      // Falls back to shared whoami only when no kitty window is available.
-      sessionKey = win || "-";
+      sessionKey = paneId || "-";
       await sp(["bind-session", sessionKey, params.name], ctx.cwd).catch(() => {});
-      return ok(`joined as @${params.name}${target === "-" ? " (no kitty window — external wake off)" : ""}. Reply with the stitchpad_say tool.`);
+      return ok(
+        `joined as @${params.name}${paneId ? "" : " (not in a herdr pane — push wake off; mentions deliver at turn-end)"}. Reply with the stitchpad_say tool.`
+      );
     },
   });
 

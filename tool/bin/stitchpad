@@ -179,6 +179,38 @@ EOF
       && echo "── wake watcher started for this pad ──"
     ;;
 
+  set-wake)
+    # Update an EXISTING roster row's wake mode + target (and optionally adapter).
+    # join exits early when the name is already present, so re-joins could never
+    # move an agent from pull|- to push|<pane>; this closes that gap.
+    #   stitchpad set-wake <name> <push|pull> <target> [adapter]
+    sp_init_paths || exit 1
+    who="${1:?usage: stitchpad set-wake <name> <push|pull> <target> [adapter]}"
+    wake="${2:?wake mode required (push|pull)}"
+    target="${3:--}"
+    adapter="${4:-}"
+    sp_user_exists "$who" || { echo "stitchpad: @$who not in roster" >&2; exit 1; }
+    sp_lock || exit 1
+    tmp="$(mktemp)"
+    awk -v who="$who" -v wake="$wake" -v target="$target" -v adapter="$adapter" '
+      /^```roster/ { inblk=1; print; next }
+      inblk && /^```/ { inblk=0; print; next }
+      inblk && $0 !~ /^[[:space:]]*#/ {
+        line=$0; sub(/^[[:space:]]+/, "", line)
+        n=split(line, f, /[[:space:]]*\|[[:space:]]*/)
+        if (n >= 2 && f[1] == who) {
+          a = (adapter != "") ? adapter : f[2]
+          print who " | " a " | " wake " | " target
+          next
+        }
+      }
+      { print }
+    ' "$PAD_MD" > "$tmp" && mv "$tmp" "$PAD_MD"
+    sp_commit "roster: ~ $who wake=$wake target=$target"
+    sp_unlock
+    echo "✓ $who wake=$wake target=$target${adapter:+ adapter=$adapter}"
+    ;;
+
   clear)
     # Wipe the conversation but KEEP the roster (and everyone's captured targets).
     # Rewrites stitchpad.md to just the header + roster block. One commit.
