@@ -59,10 +59,17 @@ export class PadHub {
       await this.ctx.storage.put("doc", doc);
       if (sig !== prevSig) {
         await this.ctx.storage.put("sig", sig);
-        // pads index (sidebar recency order) — only on real change, sparing KV
-        const idx = JSON.parse((await this.env.STITCHPAD.get("index")) || "{}");
-        idx[pad] = at; await this.env.STITCHPAD.put("index", JSON.stringify(idx));
+        // per-pad KV key — the old shared "index" key was a read-modify-write
+        // that concurrent pushes from different pads' DOs clobbered (pads
+        // vanished from the sidebar forever). One key per pad cannot race.
+        await this.env.STITCHPAD.put("pad:" + pad, "1", { metadata: { at } });
+        await this.ctx.storage.put("indexed2", true);
         this.broadcast("client", JSON.stringify({ type: "pad", data: doc }));
+      } else if (!(await this.ctx.storage.get("indexed2"))) {
+        // dormant pad whose content predates the per-pad index: an unchanged
+        // push must still register it once, or it can never appear
+        await this.env.STITCHPAD.put("pad:" + pad, "1", { metadata: { at } });
+        await this.ctx.storage.put("indexed2", true);
       }
       return json({ ok: true, changed: sig !== prevSig });
     }
@@ -248,9 +255,15 @@ export default {
       return json({ ok: true, revoked: rev });
     }
 
-    // list all pads (index maintained by PadHub on changed pushes)
+    // list all pads: per-pad KV keys (race-free), merged with the legacy
+    // shared "index" key for recency continuity
     if (url.pathname === "/pads" && req.method === "GET") {
       const idx = JSON.parse((await env.STITCHPAD.get("index")) || "{}");
+      const l = await env.STITCHPAD.list({ prefix: "pad:" });
+      for (const k of l.keys) {
+        const n = k.name.slice(4), at = (k.metadata && k.metadata.at) || 0;
+        if (!idx[n] || at > idx[n]) idx[n] = at;
+      }
       return json(Object.entries(idx).map(([name, at]) => ({ name, at })).sort((a, b) => b.at - a.at));
     }
     // Serve attached files from R2 (token-gated; no ?pad needed — key is global)

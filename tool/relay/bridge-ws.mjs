@@ -145,10 +145,20 @@ function parseTranscript(file) {
   }
   return msgs.slice(-60);
 }
+const TERM_SIG = {}; // "<pad>:<agent>" → transcript mtime:size at last post
 async function onTerm(p, msg) {
   const agent = msg.agent; if (!agent) return;
   let out = { agent, msgs: null, error: "", at: Date.now() };
   const file = sessionTranscript(p, agent);
+  // a phone pane polls this every few seconds — skip the reparse+repost when
+  // the transcript hasn't moved (initial pane load reads GET /term's stored copy)
+  if (file) {
+    try {
+      const st = statSync(file), sig = st.mtimeMs + ":" + st.size, key = p.name + ":" + agent;
+      if (TERM_SIG[key] === sig) return;
+      TERM_SIG[key] = sig;
+    } catch { /* stat raced a rotation — fall through and post */ }
+  }
   if (file) { try { out.msgs = parseTranscript(file); } catch (e) { out.error = "transcript parse failed: " + e.message; } }
   else out.error = "no session transcript for @" + agent + " (non-claude harness or session not bound)";
   const r = await api(`/term-in?pad=${encodeURIComponent(p.name)}`, { method: "POST", body: JSON.stringify(out) }).catch(e => ({ ok: false, statusText: e.message }));
@@ -457,6 +467,10 @@ setInterval(() => pads.forEach(healRoster), 60000);
 // so it revives tickers for roster seats with a wake target and re-ensures
 // the watcher every cycle.
 async function keepAlive(p) {
+  // dormant pads don't get revived tickers: a dead test pad's heartbeat could
+  // claim a vacant terminal lock and block deliveries in a live pad. Using a
+  // dormant pad again (any write) re-arms its keepalive automatically.
+  try { if (Date.now() - statSync(join(p.padd, "stitchpad.md")).mtimeMs > 7 * 86400e3) return; } catch { return; }
   let roster;
   try { roster = (await sh(SP, ["roster"], { cwd: p.proj })).stdout; } catch { return; }
   for (const line of roster.split("\n")) {
