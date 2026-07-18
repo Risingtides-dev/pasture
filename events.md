@@ -683,3 +683,10 @@ area:      [infra]
 
 Built `stitchpad reset [name]` after ocean-surface wakes wedged on zombie heartbeat tickers (evicted @pi's ticker aiming at a dead pane, a @pi-kimi ticker running from a stale binary copy). Targeted reset kills only pids the pad itself recorded (cross-pad safe), waits out exit traps so a dying ticker can't delete the replacement's alive file, clears the wake-once cursor, and restarts the heartbeat from the roster target. Full-pad sweep additionally scrubs ghost state for names no longer in the roster, drops orphaned session/autoname bindings and stale terminal locks, and ensures the watcher. Also renamed @thoth → @pi in ocean-surface via the rename primitive, and fixed doctor's bridge-heartbeat check (fractional-second ISO ts parsed as epoch 0, then UTC parsed as local — showed the bridge stale/negative when it was 6s fresh). Verified: planted-ghost sweep in a throwaway pad, live doctor now 0 issues with all four seats online.
 _________________________________________________________________________________
+time:      [20:27] [07-17-26]
+agent:     [claude] [fable 5]
+type:      [feature-request]
+area:      [infra]
+
+Rename now rewrites pad history too, per smaths: every @old in message headers, mentions, and presence lines becomes @new during `stitchpad rename`, so the md, TUI, and phone surface all show one continuous identity (they all render from stitchpad.md, so one in-place replace covers all three). Word-boundary safe (@thoth never matches @thothx), pure text swap so line count, message ordinals, and wake cursors stay valid; the "@old is now @new" system line posts after the rewrite so the announcement survives. Ran the one-off for the already-renamed ocean-surface pad: 245 @thoth refs → @pi, sole survivor is the announcement line kept historically accurate.
+_________________________________________________________________________________
