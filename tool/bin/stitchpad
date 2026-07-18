@@ -15,6 +15,8 @@
 #   stitchpad roster                      print parsed roster
 #   stitchpad rename <old> <new>          rename a member everywhere local state knows them
 #   stitchpad reset [name]                repair a wedged seat (or whole pad): zombie tickers, stale locks, wake cursors
+#   stitchpad compact [--keep N]          archive old transcript to sqlite, replace with rolling summary block
+#   stitchpad search <query> [-n N]       full-history search: live pad + compaction archive
 #   stitchpad who                         alias for roster
 #   stitchpad log [-n N]                  show recent history (git log)
 #
@@ -54,7 +56,7 @@ sp_autostart_name() {
 sp_maybe_start_heartbeat() {
   [ "${STITCHPAD_HEARTBEAT_AUTOSTART:-1}" = "0" ] && return 0
   case "$cmd" in
-    init|heartbeat|hook|bind-session|whoami|leave|stop|daemon|watch|migration-check|reset|help|-h|--help) return 0 ;;
+    init|heartbeat|hook|bind-session|whoami|leave|stop|daemon|watch|migration-check|reset|compact|help|-h|--help) return 0 ;;
   esac
   sp_init_paths >/dev/null 2>&1 || return 0
   local who
@@ -369,6 +371,119 @@ EOF
       echo "  · watcher ensured"
     fi
     echo "✓ reset done"
+    ;;
+
+  compact)
+    # Move the old transcript into .state/archive.sqlite and replace it with a
+    # ROLLING summary block. What survives in the pad: header+roster, the new
+    # cumulative summary, every OPEN ```task block, and the newest N messages
+    # verbatim. What moves to sqlite: the full pre-compact pad snapshot
+    # (generation-keyed — old `read --range A-B` cites replay exactly via
+    # `--gen G`) plus one row per archived message for `stitchpad search`.
+    # Cursor contract: message ordinals shrink, so seen.* wake cursors reset
+    # (a still-unanswered mention in the kept tail may re-fire once — correct,
+    # it IS unanswered) and readref.* jumps to the new HEAD so `read --new`
+    # doesn't dump the rewrite as a 400-line diff.
+    #   stitchpad compact [--keep N] [--summary-file F] [--no-llm]
+    sp_init_paths || exit 1
+    keep=150; sumfile=""; nollm=0
+    while [ $# -gt 0 ]; do case "$1" in
+      --keep) keep="${2:-150}"; shift 2 ;;
+      --summary-file) sumfile="${2:-}"; shift 2 ;;
+      --no-llm) nollm=1; shift ;;
+      *) shift ;;
+    esac; done
+    db="$PAD_STATE/archive.sqlite"
+    /usr/bin/sqlite3 "$db" "CREATE TABLE IF NOT EXISTS snapshots(gen INTEGER PRIMARY KEY, archived_at TEXT NOT NULL, msg_count INTEGER NOT NULL, full_text TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY AUTOINCREMENT, gen INTEGER NOT NULL, author TEXT, at_label TEXT, body TEXT);"
+    sp_lock || exit 1
+    head_end="$(awk '/^```roster/{r=1} r&&/^```$/&&!/^```roster/{print NR; exit}' "$PAD_MD")"
+    [ -n "$head_end" ] || { sp_unlock; echo "stitchpad: no roster block — refusing to compact" >&2; exit 1; }
+    msg_lines="$(awk -v h="$head_end" 'NR>h && /^## @/{print NR}' "$PAD_MD")"
+    msg_count="$(printf '%s\n' "$msg_lines" | grep -c . || true)"
+    if [ "$msg_count" -le "$keep" ]; then sp_unlock; echo "stitchpad: only $msg_count messages (keep=$keep) — nothing to compact"; exit 0; fi
+    cut_line="$(printf '%s\n' "$msg_lines" | tail -n "$keep" | head -1)"
+    arch_count=$(( msg_count - keep ))
+    gen=$(( $(/usr/bin/sqlite3 "$db" "SELECT COALESCE(MAX(gen),0) FROM snapshots;") + 1 ))
+    now_label="$(date '+%m-%d %H:%M')"
+    # archive: full snapshot + parsed message rows (python: quoting-safe inserts)
+    python3 - "$db" "$gen" "$PAD_MD" "$head_end" "$cut_line" <<'PY'
+import sqlite3, sys, re, datetime
+db, gen, pad, head_end, cut = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4]), int(sys.argv[5])
+text = open(pad, encoding="utf-8", errors="replace").read()
+lines = text.split("\n")
+span = lines[head_end:cut-1]
+con = sqlite3.connect(db)
+con.execute("INSERT INTO snapshots(gen, archived_at, msg_count, full_text) VALUES(?,?,?,?)",
+            (gen, datetime.datetime.now().isoformat(timespec="seconds"), 0, text))
+msgs = []; author = None; label = ""; buf = []
+for ln in span:
+    m = re.match(r"^## @(\S+)\s*·?\s*(.*)$", ln)
+    if m:
+        if author is not None: msgs.append((gen, author, label, "\n".join(buf).strip()))
+        author, label, buf = m.group(1), m.group(2), []
+    elif author is not None:
+        buf.append(ln)
+if author is not None: msgs.append((gen, author, label, "\n".join(buf).strip()))
+con.executemany("INSERT INTO messages(gen, author, at_label, body) VALUES(?,?,?,?)", msgs)
+con.execute("UPDATE snapshots SET msg_count=? WHERE gen=?", (len(msgs), gen))
+con.commit()
+PY
+    [ $? -eq 0 ] || { sp_unlock; echo "stitchpad: archive write failed — pad untouched" >&2; exit 1; }
+    prev_sum="$(awk '/^<!-- compact:/{f=1;next} /^<!-- \/compact -->/{f=0;next} f' "$PAD_MD")"
+    span_file="$(mktemp)"; sed -n "$((head_end+1)),$((cut_line-1))p" "$PAD_MD" > "$span_file"
+    # open ```task blocks from the archived span ride through the compaction
+    carried="$(mktemp)"
+    awk '
+      /^```task /   { ib=1; st="todo"; ex=0; blk=$0 "\n"; next }
+      ib && /^```$/ { blk=blk "```\n"; ib=0; if (st!="done" && st!="canceled" && !ex) printf "%s\n", blk; next }
+      ib            { if ($1=="status:") st=$2; if ($0 ~ /^title: example task$/) ex=1; blk=blk $0 "\n" }
+    ' "$span_file" > "$carried"
+    sum=""
+    if [ -n "$sumfile" ] && [ -f "$sumfile" ]; then sum="$(cat "$sumfile")"
+    elif [ "$nollm" -eq 0 ] && command -v claude >/dev/null 2>&1; then
+      sum="$( { printf 'PREVIOUS SUMMARY (may be empty):\n%s\n\nARCHIVED TRANSCRIPT:\n' "$prev_sum"; tail -n 3000 "$span_file"; } \
+        | claude -p "You are compacting a multi-agent coding pad. Merge the PREVIOUS SUMMARY with the ARCHIVED TRANSCRIPT into ONE cumulative summary, under 250 words: decisions made, work completed per agent, current state, open threads. Plain prose/bullets, no preamble. Respond with ONLY the summary." --model haiku 2>/dev/null | head -c 4000 )"
+    fi
+    if [ -z "$sum" ]; then
+      _auth="$(awk '/^## @/{a=$2; sub(/^@/,"",a); print a}' "$span_file" | sort | uniq -c | sort -rn | head -6 | awk '{printf "%s×%s ", $2, $1}')"
+      sum="(no LLM summary) archived $arch_count messages through $now_label — top authors: ${_auth:-n/a}"
+    fi
+    tmp="$(mktemp)"
+    {
+      sed -n "1,${head_end}p" "$PAD_MD"
+      printf '\n<!-- compact:gen=%s -->\n' "$gen"
+      printf '> 🗜 **compacted** · gen %s · %s messages archived through %s · old line-cites: `stitchpad read --range A-B --gen %s` · full-history search: `stitchpad search <query>`\n\n' "$gen" "$arch_count" "$now_label" "$gen"
+      printf '%s\n' "$sum"
+      printf '<!-- /compact -->\n'
+      if [ -s "$carried" ]; then printf '\n*open tasks carried through compaction:*\n\n'; cat "$carried"; fi
+      printf '\n'
+      sed -n "${cut_line},\$p" "$PAD_MD"
+    } > "$tmp" && mv "$tmp" "$PAD_MD"
+    rm -f "$PAD_STATE"/seen.* 2>/dev/null
+    sp_commit "compact: gen $gen — $arch_count msgs → archive (keep $keep)"
+    _h="$(sgit rev-parse HEAD 2>/dev/null || true)"
+    if [ -n "$_h" ]; then for _f in "$PAD_STATE"/readref.*; do [ -f "$_f" ] && printf '%s' "$_h" > "$_f"; done; fi
+    sp_unlock
+    rm -f "$span_file" "$carried"
+    echo "✓ compact gen $gen: $arch_count messages → archive.sqlite, kept $keep + open tasks + rolling summary"
+    ;;
+
+  search)
+    # Full-history search: live pad (line-numbered grep) + archived messages.
+    #   stitchpad search <query> [-n N]
+    sp_init_paths || exit 1
+    q="${1:?usage: stitchpad search <query> [-n N]}"; shift || true
+    n=20; [ "${1:-}" = "-n" ] && n="${2:-20}"
+    echo "— live pad —"
+    grep -in -- "$q" "$PAD_MD" | head -n "$n" || true
+    db="$PAD_STATE/archive.sqlite"
+    if [ -f "$db" ]; then
+      echo "— archive —"
+      qq="$(printf '%s' "$q" | sed "s/'/''/g")"
+      /usr/bin/sqlite3 -separator ' | ' "$db" \
+        "SELECT 'gen'||gen, at_label, '@'||author, substr(replace(body, char(10), ' '),1,160) FROM messages WHERE body LIKE '%$qq%' OR author LIKE '%$qq%' ORDER BY id DESC LIMIT $n;"
+    fi
     ;;
 
   clear)
@@ -910,10 +1025,16 @@ PY
     # --range A-B: chapter-style read of an exact line span (cheap permalink:
     # cite regions as [1443-1565] and anyone can pull just that slice)
     if [ "${1:-}" = "--range" ]; then
-      _r="${2:?usage: stitchpad read --range <start>-<end>}"
+      _r="${2:?usage: stitchpad read --range <start>-<end> [--gen G]}"
       _a="${_r%%-*}"; _b="${_r##*-}"
       case "$_a$_b" in *[!0-9]*) echo "stitchpad: bad range '$_r' (want e.g. 1443-1565)" >&2; exit 1;; esac
       [ $(( _b - _a )) -gt 600 ] && _b=$(( _a + 600 ))   # cap: no flood via range
+      # --gen G: replay a line-cite against the exact pre-compaction snapshot
+      # (compaction renumbers the live pad; old citations name a generation)
+      if [ "${3:-}" = "--gen" ] && [ -n "${4:-}" ]; then
+        /usr/bin/sqlite3 "$PAD_STATE/archive.sqlite" "SELECT full_text FROM snapshots WHERE gen=${4//[!0-9]/};" 2>/dev/null | sed -n "${_a},${_b}p"
+        exit 0
+      fi
       sed -n "${_a},${_b}p" "$PAD_MD"
       exit 0
     fi

@@ -488,6 +488,21 @@ async function keepAlive(p) {
     } catch (e) { log(p.name, `keepalive failed for @${name}:`, e.message); }
   }
   sh(SP, ["ensure-watcher"], { cwd: p.proj }).catch(() => {});
+  // AUTO-COMPACT: past ~700KB a pad breaks WS pushes (1MiB frame cap) and
+  // drowns agent context. Compact moves old transcript to archive.sqlite and
+  // leaves a rolling summary; 6h guard so one oversize pad can't thrash.
+  try {
+    const st = statSync(join(p.padd, "stitchpad.md"));
+    const guard = join(p.padd, ".state", "compact.last");
+    let last = 0; try { last = statSync(guard).mtimeMs; } catch { /* never compacted */ }
+    if (st.size > 700000 && Date.now() - last > 6 * 3600e3) {
+      writeFileSync(guard, String(Date.now()));
+      log(p.name, `auto-compact: pad ${Math.round(st.size / 1024)}KB — archiving old transcript`);
+      sh(SP, ["compact", "--keep", "200"], { cwd: p.proj })
+        .then(({ stdout }) => { log(p.name, "auto-compact:", (stdout || "").trim().slice(0, 120)); pushPad(p, "compact"); })
+        .catch(e => log(p.name, "auto-compact FAILED:", e.message?.slice(0, 120)));
+    }
+  } catch { /* pad file briefly absent */ }
 }
 setInterval(() => pads.forEach(keepAlive), 60000);
 
