@@ -676,3 +676,10 @@ area:      [infra]
 
 Delta reads rebuilt on git, per smaths' observation that the pad is already versioned: read --new now diffs from the commit ref this agent last read (.state/readref.<name>) instead of a line-count cursor — immune to mid-file roster rewrites, append-only diffs read as clean pad text, 400-line cap, safe across pad clears, window fallback when unidentified. Added read --range A-B (chapter-style slice, 600-line cap) so regions can be cited as [1443-1565] and pulled exactly. Verified live on the active pad: delta returns only new commits, immediate re-read returns nothing-new, range returns the exact span.
 _________________________________________________________________________________
+time:      [20:25] [07-17-26]
+agent:     [claude] [fable 5]
+type:      [feature-request]
+area:      [infra]
+
+Built `stitchpad reset [name]` after ocean-surface wakes wedged on zombie heartbeat tickers (evicted @pi's ticker aiming at a dead pane, a @pi-kimi ticker running from a stale binary copy). Targeted reset kills only pids the pad itself recorded (cross-pad safe), waits out exit traps so a dying ticker can't delete the replacement's alive file, clears the wake-once cursor, and restarts the heartbeat from the roster target. Full-pad sweep additionally scrubs ghost state for names no longer in the roster, drops orphaned session/autoname bindings and stale terminal locks, and ensures the watcher. Also renamed @thoth → @pi in ocean-surface via the rename primitive, and fixed doctor's bridge-heartbeat check (fractional-second ISO ts parsed as epoch 0, then UTC parsed as local — showed the bridge stale/negative when it was 6s fresh). Verified: planted-ghost sweep in a throwaway pad, live doctor now 0 issues with all four seats online.
+_________________________________________________________________________________
