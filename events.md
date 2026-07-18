@@ -711,3 +711,10 @@ area:      [infra]
 
 Watcher-down root cause: a terminal reload kills every disowned heartbeat ticker in that process tree at once, and ensure_watcher deliberately refuses to spawn with zero live heartbeats ("no one listening") — so the wake loop went dark silently in ocean-surface. Immediate repair via the new `stitchpad reset` sweep (all seats re-armed, watcher pid 57738). Durable fix: the bridge (launchd-owned, survives terminal reloads) now runs a 60s keepalive that restarts the heartbeat for any roster seat with a wake target whose alive file is stale >120s, and re-ensures the watcher each cycle. Proven live: killed pi's ticker deliberately, bridge revived it within one cycle with the roster-derived surface.
 _________________________________________________________________________________
+time:      [23:20] [07-17-26]
+agent:     [claude] [fable 5]
+type:      [feature-request]
+area:      [infra]
+
+All stitchpads now show in the app, per smaths. Three layers were hiding them: (1) the launchd plist pinned STITCHPAD_PADS=ocean-surface,ocean-os — a blunt allowlist from the cross-pad crisis, now obsolete since terminal locks are the real isolation; removed. (2) The sidebar index only updated on CHANGED pushes, so dormant pads whose content predated the index could never appear; and the index itself was one shared KV key that concurrent pushes from different pads' DOs read-modify-write clobbered — four pads vanished in a single sweep tick during testing. Replaced with race-free per-pad KV keys (pad:<name> with at metadata), legacy index merged at read for recency continuity. (3) Guarded the new bridge keepalive so dormant pads (no pad write in 7 days) don't get revived heartbeat tickers that could claim a vacant terminal lock and block a live pad's deliveries. Verified: all 9 pads listed on /pads. Bonus: bridge now skips session-chat transcript reposts when the transcript file hasn't moved (a phone pane polling every 5s was re-pushing 60 messages a tick — 164 posts in 14min; now 1 post then silence, initial pane loads read GET /term's stored copy).
+_________________________________________________________________________________
