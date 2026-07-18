@@ -15,7 +15,7 @@ api() { curl -fsS -H "authorization: Bearer $TOKEN" -H "content-type: applicatio
 [ -f "$padd/stitchpad.md" ] || exit 0
 name="$(basename "$(dirname "$padd")")"            # pad name = project dir
 md="$(cat "$padd/stitchpad.md")"
-roster="$(cd "$(dirname "$padd")" && "$SP" roster 2>/dev/null | awk -F'|' '{printf "%s{\"name\":\"%s\",\"adapter\":\"%s\"}", (NR>1?",":""), $1, $2}')"
+roster="$(cd "$(dirname "$padd")" && "$SP" roster 2>/dev/null | awk -F'|' '{gsub(/[ \t]/,"",$4); printf "%s{\"name\":\"%s\",\"adapter\":\"%s\",\"target\":\"%s\"}", (NR>1?",":""), $1, $2, $4}')"
 # file list for the `>` attach dropdown: project files, relative paths, skip junk/dotdirs
 proj="$(dirname "$padd")"
 files="$(cd "$proj" && find . -maxdepth 3 -type f \
@@ -28,6 +28,14 @@ colors="$(cd "$proj" && "$SP" color --all 2>/dev/null | jq -R 'split(" ") | {(.[
 profiles='{}'
 for _name in $(echo "[$roster]" | jq -r '.[].name' 2>/dev/null); do
   _model="$(cat "$padd/.state/model.$_name" 2>/dev/null || echo '')"
+  # daemon-seat agents: the session-config RPC is the model's source of truth —
+  # a model switched over RPC must flip the card chip on the next push
+  _tgt="$(echo "[$roster]" | jq -r '.[] | select(.name=="'"$_name"'") | .target // ""' 2>/dev/null)"
+  _adp0="$(echo "[$roster]" | jq -r '.[] | select(.name=="'"$_name"'") | .adapter // ""' 2>/dev/null)"
+  if [ "$_adp0" = "ocean" ] && [ -n "$_tgt" ] && [ "$_tgt" != "-" ]; then
+    _live="$(curl -sf --max-time 2 "${OCEAN_DAEMON_URL:-http://127.0.0.1:4780}/v1/agent/sessions/$_tgt/config" 2>/dev/null | jq -r '.model // empty' 2>/dev/null)"
+    if [ -n "$_live" ]; then _model="$_live"; printf '%s' "$_live" > "$padd/.state/model.$_name" 2>/dev/null; fi
+  fi
   _role="$(cat "$padd/.state/role.$_name" 2>/dev/null || echo '')"
   _level="$(cat "$padd/.state/level.$_name" 2>/dev/null || echo '')"
   _persona=""

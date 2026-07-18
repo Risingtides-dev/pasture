@@ -242,6 +242,15 @@ async function onDm(p, msg) {
         await sh(HERDR, ["pane", "run", pane, ""]).catch(() => {});
       }
       if (delivered && cmd) log(p.name, `DM @${from} → @${to} slash /${cmd} injected raw`);
+      // a delivered /model switch must show on the profile card — record it as
+      // pad meta and re-push so the chip flips with the switch, not the vibe
+      if (delivered && cmd === "model") {
+        const marg = clean.replace(/^\/model\s*/i, "").trim();
+        if (marg) {
+          sh(SP, ["meta", "set", to, "model", marg], { cwd: p.proj }).catch(() => {});
+          setTimeout(() => pushPad(p, "model-switch"), 500);
+        }
+      }
     }
   }
   if (delivered) {
