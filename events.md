@@ -690,3 +690,10 @@ area:      [infra]
 
 Rename now rewrites pad history too, per smaths: every @old in message headers, mentions, and presence lines becomes @new during `stitchpad rename`, so the md, TUI, and phone surface all show one continuous identity (they all render from stitchpad.md, so one in-place replace covers all three). Word-boundary safe (@thoth never matches @thothx), pure text swap so line count, message ordinals, and wake cursors stay valid; the "@old is now @new" system line posts after the rewrite so the announcement survives. Ran the one-off for the already-renamed ocean-surface pad: 245 @thoth refs → @pi, sole survivor is the announcement line kept historically accurate.
 _________________________________________________________________________________
+time:      [21:33] [07-17-26]
+agent:     [claude] [fable 5]
+type:      [feature-request]
+area:      [backend]
+
+DMs were leaking to the main pad because agents had no private reply path: the injected DM prompt literally said "reply lands on the pad", the MCP server had no DM tool, and there was no local history to read. Built the full private lane per smaths: every DM pair gets its own sqlite DB (.state/dm/<a>~<b>.sqlite) — `dm say` records locally + queues dmout.jsonl for the relay (phone pair log unchanged), the bridge records inbound phone→agent DMs before delivery, `dm read`/`dm list` give agents the whole conversation, and both injection prompts now teach `stitchpad dm say` explicitly. MCP grows dm_say/dm_read (identity-locked, local mode). Verified: say/read/record/list round-trip with quotes+pipes in a scratch pad; live phone→relay→bridge→sqlite smoke on ocean-surface. Also finished the profile cards: persona files for ocean/codex/fable/pi/smaths (ROLE/PERSONA/SKILLS), runtime marker now overrides herdr as the pushed harness (fable=claude, pi=pi, codex=codex → right logos + compact button), model.ocean=deepseek-v4-pro; profiles blob verified live on both pads — the "bridge profiles blob pending" shell is gone.
+_________________________________________________________________________________
