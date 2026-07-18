@@ -340,6 +340,14 @@ EOF
         echo "  ghost @$g:"
         _reset_kill_ticker "$g"; _reset_scrub_ghost "$g"
       done
+      # 1.5) session/autoname bindings pointing at names not in the roster
+      for f in "$PAD_STATE"/sessions/* "$PAD_STATE"/autoname.*; do
+        [ -f "$f" ] || continue
+        g="$(tr -d '[:space:]' < "$f" 2>/dev/null)"
+        [ -n "$g" ] || continue
+        printf '%s\n' "$names" | grep -qx "$g" && continue
+        rm -f "$f" && echo "  · dropped orphaned binding $(basename "$f") (@$g)"
+      done
       # 2) terminal locks held by this pad for names not in the roster
       for f in "$SP_TERMDIR"/*; do
         [ -f "$f" ] || continue
@@ -1606,7 +1614,8 @@ except: print("")' 2>/dev/null)"
       _bridge_ts="$(jq -r '.ts // empty' "$_bridge_file" 2>/dev/null)"
       _bridge_interval="$(jq -r '.interval // 3' "$_bridge_file" 2>/dev/null)"
       if [ -n "$_bridge_ts" ]; then
-        _bridge_epoch="$(date -jf '%Y-%m-%dT%H:%M:%SZ' "$_bridge_ts" +%s 2>/dev/null || date -d "$_bridge_ts" +%s 2>/dev/null || echo 0)"
+        _bridge_ts_s="$(printf '%s' "$_bridge_ts" | sed 's/\.[0-9]*Z$/Z/')"
+        _bridge_epoch="$(date -juf '%Y-%m-%dT%H:%M:%SZ' "$_bridge_ts_s" +%s 2>/dev/null || date -u -d "$_bridge_ts_s" +%s 2>/dev/null || echo 0)"
         _now_epoch="$(date +%s)"
         _bridge_age=$(( _now_epoch - _bridge_epoch ))
         _threshold=$(( _bridge_interval * 3 ))
