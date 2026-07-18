@@ -15,6 +15,15 @@ api() { curl -fsS -H "authorization: Bearer $TOKEN" -H "content-type: applicatio
 [ -f "$padd/stitchpad.md" ] || exit 0
 name="$(basename "$(dirname "$padd")")"            # pad name = project dir
 md="$(cat "$padd/stitchpad.md")"
+# Cloudflare WS frames cap at 1MiB — a pad past that kills the DO broadcast
+# (error 1101) and NOTHING updates. Phones only need the recent window; keep
+# the roster block + the newest ~350KB, cut at a message boundary.
+if [ "${#md}" -gt 400000 ]; then
+  _roster_blk="$(printf '%s' "$md" | awk '/^```roster/{r=1} r{print} r&&/^```$/&&!/```roster/{exit}')"
+  _tail="$(printf '%s' "$md" | tail -c 350000)"
+  _tail="$(printf '%s' "$_tail" | sed -n '/^## @/,$p')"   # start at a clean message header
+  md="$(printf '%s\n\n*…earlier history trimmed for phone — full pad lives on the mac…*\n\n%s' "$_roster_blk" "$_tail")"
+fi
 roster="$(cd "$(dirname "$padd")" && "$SP" roster 2>/dev/null | awk -F'|' '{gsub(/[ \t]/,"",$4); printf "%s{\"name\":\"%s\",\"adapter\":\"%s\",\"target\":\"%s\"}", (NR>1?",":""), $1, $2, $4}')"
 # file list for the `>` attach dropdown: project files, relative paths, skip junk/dotdirs
 proj="$(dirname "$padd")"
@@ -32,9 +41,13 @@ for _name in $(echo "[$roster]" | jq -r '.[].name' 2>/dev/null); do
   # a model switched over RPC must flip the card chip on the next push
   _tgt="$(echo "[$roster]" | jq -r '.[] | select(.name=="'"$_name"'") | .target // ""' 2>/dev/null)"
   _adp0="$(echo "[$roster]" | jq -r '.[] | select(.name=="'"$_name"'") | .adapter // ""' 2>/dev/null)"
+  _last_model=""
   if [ "$_adp0" = "ocean" ] && [ -n "$_tgt" ] && [ "$_tgt" != "-" ]; then
     _live="$(curl -sf --max-time 2 "${OCEAN_DAEMON_URL:-http://127.0.0.1:4780}/v1/agent/sessions/$_tgt/config" 2>/dev/null | jq -r '.model // empty' 2>/dev/null)"
     if [ -n "$_live" ]; then _model="$_live"; printf '%s' "$_live" > "$padd/.state/model.$_name" 2>/dev/null; fi
+    # what the session ACTUALLY ran last: clients (TUI/GUI) pass explicit
+    # per-turn models that outrank the session default the chip shows
+    _last_model="$(tail -c 2000000 /tmp/ocean-daemon.log 2>/dev/null | perl -pe 's/\e\[[0-9;]*m//g' | grep "provider_stream" | grep "$_tgt" | tail -1 | grep -oE 'model=[a-zA-Z0-9._-]+' | head -1 | cut -d= -f2)"
   fi
   _role="$(cat "$padd/.state/role.$_name" 2>/dev/null || echo '')"
   _level="$(cat "$padd/.state/level.$_name" 2>/dev/null || echo '')"
@@ -97,14 +110,18 @@ print(json.dumps(skills))
       [ -n "$_alive_pid" ] && kill -0 "$_alive_pid" 2>/dev/null && _online="true"
     fi
   fi
-  profiles="$(echo "$profiles" | jq --arg n "$_name" --arg m "$_model" --arg r "$_role" --arg lv "$_level" --arg p "$_persona" --argjson s "${_skills:-[]}" --arg h "$_adapter" --arg st "$_status" --argjson on "$_online"\
-    '. + {($n): {role:$r, level:$lv, persona:$p, skills:$s, model:$m, harness:$h, status:$st, online:$on}}')"
+  profiles="$(echo "$profiles" | jq --arg n "$_name" --arg m "$_model" --arg r "$_role" --arg lv "$_level" --arg p "$_persona" --argjson s "${_skills:-[]}" --arg h "$_adapter" --arg st "$_status" --arg lm "${_last_model:-}" --argjson on "$_online"\
+    '. + {($n): {role:$r, level:$lv, persona:$p, skills:$s, model:$m, last_model:$lm, harness:$h, status:$st, online:$on}}')"
 done
 # file-write claims (who holds a lease on what) — tolerated absent
 claims="$(cd "$proj" && "$SP" claims --json 2>/dev/null || echo '[]')"
 echo "$claims" | jq -e . >/dev/null 2>&1 || claims='[]'
-# push this pad up (markdown + roster + files + colors + profiles)
-jq -nc --arg pad "$md" --argjson roster "[${roster}]" --argjson files "${files:-[]}" --argjson colors "${colors}" --argjson profiles "${profiles}" --argjson claims "${claims}" \
+# push this pad up (markdown + roster + files + colors + profiles).
+# pad text goes via --rawfile, NEVER --arg: a big pad as an argv blows ARG_MAX,
+# jq dies, and curl posts an empty body the worker 500s on.
+_mdf="$(mktemp)"; printf '%s' "$md" > "$_mdf"
+jq -nc --rawfile pad "$_mdf" --argjson roster "[${roster}]" --argjson files "${files:-[]}" --argjson colors "${colors}" --argjson profiles "${profiles}" --argjson claims "${claims}" \
   '{pad:$pad, roster:$roster, files:$files, colors:$colors, profiles:$profiles, claims:$claims}' 2>/dev/null \
-  | api -X POST "$RELAY/push?pad=$name" --data-binary @- >/dev/null || exit 1
+  | api -X POST "$RELAY/push?pad=$name" --data-binary @- >/dev/null
+_rc=$?; rm -f "$_mdf"; [ $_rc -eq 0 ] || exit 1
 exit 0

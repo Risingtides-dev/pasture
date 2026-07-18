@@ -51,7 +51,7 @@ export class PadHub {
     // bridge push → store; broadcast ONLY when content actually changed
     // (the bridge pushes every ~3s; identical snapshots must not repaint phones)
     if (url.pathname === "/push" && req.method === "POST") {
-      const body = await req.json();
+      let body; try { body = await req.json(); } catch { return json({ error: "bad push body" }, 400); }
       const at = Date.now();
       const doc = { ...body, name: pad, at };
       const sig = JSON.stringify([body.pad, body.roster, body.colors, body.profiles, body.claims, body.files]);

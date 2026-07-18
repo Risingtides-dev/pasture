@@ -836,7 +836,10 @@ function agentCard(name) {
   const skills = Array.isArray(prof.skills) ? prof.skills : [];
   const ctx = prof.context || "";
   const pfp = `<div class="pfp" style="background:${col};color:${ink}"><img src="avatars/${encodeURIComponent(name)}.png" alt="" onerror="this.remove()">${initials(name)}</div>`;
-  const chips = [level ? `<span class="chip">${esc(level)}</span>` : "", harness !== "—" ? `<span class="chip">${esc(harness)}</span>` : "", model !== "—" ? `<span class="chip">${esc(model)}</span>` : "", ctx ? `<span class="chip">${esc(ctx)}</span>` : ""].join("");
+  // the model chip is the session DEFAULT; clients (TUI/GUI) can pass an
+  // explicit per-turn model that outranks it — surface the divergence
+  const lastM = prof.last_model && prof.last_model !== model ? prof.last_model : "";
+  const chips = [level ? `<span class="chip">${esc(level)}</span>` : "", harness !== "—" ? `<span class="chip">${esc(harness)}</span>` : "", model !== "—" ? `<span class="chip">${esc(model)}${lastM ? " (default)" : ""}</span>` : "", lastM ? `<span class="chip">last turn: ${esc(lastM)}</span>` : "", ctx ? `<span class="chip">${esc(ctx)}</span>` : ""].join("");
   const full = `<div class="full">` +
     (role ? `<div class="sec"><h4>Role</h4>${esc(role)}</div>` : "") +
     (prof.persona ? `<div class="sec"><h4>Persona</h4><div class="persona">${esc(prof.persona)}</div></div>` : "") +
