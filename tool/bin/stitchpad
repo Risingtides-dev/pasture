@@ -223,8 +223,10 @@ EOF
   rename)
     # Rename a roster member everywhere the local pad knows them: roster row,
     # wake cursors, heartbeat, session bindings, sticky autonames, terminal
-    # locks, runtime/role/level meta. Pad HISTORY is untouched (append-only
-    # ledger); a system line announces the change instead.
+    # locks, runtime/model meta — AND pad history: every @old (message headers,
+    # mentions, presence lines) becomes @new, so the md, TUI, and surface all
+    # show one continuous identity. Word-boundary safe (@thoth ≠ @thothx),
+    # line structure preserved so ordinals and wake cursors stay valid.
     #   stitchpad rename <old> <new>
     sp_init_paths || exit 1
     old="${1:?usage: stitchpad rename <old> <new>}"
@@ -250,6 +252,10 @@ EOF
       }
       { print }
     ' "$PAD_MD" > "$tmp" && mv "$tmp" "$PAD_MD"
+    # history rewrite: @old → @new everywhere in the pad (headers, mentions,
+    # presence lines). In-place text swap — line count is untouched, so
+    # message ordinals and every agent's wake cursor stay valid.
+    perl -i -pe 's/\@\Q'"$old"'\E(?![A-Za-z0-9_-])/\@'"$new"'/g' "$PAD_MD"
     # per-agent state files keyed by name
     for _pfx in seen seen.relay count alive role level runtime forcewake dnd delivered_no_reply; do
       [ -f "$PAD_STATE/$_pfx.$old" ] && mv "$PAD_STATE/$_pfx.$old" "$PAD_STATE/$_pfx.$new" 2>/dev/null
