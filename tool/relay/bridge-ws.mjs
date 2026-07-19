@@ -502,6 +502,21 @@ async function keepAlive(p) {
   // claim a vacant terminal lock and block deliveries in a live pad. Using a
   // dormant pad again (any write) re-arms its keepalive automatically.
   try { if (Date.now() - statSync(join(p.padd, "stitchpad.md")).mtimeMs > 7 * 86400e3) return; } catch { return; }
+  // ROSTER GUARD: direct-file writers (remote agents, raw edits) have dropped
+  // the pad header before — a missing roster silently breaks gates, doctor,
+  // and profiles while the running watcher coasts on its cached copy. Back the
+  // block up whenever it parses; put it back the moment it vanishes.
+  try {
+    const padTxt = readFileSync(join(p.padd, "stitchpad.md"), "utf8");
+    const rb = padTxt.match(/```roster\n[\s\S]*?```/);
+    const bak = join(p.padd, ".state", "roster.backup");
+    if (rb) writeFileSync(bak, rb[0]);
+    else if (existsSync(bak)) {
+      writeFileSync(join(p.padd, "stitchpad.md"),
+        `# 🧵 #${p.name} — agent stitchpad\n\n${readFileSync(bak, "utf8")}\n\n---\n\n` + padTxt);
+      log(p.name, "ROSTER RESTORED from backup — a direct write had dropped the pad header");
+    }
+  } catch { /* pad mid-rewrite; next cycle */ }
   let roster;
   try { roster = (await sh(SP, ["roster"], { cwd: p.proj })).stdout; } catch { return; }
   for (const line of roster.split("\n")) {
