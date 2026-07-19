@@ -411,7 +411,7 @@ async function drainDmOut(p) {
 function lastWakeFor(p, name) {
   // adapter logs are the delivery ground truth; scan the tails
   let best = null;
-  for (const f of ["adapter.herdr.log", "adapter.velocity.log", "adapter.codex.log"]) {
+  for (const f of ["adapter.herdr.log", "adapter.ocean.log", "adapter.codex.log"]) {
     let raw; try { raw = readFileSync(join(p.padd, ".state", f), "utf8"); } catch { continue; }
     const lines = raw.trimEnd().split("\n").slice(-200);
     for (let i = lines.length - 1; i >= 0; i--) {
@@ -476,7 +476,7 @@ async function healRoster(p) {
   for (const line of roster.split("\n")) {
     const [name, adapter, wake, target] = line.split("|").map(s => (s || "").trim());
     if (!name || !(wake === "push" || wake === "pull")) continue;
-    // herdr rows only: other adapters (ocean, velocity) key their target on
+    // herdr rows only: Ocean keys its target on
     // adapter-specific ids (session uuids), not panes — a heartbeat pane would
     // clobber them. Their DMs already fall back to the heartbeat in resolvePane.
     if (adapter !== "herdr") continue;

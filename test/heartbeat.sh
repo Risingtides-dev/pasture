@@ -7,27 +7,25 @@ SP="$ROOT/tool/bin/stitchpad"
 FIXTURE_DIR="$(mktemp -d)"
 cleanup() {
   rm -rf "$FIXTURE_DIR"
-  rm -f "$HOME/.stitchpad-terminals/surface-77"
+  rm -f "$HOME/.stitchpad-terminals/term-alice" "$HOME/.stitchpad-terminals/term-legacy"
 }
 trap cleanup EXIT
 # The fixture intentionally uses a stable fake surface; clear residue from an
 # interrupted prior run so the machine-global one-terminal/one-pad guard remains
 # testable and repeatable.
-rm -f "$HOME/.stitchpad-terminals/surface-77"
+rm -f "$HOME/.stitchpad-terminals/term-alice" "$HOME/.stitchpad-terminals/term-legacy"
 
 cd "$FIXTURE_DIR"
 "$SP" init --name heartbeat >/dev/null
 
 export STITCHPAD_NAME="alice"
 export STITCHPAD_SESSION="session-test"
-export VELOCITY_SURFACE_ID="surface-42"
-export VELOCITY_TAB_ID="tab-42"
-export VELOCITY_WORKTREE_ID="worktree-42"
 export STITCHPAD_HEARTBEAT_INTERVAL="1"
 # Pin the ticker parent to this test shell. Under harnessed/non-interactive runs,
 # relying on the stitchpad subprocess PPID can point at a transient wrapper and
 # make the ticker exit before the mtime refresh assertion.
 export STITCHPAD_HEARTBEAT_PARENT_PID="$$"
+"$SP" join alice herdr push term-alice >/dev/null
 
 "$SP" heartbeat start >/dev/null
 
@@ -38,7 +36,7 @@ for _ in 1 2 3 4 5; do
 done
 [ -f "$alive" ]
 
-jq -e '.name == "alice" and .session == "session-test" and .surface == "surface-42" and (.pid | type == "number") and (.ts | type == "number")' "$alive" >/dev/null
+jq -e '.name == "alice" and .session == "session-test" and .surface == "term-alice" and .target == "term-alice" and (.pid | type == "number") and (.ts | type == "number")' "$alive" >/dev/null
 pid="$(jq -r '.pid' "$alive")"
 kill -0 "$pid"
 
@@ -64,13 +62,13 @@ fi
 # Existing pads can have roster entries created before heartbeat tickers existed.
 # The next normal command from an explicitly identified agent should backfill the
 # ticker without requiring the agent to leave/rejoin.
-"$SP" join legacy codex push 'worktree-legacy@@tab-77@@surface-77' >/dev/null
+"$SP" join legacy herdr push term-legacy >/dev/null
 STITCHPAD_NAME=legacy "$SP" heartbeat --stop legacy >/dev/null
 legacy_alive="$FIXTURE_DIR/.stitchpad/.state/alive.legacy"
 [ ! -e "$legacy_alive" ]
 
 (
-  unset VELOCITY_SURFACE_ID VELOCITY_TAB_ID VELOCITY_WORKTREE_ID STITCHPAD_SESSION STITCHPAD_HEARTBEAT_PARENT_PID STITCHPAD_HEARTBEAT_INTERVAL
+  unset STITCHPAD_SESSION STITCHPAD_HEARTBEAT_PARENT_PID STITCHPAD_HEARTBEAT_INTERVAL
   export STITCHPAD_NAME=legacy
   "$SP" read -n 1 >/dev/null
 )
@@ -80,7 +78,7 @@ for _ in 1 2 3 4 5; do
   sleep 0.2
 done
 [ -f "$legacy_alive" ]
-jq -e '.name == "legacy" and .target == "worktree-legacy@@tab-77@@surface-77" and .surface == "surface-77" and (.pid | type == "number")' "$legacy_alive" >/dev/null
+jq -e '.name == "legacy" and .target == "term-legacy" and .surface == "term-legacy" and (.pid | type == "number")' "$legacy_alive" >/dev/null
 legacy_pid="$(jq -r '.pid' "$legacy_alive")"
 kill -0 "$legacy_pid"
 

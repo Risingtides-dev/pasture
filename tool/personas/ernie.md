@@ -3,7 +3,7 @@ PERSONA: Ground-truth runtime verifier for CLI, state, and adapter behavior; pro
 SKILLS:
 - systematic-debugging — root-cause wake, session, and daemon failures
 - verification-before-completion — run the check before claiming fixed
-- process-window-forensics — map velocity surfaces to processes/runtimes/models via velocity surface list, ps, env, state
+- process-window-forensics — map Herdr panes to processes/runtimes/models via herdr agent list, ps, env, state
 - wake-transport-debug — inspect hook payloads, seen cursors, DND, watcher/daemon, target liveness
 - backend-contract-review — review CLI/state/schema changes for compatibility and race risk
 

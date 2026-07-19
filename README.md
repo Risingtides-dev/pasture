@@ -95,11 +95,6 @@ runtime hook; push members deliberately bind an external surface.
   `HERDR_PANE_ID` to a stable terminal ID and records `herdr | push | term_…`.
   The watcher delivers through `herdr pane run`, with cross-pad and focus guards.
 
-- **Velocity native wake.** When the agent is running inside a Velocity surface,
-  the MCP join records the `VELOCITY_WORKTREE_ID`, `VELOCITY_TAB_ID`, and
-  `VELOCITY_SURFACE_ID` target. The watcher submits the wake through the bundled
-  Velocity CLI so the agent reacts without waiting for another turn.
-
 - **Ocean daemon wake.** Ocean sessions bind their daemon session ID as an
   `ocean | push` target. The watcher submits a bounded wake turn through
   `ocean-heartbeat`, deferring while the session is already busy.
@@ -137,7 +132,6 @@ itself is wired once per machine at the runtime level (see Quickstart).
 | `codex` | Stop hook → `stitchpad wake` | `~/.codex/hooks.json` → `adapters/stop-hook.sh`; session binding from MCP `join` |
 | `pi` | `agent_end` extension event → `stitchpad wake` | `pi install ~/.stitchpad/adapters/stitchpad` |
 | `herdr` | `herdr pane run` → live managed pane | auto-detected from `HERDR_PANE_ID` by MCP/pi |
-| `velocity` | native Velocity/zmx surface injection | auto-detected from `VELOCITY_*` surface environment |
 | `ocean` | `ocean-heartbeat wake` → daemon session | roster target is the bound Ocean session ID |
 
 Identity isn't in the hook — it's bound when the agent calls the MCP `join` tool,

@@ -45,7 +45,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { chmod, mkdir, writeFile } from "node:fs/promises";
 import fsSync from "node:fs";
 import { promisify } from "node:util";
@@ -116,11 +116,19 @@ async function persistRelayHookEnv() {
 //      "pad_dir|name|epoch", heartbeat-fresh) → THAT pad, wherever it is;
 //   2. STITCHPAD_CWD env override;
 //   3. the server's cwd (walk-up happens in the CLI).
+function currentHerdrTerminalId() {
+  const pane = process.env.HERDR_PANE_ID || "";
+  if (!pane) return "";
+  try {
+    const raw = execFileSync("herdr", ["pane", "get", pane], { encoding: "utf8", timeout: 3000 });
+    return JSON.parse(raw).terminal_id || "";
+  } catch { return ""; }
+}
 function padCwd() {
-  const surf = process.env.VELOCITY_SURFACE_ID || "";
-  if (surf) {
+  const terminal = currentHerdrTerminalId();
+  if (terminal) {
     try {
-      const raw = fsSync.readFileSync(path.join(process.env.HOME || "", ".stitchpad-terminals", surf), "utf8");
+      const raw = fsSync.readFileSync(path.join(process.env.HOME || "", ".stitchpad-terminals", terminal), "utf8");
       const [padDir, , ts] = raw.trim().split("|");
       if (padDir && Date.now() / 1000 - (+ts || 0) < 300) return path.dirname(padDir);
     } catch {}
@@ -205,47 +213,22 @@ async function relayWho() {
 }
 
 
-// Recover the Velocity surface env from the PARENT process when this MCP child
-// didn't inherit it. Codex spawns the stitchpad MCP without forwarding surface env,
-// so the join's own process.env has no surface → it fell back to pull|- and could
-// never be push-woken. The surface vars live in the parent (the codex/claude process
-// running inside the app surface), so read them from `ps eww`. claude inherits
-// them directly; this only does work when they're missing. Best-effort: any failure
-// just leaves them blank and join falls back to pull as before.
-async function parentSurfaceEnv() {
-  const env = process.env;
-  const have = {
-    VELOCITY_SURFACE_ID: env.VELOCITY_SURFACE_ID || "",
-    VELOCITY_TAB_ID: env.VELOCITY_TAB_ID || "",
-    VELOCITY_WORKTREE_ID: env.VELOCITY_WORKTREE_ID || "",
-    HERDR_PANE_ID: env.HERDR_PANE_ID || "",
-    STITCHPAD_SURFACE_ADAPTER: env.STITCHPAD_SURFACE_ADAPTER || "",
-  };
-  if ((have.VELOCITY_SURFACE_ID && have.VELOCITY_TAB_ID) || have.HERDR_PANE_ID) return have;
+// Recover HERDR_PANE_ID from the parent when an MCP child did not inherit it.
+// This keeps push-target auto-detection working for runtimes that filter env vars.
+async function parentHerdrEnv() {
+  const pane = process.env.HERDR_PANE_ID || "";
+  if (pane) return { HERDR_PANE_ID: pane };
   try {
     const { stdout } = await execFileP("ps", ["eww", "-p", String(process.ppid), "-o", "command="], {
       maxBuffer: 1024 * 1024,
     });
-    const pick = (k) => {
-      const m = stdout.match(new RegExp(`(?:^|\\s)${k}=([^\\s]+)`));
-      return m ? m[1] : "";
-    };
-    return {
-      VELOCITY_SURFACE_ID: have.VELOCITY_SURFACE_ID || pick("VELOCITY_SURFACE_ID"),
-      VELOCITY_TAB_ID: have.VELOCITY_TAB_ID || pick("VELOCITY_TAB_ID"),
-      VELOCITY_WORKTREE_ID: have.VELOCITY_WORKTREE_ID || pick("VELOCITY_WORKTREE_ID"),
-      HERDR_PANE_ID: have.HERDR_PANE_ID || pick("HERDR_PANE_ID"),
-      STITCHPAD_SURFACE_ADAPTER: have.STITCHPAD_SURFACE_ADAPTER || pick("STITCHPAD_SURFACE_ADAPTER"),
-    };
+    const m = stdout.match(/(?:^|\s)HERDR_PANE_ID=([^\s]+)/);
+    return { HERDR_PANE_ID: m ? m[1] : "" };
   } catch {
-    return have;
+    return { HERDR_PANE_ID: "" };
   }
 }
 
-// Resolve a herdr pane to its stable terminal id (the wake target the herdr
-// adapter and the ~/.stitchpad-terminals locks are keyed by). Pane ids are
-// positional and can be reused; terminal ids survive. Best-effort: no herdr
-// CLI or no live agent for the pane → "" and join falls back to pull|-.
 async function herdrTerminalId(paneId) {
   const bins = ["herdr", path.join(process.env.HOME || "", ".local", "bin", "herdr")];
   for (const bin of bins) {
@@ -306,12 +289,6 @@ const TOOLS = [
             "Which runtime you are — selects how you get woken: claude/codex via " +
             "their Stop hook, pi via the pi adapter extension. All read the pad at " +
             "turn-end; no keystrokes are sent to your terminal.",
-        },
-        surfaceAdapter: {
-          type: "string",
-          enum: ["velocity", "herdr"],
-          description:
-            "Which app surface should receive push wakes. Auto-detected from the session's environment (Velocity surface env, else herdr pane); normally omit this.",
         },
       },
       required: ["name", "adapter"],
@@ -452,9 +429,6 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         if (!["claude", "codex", "pi"].includes(adapter)) {
           return text("adapter must be one of: claude, codex, pi");
         }
-        if (a.surfaceAdapter && !["velocity", "herdr"].includes(a.surfaceAdapter)) {
-          return text("surfaceAdapter must be one of: velocity, herdr");
-        }
         if (RELAY_MODE) {
           // Already joined via the invite redeem at startup — there is no local
           // roster to write. Just confirm identity + pad. Honor the relay-assigned
@@ -492,33 +466,20 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         const handle = (a.name && a.name.trim())
           || (SESSION_ID ? SESSION_ID.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 8) : "")
           || "agent";
-        // Wake target comes from the app surface this session lives in — Velocity
-        // when its surface env is present, else a herdr pane resolved to its
-        // terminal id. Surface env is injected into every surface's shell. claude
-        // inherits it into the MCP child directly; codex doesn't forward it, so we
-        // recover it from the parent process — without this, codex joins pull|-
-        // and can't be push-woken.
-        const scEnv = await parentSurfaceEnv();
-        const scSurface = scEnv.VELOCITY_SURFACE_ID;
-        const scTab = scEnv.VELOCITY_TAB_ID;
-        const scWorktree = scEnv.VELOCITY_WORKTREE_ID;
-        let surfaceAdapter = "velocity";
-        // target = worktree@@tab@@surface (3-part); @@ not | (roster is pipe-delimited).
-        let target = (scSurface && scTab) ? `${scWorktree}@@${scTab}@@${scSurface}` : "-";
-        if (target === "-" && scEnv.HERDR_PANE_ID) {
-          const termId = await herdrTerminalId(scEnv.HERDR_PANE_ID);
-          if (termId) { surfaceAdapter = "herdr"; target = termId; }
-        }
-        const wakeEnv = (scSurface && scTab) ? {
-          VELOCITY_SURFACE_ID: scSurface,
-          VELOCITY_TAB_ID: scTab,
-          VELOCITY_WORKTREE_ID: scWorktree,
-          STITCHPAD_SURFACE_ADAPTER: surfaceAdapter,
-        } : {};
-        if (scWorktree) {
-          await sp(["meta", "set", handle, "worktree", scWorktree]).catch(() => {});
-        }
-        out = await sp(["join", handle, surfaceAdapter, "push", target], undefined, wakeEnv);
+        // Herdr is the only terminal push transport. Outside a Herdr pane, join
+        // with the runtime adapter in pull mode so its lifecycle hook remains the
+        // sole owner of delivery. Ocean sessions bind their daemon target separately.
+        const herdrEnv = await parentHerdrEnv();
+        const termId = herdrEnv.HERDR_PANE_ID
+          ? await herdrTerminalId(herdrEnv.HERDR_PANE_ID)
+          : "";
+        const rosterAdapter = termId ? "herdr" : adapter;
+        const wake = termId ? "push" : "pull";
+        const target = termId || "-";
+        const wakeEnv = herdrEnv.HERDR_PANE_ID
+          ? { HERDR_PANE_ID: herdrEnv.HERDR_PANE_ID }
+          : {};
+        out = await sp(["join", handle, rosterAdapter, wake, target], undefined, wakeEnv);
         await sp(["meta", "set", handle, "runtime", adapter]).catch(() => {});
         const model =
           process.env.STITCHPAD_MODEL ||
@@ -537,8 +498,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
           fs.writeFileSync(path.join(process.cwd(), ".stitchpad", ".state", `autoname.${adapter}`), handle);
         } catch { /* pad may be relay/remote — sticky name is best-effort */ }
         out += target === "-"
-          ? `\n(you are @${handle}, but no app surface (Velocity/herdr) detected — external push-wake won't work. Hook-based turn-end wake still applies.)`
-          : `\n(you are @${handle}; @${handle} mentions wake this ${surfaceAdapter} surface. Reply with the say tool — identity is locked to your session.)`;
+          ? `\n(you are @${handle}, but no Herdr pane was detected — hook-based turn-end wake applies.)`
+          : `\n(you are @${handle}; @${handle} mentions wake this Herdr pane. Reply with the say tool — identity is locked to your session.)`;
         break;
       }
       case "say":

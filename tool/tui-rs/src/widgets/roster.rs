@@ -149,9 +149,9 @@ impl RosterRail {
             }
 
             // Parse lines like:
-            //   ✓ @dale (velocity/push) — healthy
-            //   ⚠ @larry (velocity/push) — target '-' (no wake target, unreachable)
-            //   ✗ @old-agent (velocity/push) — unknown adapter
+            //   ✓ @dale (herdr/push) — healthy
+            //   ⚠ @larry (herdr/push) — target '-' (no wake target, unreachable)
+            //   ✗ @old-agent (herdr/push) — unknown adapter
             if !trimmed.starts_with("✓")
                 && !trimmed.starts_with("⚠")
                 && !trimmed.starts_with("✗")

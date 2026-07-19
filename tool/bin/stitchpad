@@ -45,11 +45,12 @@ sp_autostart_name() {
     cat "$PAD_STATE/sessions/$STITCHPAD_SESSION" 2>/dev/null
     return 0
   fi
-  if [ -n "${VELOCITY_SURFACE_ID:-}" ]; then
-    sp_roster | awk -F'|' -v w="$VELOCITY_SURFACE_ID" '
+  local surface
+  surface="$(sp_this_surface)"
+  if [ -n "$surface" ]; then
+    sp_roster | awk -F'|' -v w="$surface" '
       { gsub(/^[ \t]+|[ \t]+$/, "", $1); gsub(/^[ \t]+|[ \t]+$/, "", $4)
-        n=$4; sub(/.*@@/, "", n)
-        if (n == w) { print $1; exit } }'
+        if ($4 == w) { print $1; exit } }'
   fi
 }
 
@@ -584,7 +585,7 @@ PY
     sid="${1:?usage: stitchpad bind-session <session_id|-> <name>}"
     nm="${2:?name required}"
     if [ "$sid" = "-" ]; then
-      echo "✓ no session id — set STITCHPAD_NAME=$nm or VELOCITY_SURFACE_ID in your shell to pin identity" >&2
+      echo "✓ no session id — set STITCHPAD_NAME=$nm or run inside a Herdr pane to pin identity" >&2
     else
       # Collision guard: if this session id is ALREADY bound to a DIFFERENT name,
       # blindly clobbering is the identity-bleed bug (one session id rebound to
@@ -607,28 +608,7 @@ PY
       printf '%s' "$_model" > "$PAD_STATE/model.$nm"
       echo "✓ model for @$nm: $_model"
     fi
-    # Auto-capture this Velocity surface as the wake target if we're in one and
-    # the roster target is still empty.
-    if [ -n "${VELOCITY_SURFACE_ID:-}" ] && [ -n "${VELOCITY_TAB_ID:-}" ]; then
-      cur="$(sp_user_field "$nm" target)"
-      if [ -z "$cur" ] || [ "$cur" = "-" ]; then
-        # We already hold the pad lock from the outer join transaction.
-        # Re-entering sp_lock here would self-deadlock and skip target capture.
-        tgt="${VELOCITY_WORKTREE_ID:-}@@${VELOCITY_TAB_ID}@@${VELOCITY_SURFACE_ID}"
-        tmp="$(mktemp)"
-        awk -v who="$nm" -v tgt="$tgt" '
-          /^```roster/ { inblk=1; print; next }
-          inblk && /^```/ { inblk=0; print; next }
-          inblk && tolower($1)==tolower(who"") {
-            print who " | velocity | push | " tgt; next
-          }
-          { print }
-        ' "$PAD_MD" > "$tmp" && mv "$tmp" "$PAD_MD"
-        sp_commit "roster: @$nm velocity target captured"
-        sp_unlock
-        echo "✓ captured Velocity target for @$nm ($tgt)"
-      fi
-    fi
+    # Push-target capture is owned by MCP/pi Herdr join and SessionStart repair.
     STITCHPAD_NAME="$nm" STITCHPAD_HEARTBEAT_PARENT_PID="${STITCHPAD_HEARTBEAT_PARENT_PID:-$PPID}" \
       "$BIN_DIR/stitchpad" heartbeat start "$nm" >/dev/null 2>&1 \
       && echo "✓ heartbeat for @$nm"
@@ -922,9 +902,7 @@ PY
           [ -z "${STITCHPAD_HEARTBEAT_PARENT_PID:-}" ] && parent=""
         else
           surface="$(sp_this_surface)"
-          if [ -n "$surface" ] && [ -n "${VELOCITY_TAB_ID:-}" ]; then
-            target="${VELOCITY_WORKTREE_ID:-}@@${VELOCITY_TAB_ID}@@$surface"
-          fi
+          [ -n "$surface" ] && target="$surface"
         fi
         (
           # Bash 3.2 (the macOS system bash) has no $BASHPID. The parent
@@ -964,9 +942,7 @@ PY
           _surface="${_rt##*@@}"; _target="$_rt"
         else
           _surface="$(sp_this_surface)"
-          if [ -n "$_surface" ] && [ -n "${VELOCITY_TAB_ID:-}" ]; then
-            _target="${VELOCITY_WORKTREE_ID:-}@@${VELOCITY_TAB_ID}@@$_surface"
-          fi
+          [ -n "$_surface" ] && _target="$_surface"
         fi
         heartbeat_write "$who" "$pid" "${STITCHPAD_HEARTBEAT_PARENT_PID:-$PPID}" "${STITCHPAD_SESSION:-}" "$_surface" "$_target"
         ;;
@@ -1969,7 +1945,7 @@ except: print("")' 2>/dev/null)"
     ;;
 
   migration-check)
-    # 4-point Velocity reachability verifier. All 4 gates must pass before a
+    # 4-point push-target reachability verifier. All 4 gates must pass before a
     # member is considered reachable.
     #   stitchpad migration-check <name>
     sp_init_paths || exit 1
@@ -1985,8 +1961,8 @@ except: print("")' 2>/dev/null)"
     echo "stitchpad migration-check — verifying @$_mc_pilot"
     echo ""
 
-    # Gate 1: doctor confirms Velocity target
-    echo -n "  [1/4] Velocity target .......... "
+    # Gate 1: doctor confirms a supported push target
+    echo -n "  [1/4] push target .............. "
     _mc_doctor_out="$("$0" doctor --json 2>/dev/null || true)"
     if echo "$_mc_doctor_out" | python3 -c "
 import json, sys
@@ -1995,16 +1971,16 @@ for m in data:
     if m.get('name') == '$_mc_pilot':
         t = m.get('target', '')
         a = m.get('adapter', '')
-        if a == 'velocity' and t and t != '-':
+        if a in ('herdr', 'ocean') and m.get('wake') == 'push' and t and t != '-':
             print('OK')
             sys.exit(0)
 print('FAIL')
 sys.exit(1)
 " 2>/dev/null; then
-      echo "${_mc_green}PASS${_mc_reset} — Velocity target validated"
+      echo "${_mc_green}PASS${_mc_reset} — push target validated"
       (( _mc_pass++ ))
     else
-      echo "${_mc_red}FAIL${_mc_reset} — not velocity or no target"
+      echo "${_mc_red}FAIL${_mc_reset} — not herdr/ocean push or no target"
       (( _mc_fail++ ))
     fi
 

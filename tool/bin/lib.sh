@@ -106,11 +106,9 @@ sp_me() {
     echo "$_bound"; return
   fi
   if [ -n "${STITCHPAD_NAME:-}" ]; then echo "$STITCHPAD_NAME"; return; fi
-  # Surface-id resolution: each Velocity surface UUID is unique and stable, and
-  # the roster records each agent's surface as "...@@<surface_id>". A process that
-  # knows its own surface ID can find its name unambiguously — no shared
-  # state. Keeps sessions from colliding on whoami when no session id is present.
-  local _surface_id="${VELOCITY_SURFACE_ID:-}"
+  # Herdr terminal resolution: a process in a managed pane can resolve its stable
+  # terminal id and find the matching roster target without shared whoami state.
+  local _surface_id="$(sp_this_surface)"
   if [ -n "$_surface_id" ]; then
     local _wname
     _wname="$(sp_roster | awk -F'|' -v w="$_surface_id" '
@@ -122,7 +120,7 @@ sp_me() {
   # Last-resort pad default is intentionally opt-in. A shared whoami file can
   # collapse multiple agents into whoever joined last (for example, everyone
   # posting as @nancy). Prefer explicit STITCHPAD_NAME, STITCHPAD_SESSION, or
-  # VELOCITY_SURFACE_ID resolution; fail closed instead of misattributing work.
+  # Herdr terminal resolution; fail closed instead of misattributing work.
   if [ "${STITCHPAD_ALLOW_WHOAMI_FALLBACK:-0}" = "1" ]; then
     cat "$PAD_STATE/whoami" 2>/dev/null || true
   fi
@@ -394,13 +392,10 @@ sp_engagement() {
 # post into pad B, unless the operator explicitly steals it (STITCHPAD_STEAL=1)
 # or the old claim goes stale (>300s without a heartbeat).
 SP_TERMDIR="$HOME/.stitchpad-terminals"
-sp_term_surface_of() { printf '%s' "${1##*@@}"; }   # composite targets are wt@@tab@@surface; herdr targets ARE the surface
-# The terminal id of THIS shell's pane. Legacy surface env if present, else the
-# herdr pane env resolved to its terminal id (herdr panes export HERDR_PANE_ID,
-# not a terminal id — without this, every guard keyed on the surface env was
-# inert in herdr panes and heartbeats captured empty surfaces).
+sp_term_surface_of() { printf '%s' "$1"; }   # Herdr terminal ids and Ocean session ids are direct targets
+# The terminal id of THIS shell's Herdr pane. Herdr exports a pane id, so
+# resolve it to the stable terminal id used by roster targets and isolation locks.
 sp_this_surface() {
-  if [ -n "${VELOCITY_SURFACE_ID:-}" ]; then printf '%s' "$VELOCITY_SURFACE_ID"; return 0; fi
   if [ -n "${HERDR_PANE_ID:-}" ] && command -v herdr >/dev/null 2>&1; then
     herdr pane get "$HERDR_PANE_ID" 2>/dev/null \
       | sed -n 's/.*"terminal_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1
