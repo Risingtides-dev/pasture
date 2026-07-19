@@ -262,7 +262,11 @@ sp_tasks() {
   awk -v fn="$filter_name" -v fs="$filter_status" '
     BEGIN { id=""; title=""; status=""; priority=""; assignee=""; labels=""; created=""; desc="" }
     /^```task /                      { inblk=1; meta=1; id=$2; gsub(/^ *| *$/,"",id); title=""; status="todo"; priority="none"; assignee=""; labels=""; created=""; desc="" }
-    /^```$/ && inblk                 { inblk=0; if (id!="") { if ((fn==""||assignee==fn) && (fs==""||status==fs)) print id "|" title "|" status "|" priority "|" assignee "|" labels "|" created "|" substr(desc, 1, 240); id="" } }
+    /^```$/ && inblk                 { inblk=0; if (id!="") {
+      # duplicate blocks (compact-carried copies, re-posts): LAST occurrence wins
+      if (!(id in seen)) { order[++nord]=id; seen[id]=1 }
+      data[id] = id "|" title "|" status "|" priority "|" assignee "|" labels "|" created "|" substr(desc, 1, 240)
+      fa[id]=assignee; fst[id]=status; id="" } }
     inblk && /^---/                   { meta=0; next }
     inblk && !meta && !/^```/ {
       line=$0; gsub(/^[ \t]+|[ \t]+$/, "", line)
@@ -277,6 +281,8 @@ sp_tasks() {
       if (line ~ /^labels:/)   { gsub(/^labels: */, "", line); labels=line }
       if (line ~ /^created:/)  { gsub(/^created: */, "", line); created=line }
     }
+    END { for (i=1; i<=nord; i++) { k=order[i]
+      if ((fn=="" || fa[k]==fn) && (fs=="" || fst[k]==fs)) print data[k] } }
   ' "$PAD_MD"
 }
 

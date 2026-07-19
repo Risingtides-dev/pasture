@@ -17,12 +17,28 @@ name="$(basename "$(dirname "$padd")")"            # pad name = project dir
 md="$(cat "$padd/stitchpad.md")"
 # Cloudflare WS frames cap at 1MiB — a pad past that kills the DO broadcast
 # (error 1101) and NOTHING updates. Phones only need the recent window; keep
-# the roster block + the newest ~350KB, cut at a message boundary.
+# the roster block + EVERY task block (the board renders from this doc — a
+# task above the cut must not vanish from the kanban) + the newest ~350KB.
 if [ "${#md}" -gt 400000 ]; then
-  _roster_blk="$(printf '%s' "$md" | awk '/^```roster/{r=1} r{print} r&&/^```$/&&!/```roster/{exit}')"
-  _tail="$(printf '%s' "$md" | tail -c 350000)"
-  _tail="$(printf '%s' "$_tail" | sed -n '/^## @/,$p')"   # start at a clean message header
-  md="$(printf '%s\n\n*…earlier history trimmed for phone — full pad lives on the mac…*\n\n%s' "$_roster_blk" "$_tail")"
+  md="$(printf '%s' "$md" | python3 -c '
+import re, sys
+t = sys.stdin.read()
+m = re.search(r"```roster\n[\s\S]*?```", t)
+roster = m.group(0) if m else ""
+tail = t[-350000:]
+cut = tail.find("\n## @")
+tail = tail[cut + 1:] if cut != -1 else tail
+blocks = {}
+for mm in re.finditer(r"```task (\S+)\n[\s\S]*?```", t):
+    blocks[mm.group(1)] = mm.group(0)          # last occurrence wins (in-place edits)
+have = set(re.findall(r"```task (\S+)\n", tail))
+pinned = [b for i, b in blocks.items() if i not in have]
+parts = [roster, "\n\n*…earlier history trimmed for phone — full pad lives on the mac…*\n"]
+if pinned:
+    parts.append("\n" + "\n\n".join(pinned) + "\n")
+parts.append("\n" + tail)
+sys.stdout.write("".join(parts))
+')"
 fi
 roster="$(cd "$(dirname "$padd")" && "$SP" roster 2>/dev/null | awk -F'|' '{gsub(/[ \t]/,"",$4); printf "%s{\"name\":\"%s\",\"adapter\":\"%s\",\"target\":\"%s\"}", (NR>1?",":""), $1, $2, $4}')"
 # file list for the `>` attach dropdown: project files, relative paths, skip junk/dotdirs

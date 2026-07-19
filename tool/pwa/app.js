@@ -926,6 +926,10 @@ function BoardPanel() {
   const [showNew, setShowNew] = useState(false);
   const tasks = parseTasks(s.doc?.pad);
   const roster = (s.doc?.roster || []).map(r => r.name);
+  // agents invent statuses ("queued") — a task must NEVER fall off the board
+  // because its column wasn't in the standard list. Unknowns get real columns.
+  const extra = [...new Set(tasks.map(t => t.status))].filter(x => !TASK_STATUSES.includes(x));
+  const cols = [...TASK_STATUSES.slice(0, 2), ...extra, ...TASK_STATUSES.slice(2)];
   const col = st => tasks.filter(t => t.status === st);
   const close = () => { store.boardOpen = false; publish(); };
   const move = (id, st) => { taskOp({ op: "move", id, status: st }); setSel(null); notice(`${id} → ${st.replace(/_/g, " ")}`); };
@@ -951,7 +955,7 @@ function BoardPanel() {
       </div>
     </form>`}
     <div class="b-cols">
-      ${TASK_STATUSES.map(st => html`<div class="b-col" key=${st}>
+      ${cols.map(st => html`<div class="b-col" key=${st}>
         <div class="b-col-hd">${st.replace(/_/g, " ")} <span class="cnt">${col(st).length}</span></div>
         ${col(st).map(t => html`<div class=${"b-card" + (sel === t.id ? " sel" : "")} key=${t.id} onClick=${() => setSel(sel === t.id ? null : t.id)}>
           <div class="b-card-top"><b>${t.id}</b>${t.priority !== "none" ? html`<span class=${"b-pri p-" + t.priority}>${t.priority}</span>` : null}${t.assignee ? html`<span class="b-as" style=${{ color: colorFor(t.assignee) }}>@${t.assignee}</span>` : null}</div>
