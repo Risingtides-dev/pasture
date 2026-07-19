@@ -201,10 +201,46 @@ button{font:inherit}
 .receipt{margin-top:3px;font-size:11px;color:var(--dim);letter-spacing:.02em}
 .receipt.ok{color:#3fb950}
 .receipt.bad{color:var(--err)}
-#docbtn{margin-left:auto;display:flex;align-items:center;gap:6px;background:transparent;border:1px solid var(--paper-edge);border-radius:9px;color:var(--ink-dim);font-size:13px;font-weight:600;padding:5px 10px;cursor:pointer;transition:background .15s var(--ease),color .15s var(--ease)}
-#docbtn:hover{background:var(--paper-3);color:var(--accent-ink)}
-#docbtn + #sumbtn{margin-left:8px}
-@media(max-width:560px){#docbtn .lbl{display:none}}
+#taskbtn,#docbtn{margin-left:auto;display:flex;align-items:center;gap:6px;background:transparent;border:1px solid var(--paper-edge);border-radius:9px;color:var(--ink-dim);font-size:13px;font-weight:600;padding:5px 10px;cursor:pointer;transition:background .15s var(--ease),color .15s var(--ease)}
+#taskbtn:hover,#docbtn:hover{background:var(--paper-3);color:var(--accent-ink)}
+#taskbtn ~ #docbtn,#docbtn + #sumbtn,#taskbtn + #sumbtn{margin-left:8px}
+@media(max-width:560px){#taskbtn .lbl,#docbtn .lbl{display:none}}
+.ico{display:inline-flex;align-items:center;line-height:0}
+.ico svg{display:block}
+/* kanban board */
+.board-back{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:54}
+.board{position:fixed;inset:12px;max-width:1100px;margin:0 auto;background:var(--panel-2);border:1px solid var(--edge);border-radius:var(--r-l);z-index:55;display:flex;flex-direction:column;box-shadow:0 24px 64px rgba(0,0,0,.6);animation:card-in .2s var(--ease) both}
+.b-hd{display:flex;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid var(--edge)}
+.b-hd h3{margin:0;font-size:14.5px;display:flex;align-items:center;gap:8px;color:var(--txt)}
+.b-hd .sub{color:var(--dim);font-weight:400;font-size:12.5px}
+.b-hd .x{margin-left:6px;background:transparent;border:0;color:var(--dim);cursor:pointer;font-size:15px;padding:2px 6px;border-radius:6px}
+.b-hd .x:hover{color:var(--txt);background:var(--panel)}
+.b-new{margin-left:auto;background:transparent;border:1px solid var(--edge);border-radius:8px;color:var(--txt);font:600 12.5px inherit;padding:5px 11px;cursor:pointer}
+.b-new:hover{border-color:var(--teal);color:var(--teal)}
+.b-form{padding:10px 14px;border-bottom:1px solid var(--edge);display:flex;flex-direction:column;gap:7px}
+.b-form input,.b-form textarea,.b-form select{background:var(--panel);border:1px solid var(--edge);border-radius:7px;color:var(--txt);font:inherit;font-size:13px;padding:7px 9px}
+.b-form-row{display:flex;gap:7px;flex-wrap:wrap}
+.b-form-row button{background:var(--teal);border:0;border-radius:7px;color:#04262b;font-weight:700;font-size:13px;padding:7px 14px;cursor:pointer}
+.b-cols{display:flex;gap:10px;overflow-x:auto;padding:12px;flex:1;-webkit-overflow-scrolling:touch}
+.b-col{min-width:232px;width:232px;flex:0 0 auto;background:var(--panel);border:1px solid var(--edge);border-radius:10px;padding:8px;overflow-y:auto}
+.b-col-hd{font-size:11.5px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:var(--dim);padding:2px 4px 8px}
+.b-col-hd .cnt{color:var(--txt);margin-left:4px}
+.b-card{background:var(--panel-2);border:1px solid var(--edge);border-radius:8px;padding:8px 9px;margin-bottom:8px;cursor:pointer}
+.b-card.sel{border-color:var(--teal)}
+.b-card-top{display:flex;gap:6px;align-items:center;font-size:11px;color:var(--dim);flex-wrap:wrap}
+.b-pri{border:1px solid var(--edge);border-radius:5px;padding:0 5px}
+.b-pri.p-high,.b-pri.p-urgent{color:#f85149;border-color:rgba(248,81,73,.4)}
+.b-pri.p-medium{color:#e3b341}
+.b-title{font-size:13px;font-weight:600;margin-top:3px;color:var(--txt)}
+.b-desc{font-size:12px;color:#aab2bc;margin-top:4px;line-height:1.45;max-height:70px;overflow:hidden}
+.b-labels{font-size:10.5px;color:var(--dim);margin-top:4px}
+.b-acts{margin-top:7px;border-top:1px solid var(--edge);padding-top:7px}
+.b-act-row{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:6px;align-items:center}
+.b-act-row .lb{font-size:10.5px;color:var(--dim);min-width:20px}
+.b-act-row button{background:var(--panel);border:1px solid var(--edge);border-radius:6px;color:var(--txt);font-size:11px;padding:3px 8px;cursor:pointer}
+.b-act-row button:hover{border-color:var(--teal)}
+.b-act-row button.on{border-color:var(--teal);color:var(--teal)}
+@media(max-width:560px){.board{inset:8px}.b-col{min-width:204px;width:204px}}
 .doc-panel .body{white-space:normal}
 .doc-row{display:flex;gap:10px;align-items:flex-start;padding:9px 0;border-bottom:1px solid var(--edge)}
 .doc-row:last-of-type{border-bottom:0}

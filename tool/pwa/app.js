@@ -29,6 +29,16 @@ const onLight = n => lum(colorFor(n)) > 0.85;
 const nameColor = n => onLight(n) ? "#e7e9ec" : colorFor(n);
 const initInk = n => onLight(n) ? "#12151c" : "#fff";
 const djb2 = s => { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0; return h.toString(36); };
+// inline SVG icons — UI chrome never uses emoji (renders as colored pictographs,
+// clashes with the design). stroke=currentColor so they inherit button color.
+const ICONS = {
+  tasks: '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><rect x="1.8" y="2.2" width="3.4" height="8.6" rx="1"/><rect x="6.3" y="2.2" width="3.4" height="11.6" rx="1"/><rect x="10.8" y="2.2" width="3.4" height="6" rx="1"/></svg>',
+  summarize: '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M2.2 3.2h11.6M2.2 6.4h11.6M2.2 9.6h6.5M2.2 12.8h4"/><path d="M12.2 9.2l.9 1.9 1.9.9-1.9.9-.9 1.9-.9-1.9-1.9-.9 1.9-.9z" fill="currentColor" stroke="none"/></svg>',
+  mail: '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="1.8" y="3.2" width="12.4" height="9.6" rx="1.6"/><path d="M2.2 4.4 8 8.8l5.8-4.4"/></svg>',
+  at: '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><circle cx="8" cy="8" r="2.6"/><path d="M10.6 8v1.2a1.8 1.8 0 0 0 3.6 0V8a6.2 6.2 0 1 0-2.3 4.8"/></svg>',
+  bolt: '<svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor" stroke="none"><path d="M9.2 1.4 3.4 9h3.2l-.9 5.6L11.6 7H8.3z"/></svg>',
+};
+const Icon = ({ n }) => html`<span class="ico" dangerouslySetInnerHTML=${{ __html: ICONS[n] || "" }}></span>`;
 function fmt(t) {
   t = esc(t);
   t = t.replace(/```([\s\S]*?)```/g, (m, c) => `<div class="cb"><button class="cpy" title="copy">copy</button><pre>${c.trim()}</pre></div>`);
@@ -113,7 +123,7 @@ const store = {
   dmWith: localStorage.getItem("sp_dm") || "",
   pads: [], doc: null, blocks: null, pending: [], notices: [], dmlogs: {},
   summary: null, summaryOpen: false, summarizing: false,
-  doctor: null, doctorOpen: false,
+  doctor: null, doctorOpen: false, boardOpen: false,
   dmView: "chat", terms: {},
   authed: false, loginErr: "",
 };
@@ -390,7 +400,7 @@ async function requestSummary() {
   try {
     const r = await api("/summarize?pad=" + encodeURIComponent(store.pad), { method: "POST", body: JSON.stringify({ by: store.me }) });
     if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || "HTTP " + r.status);
-    notice("🧵 summarizing the thread — I'll pop it up here (and notify you) when it's ready");
+    notice("summarizing the thread — I'll pop it up here (and notify you) when it's ready");
   } catch (err) {
     store.summarizing = false; publish();
     notice("⚠ summarize failed: " + err.message, true);
@@ -795,16 +805,19 @@ function App() {
         <button id="hamb" aria-label="channels" onClick=${() => setDrawer(!drawer)}>☰</button>
         <span class="name">${s.dmWith ? "@" + s.dmWith : "# " + (s.pad || "…")}</span>
         ${!s.dmWith && html`<span class="meta">${s.doc ? members + " members" : ""}</span>`}
+        ${!s.dmWith && html`<button id="taskbtn" title="kanban board — tasks parsed live from the pad" onClick=${() => { store.boardOpen = true; publish(); }}><${Icon} n="tasks"/><span class="lbl">tasks</span></button>`}
         ${!s.dmWith && html`<button id="docbtn" title="pad vitals — heartbeats, wakes, locks, deliveries" onClick=${openDoctor}>♥<span class="lbl">vitals</span></button>`}
-        ${!s.dmWith && html`<button id="sumbtn" title="summarize this thread" disabled=${s.summarizing} onClick=${requestSummary}>${s.summarizing ? "…" : "🧵"}<span class="lbl">${s.summarizing ? "summarizing" : "summarize"}</span></button>`}
+        ${!s.dmWith && html`<button id="sumbtn" title="summarize this thread" disabled=${s.summarizing} onClick=${requestSummary}>${s.summarizing ? "…" : html`<${Icon} n="summarize"/>`}<span class="lbl">${s.summarizing ? "summarizing" : "summarize"}</span></button>`}
       </div>
       <${StatusBar}/>
       <${ClaimBar}/>
       <${Log}/>
       <${Composer}/>
       ${s.doctorOpen && html`<${DoctorPanel}/>`}
+      ${s.boardOpen && html`<${BoardPanel}/>`}
+      ${s.boardOpen && html`<${BoardPanel}/>`}
       ${s.summaryOpen && s.summary && html`<div class="sum-panel">
-        <h3>🧵 Thread summary <span class="sub">#${s.pad}</span><button class="x" aria-label="close" onClick=${() => { store.summaryOpen = false; publish(); }}>✕</button></h3>
+        <h3><${Icon} n="summarize"/> Thread summary <span class="sub">#${s.pad}</span><button class="x" aria-label="close" onClick=${() => { store.summaryOpen = false; publish(); }}>✕</button></h3>
         ${s.summary.error
           ? html`<div class="body">⚠ ${s.summary.error}</div>`
           : html`<div class="body md" dangerouslySetInnerHTML=${{ __html: fmtMd(s.summary.text) }}></div>`}
@@ -862,6 +875,82 @@ document.addEventListener("click", e => {
 // images loading in can grow the log after we stuck to bottom — re-stick
 document.addEventListener("load", e => { if (e.target.tagName === "IMG" && e.target.closest("#log") && nearBottom()) stick(); }, true);
 
+// ── kanban board: tasks parsed straight from the pad markdown ─
+const TASK_STATUSES = ["backlog", "todo", "in_progress", "in_review", "done", "canceled"];
+const TASK_PRIOS = ["none", "low", "medium", "high", "urgent"];
+function parseTasks(md) {
+  const out = []; const re = /```task (\S+)\n([\s\S]*?)```/g; let m;
+  while ((m = re.exec(md || ""))) {
+    const t = { id: m[1], title: "", status: "todo", priority: "none", assignee: "", labels: "", created: "", desc: [] };
+    let inDesc = false;
+    for (const ln of m[2].split("\n")) {
+      if (!inDesc && /^---/.test(ln)) { inDesc = true; continue; }
+      const kv = !inDesc && ln.match(/^(\w+):\s*(.*)$/);
+      if (kv && kv[1] in t && kv[1] !== "desc") t[kv[1]] = kv[2].trim();
+      else if (inDesc && ln.trim()) t.desc.push(ln.trim());
+    }
+    t.desc = t.desc.join("\n");
+    const i = out.findIndex(x => x.id === t.id); if (i >= 0) out.splice(i, 1); // dup blocks: last wins
+    if (t.title !== "example task") out.push(t);
+  }
+  return out;
+}
+async function taskOp(body) {
+  try {
+    const r = await api("/task?pad=" + encodeURIComponent(store.pad), { method: "POST", body: JSON.stringify({ ...body, by: store.me }) });
+    const j = await r.json();
+    if (!j.ok) notice("⚠ board: " + (j.error || "failed"), true);
+  } catch (e) { notice("⚠ board: " + e.message, true); }
+}
+function BoardPanel() {
+  const s = useStore();
+  const [sel, setSel] = useState(null);
+  const [showNew, setShowNew] = useState(false);
+  const tasks = parseTasks(s.doc?.pad);
+  const roster = (s.doc?.roster || []).map(r => r.name);
+  const col = st => tasks.filter(t => t.status === st);
+  const close = () => { store.boardOpen = false; publish(); };
+  const move = (id, st) => { taskOp({ op: "move", id, status: st }); setSel(null); notice(`${id} → ${st.replace(/_/g, " ")}`); };
+  const submitNew = e => {
+    e.preventDefault(); const f = e.target;
+    if (!f.title.value.trim()) return;
+    taskOp({ op: "new", title: f.title.value.trim(), priority: f.priority.value, assignee: f.assignee.value, labels: f.labels.value.trim(), desc: f.desc.value.trim() });
+    setShowNew(false); notice("creating task…");
+  };
+  return html`<div class="board-back" onClick=${close}></div>
+  <div class="board">
+    <div class="b-hd"><h3><${Icon} n="tasks"/> Tasks <span class="sub">#${s.pad} · ${tasks.length}</span></h3>
+      <button class="b-new" onClick=${() => setShowNew(!showNew)}>＋ task</button>
+      <button class="x" aria-label="close" onClick=${close}>✕</button></div>
+    ${showNew && html`<form class="b-form" onSubmit=${submitNew}>
+      <input name="title" placeholder="title" required maxlength="180"/>
+      <textarea name="desc" placeholder="description — scope / acceptance" rows="3"></textarea>
+      <div class="b-form-row">
+        <select name="assignee"><option value="">unassigned</option>${roster.map(n => html`<option key=${n} value=${n}>@${n}</option>`)}</select>
+        <select name="priority">${TASK_PRIOS.map(pr => html`<option key=${pr} value=${pr}>${pr}</option>`)}</select>
+        <input name="labels" placeholder="labels,comma"/>
+        <button type="submit">create</button>
+      </div>
+    </form>`}
+    <div class="b-cols">
+      ${TASK_STATUSES.map(st => html`<div class="b-col" key=${st}>
+        <div class="b-col-hd">${st.replace(/_/g, " ")} <span class="cnt">${col(st).length}</span></div>
+        ${col(st).map(t => html`<div class=${"b-card" + (sel === t.id ? " sel" : "")} key=${t.id} onClick=${() => setSel(sel === t.id ? null : t.id)}>
+          <div class="b-card-top"><b>${t.id}</b>${t.priority !== "none" ? html`<span class=${"b-pri p-" + t.priority}>${t.priority}</span>` : null}${t.assignee ? html`<span class="b-as" style=${{ color: colorFor(t.assignee) }}>@${t.assignee}</span>` : null}</div>
+          <div class="b-title">${t.title}</div>
+          ${t.desc && html`<div class="b-desc">${t.desc}</div>`}
+          ${t.labels && html`<div class="b-labels">${t.labels}</div>`}
+          ${sel === t.id && html`<div class="b-acts" onClick=${e => e.stopPropagation()}>
+            <div class="b-act-row"><span class="lb">→</span>${TASK_STATUSES.filter(x => x !== t.status).map(x => html`<button key=${x} onClick=${() => move(t.id, x)}>${x.replace(/_/g, " ")}</button>`)}</div>
+            <div class="b-act-row"><span class="lb">pri</span>${TASK_PRIOS.map(x => html`<button key=${x} class=${x === t.priority ? "on" : ""} onClick=${() => { taskOp({ op: "edit", id: t.id, priority: x }); setSel(null); }}>${x}</button>`)}</div>
+            <div class="b-act-row"><span class="lb">to</span>${roster.map(n => html`<button key=${n} class=${n === t.assignee ? "on" : ""} onClick=${() => { taskOp({ op: "edit", id: t.id, assignee: n }); setSel(null); }}>@${n}</button>`)}</div>
+          </div>`}
+        </div>`)}
+      </div>`)}
+    </div>
+  </div>`;
+}
+
 // ── agent cards (imperative popover, same as before) ─────────
 const cardEl = document.getElementById("card"), cardBack = document.getElementById("cardback");
 function agentCard(name) {
@@ -898,9 +987,9 @@ function agentCard(name) {
   // compact → the real /compact through the DM slash pipe (claude only).
   const isClaude = harnessOf(name) === "claude";
   const acts = `<div class="cacts">` +
-    `<button class="cact" data-act="dm" data-n="${esc(name)}">✉ message</button>` +
-    `<button class="cact" data-act="mention" data-n="${esc(name)}">@ mention</button>` +
-    (isClaude ? `<button class="cact" data-act="compact" data-n="${esc(name)}">⚡ compact</button>` : "") +
+    `<button class="cact" data-act="dm" data-n="${esc(name)}"><span class="ico">${ICONS.mail}</span> message</button>` +
+    `<button class="cact" data-act="mention" data-n="${esc(name)}"><span class="ico">${ICONS.at}</span> mention</button>` +
+    (isClaude ? `<button class="cact" data-act="compact" data-n="${esc(name)}"><span class="ico">${ICONS.bolt}</span> compact</button>` : "") +
     `</div>`;
   return `<div class="top" style="background:${col}"></div><div class="body">` + pfp +
     `<div class="nm" style="color:${nameColor(name)}">@${esc(name)}</div>` +

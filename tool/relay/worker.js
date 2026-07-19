@@ -222,7 +222,7 @@ export default {
     }
 
     // Non-API paths → serve the PWA static assets (index.html, manifest).
-    const API = ["/login", "/join-request", "/invite", "/pads", "/pad", "/pad.colors", "/push", "/say", "/outbox", "/dm", "/dmbox", "/dm-in", "/dm-status", "/dmlog", "/summarize", "/summary-in", "/summary", "/term", "/term-in", "/doctor", "/doctor-in", "/upload-image", "/upload-file", "/filebox", "/ws"];
+    const API = ["/login", "/join-request", "/invite", "/pads", "/pad", "/pad.colors", "/push", "/say", "/outbox", "/dm", "/dmbox", "/dm-in", "/dm-status", "/dmlog", "/summarize", "/summary-in", "/summary", "/task", "/term", "/term-in", "/doctor", "/doctor-in", "/upload-image", "/upload-file", "/filebox", "/ws"];
     if (!API.includes(url.pathname) && !url.pathname.startsWith("/img/") && !url.pathname.startsWith("/f/")) {
       return env.ASSETS ? env.ASSETS.fetch(req) : json({ error: "no assets" }, 404);
     }
@@ -299,6 +299,13 @@ export default {
       if (!from || !to || !text) return json({ error: "need from + to + text" }, 400);
       await tryDeliver(env, pad, "dm-in", { from, to, text, at: at || Date.now() });
       return json({ ok: true });
+    }
+    // kanban ops from the PWA → bridge runs the task CLI (new/move/edit)
+    if (url.pathname === "/task" && req.method === "POST") {
+      const body = await req.json().catch(() => ({}));
+      if (!body.op) return json({ error: "need op" }, 400);
+      const ok = await tryDeliver(env, pad, "task", { ...body, at: Date.now() });
+      return json(ok ? { ok: true } : { ok: false, error: "bridge offline" }, ok ? 200 : 503);
     }
     // terminal-view request (PWA) → bridge captures the agent's pane, posts back
     if (url.pathname === "/term" && req.method === "POST") {

@@ -11,7 +11,7 @@
 //
 //   STITCHPAD_RELAY=... STITCHPAD_TOKEN=... node bridge-ws.mjs [roots...]
 import { execFile, spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, watch, writeFileSync, readFileSync, readdirSync, truncateSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, watch, writeFileSync, readFileSync, readdirSync, truncateSync, statSync, openSync, readSync, closeSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import os from "node:os";
@@ -299,6 +299,7 @@ function connect(p) {
     else if (m.type === "file") await onFile(p, m.msg || {});
     else if (m.type === "summarize") summarize(p, m.msg || {});   // async, don't block the socket
     else if (m.type === "term") onTerm(p, m.msg || {});           // live terminal capture
+    else if (m.type === "task") onTask(p, m.msg || {});           // kanban board ops
   };
   ws.onclose = () => { if (p.ws !== ws || p.closed) return; p.ws = null; setTimeout(() => connect(p), Math.min(30000, 1000 * 2 ** (p.tries++))); };
   ws.onerror = () => { try { ws.close(); } catch {} };
@@ -355,6 +356,36 @@ async function summarize(p, msg) {
     });
     c.stdin.write("THREAD:\n\n" + tail); c.stdin.end();
   } catch (e) { await post({ error: e.message }); }
+}
+
+// kanban ops from the phone board: run the task CLI with validated flags only,
+// then re-push so every phone's board re-renders from the pad itself
+const TASK_STATUSES = new Set(["backlog", "todo", "in_progress", "in_review", "done", "canceled"]);
+const TASK_PRIOS = new Set(["none", "low", "medium", "high", "urgent"]);
+async function onTask(p, msg) {
+  const { op } = msg || {};
+  try {
+    if (op === "move" && msg.id && TASK_STATUSES.has(msg.status)) {
+      await sh(SP, ["task", "move", String(msg.id).slice(0, 20), msg.status], { cwd: p.proj });
+      log(p.name, `task ${msg.id} → ${msg.status} (by @${msg.by || "?"})`);
+    } else if (op === "new" && msg.title) {
+      const args = ["task", "new", String(msg.title).slice(0, 200)];
+      if (TASK_PRIOS.has(msg.priority)) args.push("--priority", msg.priority);
+      if (msg.assignee) args.push("--to", String(msg.assignee).slice(0, 40));
+      if (msg.labels) args.push("--labels", String(msg.labels).slice(0, 120));
+      if (msg.desc) args.push("--desc", String(msg.desc).slice(0, 1000));
+      await sh(SP, args, { cwd: p.proj });
+      log(p.name, `task new "${String(msg.title).slice(0, 40)}" (by @${msg.by || "?"})`);
+    } else if (op === "edit" && msg.id) {
+      const args = ["task", "edit", String(msg.id).slice(0, 20)];
+      if (TASK_PRIOS.has(msg.priority)) args.push("--priority", msg.priority);
+      if (msg.assignee !== undefined) args.push("--to", String(msg.assignee).slice(0, 40));
+      if (msg.labels !== undefined) args.push("--labels", String(msg.labels).slice(0, 120));
+      await sh(SP, args, { cwd: p.proj });
+      log(p.name, `task edit ${msg.id} (by @${msg.by || "?"})`);
+    } else { log(p.name, "task op ignored:", JSON.stringify(msg || {}).slice(0, 80)); return; }
+    pushPad(p, "task");
+  } catch (e) { log(p.name, "task op failed:", e.message?.slice(0, 100)); }
 }
 
 // agent → human DMs: `stitchpad dm` appends to .state/dmout.jsonl; forward each
@@ -513,6 +544,45 @@ setInterval(() => pads.forEach(keepAlive), 60000);
 // matching the agent's runtime + the pad's project dir. Ambiguous → skip + log;
 // never guess, never touch operator-locked or foreign-claimed terminals.
 const RUNTIME_AGENT = { claude: "claude", codex: "codex", pi: "pi" };
+// REAL model detection: the pane list names each agent's live session file —
+// the last "model" the session actually recorded beats any guessed chip.
+function findSessionFile(root, id, depth = 0) {
+  if (depth > 3) return null;
+  let entries; try { entries = readdirSync(root, { withFileTypes: true }); } catch { return null; }
+  for (const e of entries) {
+    const f = join(root, e.name);
+    if (e.isFile() && e.name.includes(id) && e.name.endsWith(".jsonl")) return f;
+    if (e.isDirectory()) { const r = findSessionFile(f, id, depth + 1); if (r) return r; }
+  }
+  return null;
+}
+function modelFromSession(sess) {
+  try {
+    if (!sess || !sess.value) return null;
+    let file = null;
+    if (sess.kind === "path") file = sess.value.replace(/^~\//, HOME + "/");
+    else if (sess.kind === "id") {
+      const root = (sess.source || "").includes("claude") ? join(HOME, ".claude", "projects") : join(HOME, ".codex", "sessions");
+      file = findSessionFile(root, sess.value);
+    }
+    if (!file || !existsSync(file)) return null;
+    const sz = statSync(file).size, len = Math.min(sz, 262144);
+    const fd = openSync(file, "r"), buf = Buffer.alloc(len);
+    readSync(fd, buf, 0, len, sz - len); closeSync(fd);
+    // STRUCTURED fields only, newest line first — a regex over raw text can be
+    // faked by pasted JSON inside chat content; real session entries can't.
+    const lines = buf.toString("utf8").split("\n");
+    const pick = o => o && (o.modelId || o.model ||
+      (o.message && o.message.model) ||
+      (o.turn_context && o.turn_context.model) ||
+      (o.payload && (o.payload.model || (o.payload.turn_context && o.payload.turn_context.model))));
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const ln = lines[i].trim(); if (!ln.startsWith("{")) continue;
+      try { const v = pick(JSON.parse(ln)); if (typeof v === "string" && /^[A-Za-z0-9._:\/-]{2,48}$/.test(v)) return v; } catch { /* partial first line of the tail window */ }
+    }
+    return null;
+  } catch { return null; }
+}
 async function healTargets() {
   let panes = [];
   try {
@@ -529,7 +599,14 @@ async function healTargets() {
       const [name, adapter, wake, target] = line.split("|").map(s => (s || "").trim());
       if (!name || adapter !== "herdr" || !target || target === "-") continue;
       const term = target.split("@@").pop();
-      if (liveTerms.has(term)) continue;   // target is alive — nothing to heal
+      const livePane = panes.find(x => x.terminal_id === term);
+      if (livePane) {
+        // target healthy → keep the model chip TRUE: read what the agent's
+        // session actually ran last, straight from its transcript
+        const mdl = modelFromSession(livePane.agent_session);
+        if (mdl) { try { writeFileSync(join(p.padd, ".state", "model." + name), mdl); } catch {} }
+        continue;
+      }
       let runtime = "";
       try { runtime = readFileSync(join(p.padd, ".state", "runtime." + name), "utf8").trim(); } catch {}
       const want = RUNTIME_AGENT[runtime] || null;
