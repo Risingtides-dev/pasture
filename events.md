@@ -794,3 +794,10 @@ area:      [frontend]
 
 Ocean-surface tasks absent from the web board — two stacked causes. (1) The pad regrew past the 400KB phone cap overnight and the trim kept only roster + newest 350KB: 15 task blocks locally, 6 in the pushed doc — the board renders from the doc, so 9 tasks vanished. Trim now pins EVERY task block through the cut (last occurrence wins, since edits rewrite blocks in place), same as the roster. (2) The crew invented status "queued", which wasn't in the fixed column list — those tasks parsed fine and rendered NOWHERE. Board columns now adapt: unknown statuses get real columns inserted after todo; a task can never fall off the board because of its status string. Also fixed sp_tasks printing duplicate rows for compact-carried block copies (last-wins dedupe in the awk, order preserved) so CLI task list, wake task lines, MCP, and the board all agree. Verified: 12 unique tasks in the pushed doc matching 12 unique CLI rows; adaptive-columns bundle live.
 _________________________________________________________________________________
+time:      [17:45] [07-19-26]
+agent:     [claude] [fable 5]
+type:      [bug-report]
+area:      [frontend]
+
+"Tasks keep not showing" round two: server side was already fixed (12 task blocks in the pushed doc, adaptive-columns bundle deployed) — the real culprit was CLIENT CACHING: browsers/PWA installs load app.js from HTTP cache without revalidating, so every fix requires a manual kill-and-reopen and stale bundles resurface old bugs. Shipped a _headers file for the worker's asset layer: Cache-Control no-cache on / , /index.html, /app.js (Cloudflare normalizes to max-age=0 must-revalidate + etag → one cheap 304 per open when unchanged), long cache kept for vendor/avatars. Verified header live. One final manual reload needed; after that, bundle updates arrive on every app open automatically.
+_________________________________________________________________________________
