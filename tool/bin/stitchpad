@@ -1289,6 +1289,13 @@ except Exception:
       if [ -n "$_open" ]; then
         printf 'your open tasks: %s— move each with the task tool (in_progress when you start, done when finished), unprompted.\n' "$_open"
       fi
+      # TICKET DISCIPLINE: numbering work items in prose without creating the
+      # ticket makes every board lie. Nag while the phantom refs are fresh.
+      _known="$(sp_tasks 2>/dev/null | awk -F'|' '{print $1}')"
+      _phantom="$(tail -n 80 "$PAD_MD" | grep -o 'TASK-[0-9]*' | sort -u | while read -r _t; do printf '%s\n' "$_known" | grep -qx "$_t" || echo "$_t"; done | head -4 | paste -sd, -)"
+      if [ -n "$_phantom" ]; then
+        printf 'ticket discipline: %s referenced on the pad with NO ticket — whoever owns them must run `stitchpad task new "<title>" --to <name> --desc "<scope>"` (ids follow automatically).\n' "$_phantom"
+      fi
     fi
     [ "$peek" -eq 0 ] && printf '%s' "$last_mention_to_me" > "$seen_file"   # mark delivered
     exit 0
@@ -1868,14 +1875,15 @@ except: print("")' 2>/dev/null)"
             *) shift ;;
           esac
         done
-        # Generate next ID: parse existing IDs, find max, increment
+        sp_lock || exit 1
+        # Next ID computed UNDER the lock — two agents creating concurrently
+        # used to read the same max and mint colliding ids
         existing=$(sp_tasks | awk -F'|' '{print $1}' | sed 's/TASK-//' | sort -n | tail -1)
         [ -z "$existing" ] && existing=0
         id="TASK-$(( existing + 1 ))"
         # Build the block — always include all core fields so edit can find them
         ts="$(date -u '+%m-%d %H:%M')"
         block="\`\`\`task $id"$'\n'"title: $title"$'\n'"status: todo"$'\n'"priority: $priority"$'\n'"assignee: ${assignee:-}"$'\n'"labels: ${labels:-}"$'\n'"created: $ts"$'\n'"---"$'\n'"${desc:-$id created}"$'\n'"\`\`\`"
-        sp_lock || exit 1
         printf '\n%s\n' "$block" >> "$PAD_MD"
         sp_commit "task $id: $title"
         sp_unlock
