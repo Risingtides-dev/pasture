@@ -6,6 +6,7 @@ set -euo pipefail
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; NC='\033[0m'
 PASS=0; FAIL=0
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 SP="$(command -v stitchpad || echo "$HOME/.stitchpad/bin/stitchpad")"
 RELAY="${STITCHPAD_RELAY:-}"
@@ -138,7 +139,7 @@ else
 fi
 
 # Document destructive /outbox as known risk
-if grep -q 'destructive.*outbox\|claim/ack' "$HOME/stitchpad/test/pwa-contract.sh"; then
+if grep -q 'destructive.*outbox\|claim/ack' "$ROOT/test/pwa-contract.sh"; then
   echo -e "  ${GREEN}PASS${NC} documented: destructive outbox acknowledged"; PASS=$((PASS+1))
 else
   echo -e "  ${RED}FAIL${NC} documented: destructive outbox acknowledged"; FAIL=$((FAIL+1))
