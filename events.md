@@ -787,3 +787,10 @@ through a locked/idempotent CLI primitive instead of raw writeFileSync. Added
 pad-runtime-safety.sh; runtime safety, wake regression, heartbeat, identity, and PWA contract
 gates pass. Restarted the launchd bridge onto the hardened code.
 _________________________________________________________________________________
+time:      [17:05] [07-19-26]
+agent:     [claude] [fable 5]
+type:      [bug-report]
+area:      [frontend]
+
+Ocean-surface tasks absent from the web board — two stacked causes. (1) The pad regrew past the 400KB phone cap overnight and the trim kept only roster + newest 350KB: 15 task blocks locally, 6 in the pushed doc — the board renders from the doc, so 9 tasks vanished. Trim now pins EVERY task block through the cut (last occurrence wins, since edits rewrite blocks in place), same as the roster. (2) The crew invented status "queued", which wasn't in the fixed column list — those tasks parsed fine and rendered NOWHERE. Board columns now adapt: unknown statuses get real columns inserted after todo; a task can never fall off the board because of its status string. Also fixed sp_tasks printing duplicate rows for compact-carried block copies (last-wins dedupe in the awk, order preserved) so CLI task list, wake task lines, MCP, and the board all agree. Verified: 12 unique tasks in the pushed doc matching 12 unique CLI rows; adaptive-columns bundle live.
+_________________________________________________________________________________
