@@ -1007,7 +1007,10 @@ function agentCard(name) {
     `</div>` : "";
   // ACTIONS: message → the DM pane; mention → drops @name in the composer;
   // compact → the real /compact through the DM slash pipe (claude only).
-  const isClaude = harnessOf(name) === "claude";
+  // /compact is a HARNESS feature: Claude Code and Codex CLI both understand it
+  // as a terminal slash command; pi bounces slashes (chat text) and ocean seats
+  // have no terminal. Button appears only where the keystroke actually works.
+  const isClaude = ["claude", "codex"].includes(harnessOf(name));
   const acts = `<div class="cacts">` +
     `<button class="cact" data-act="dm" data-n="${esc(name)}"><span class="ico">${ICONS.mail}</span> message</button>` +
     `<button class="cact" data-act="mention" data-n="${esc(name)}"><span class="ico">${ICONS.at}</span> mention</button>` +
