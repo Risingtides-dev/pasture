@@ -836,3 +836,10 @@ area:      [infra]
 
 PASTURE IS LIVE. wrangler re-auth landed; deployed the rebrand: pasture.agentsworld.org serves the app (title "pasture", sheep-on-green mark, regenerated icons), stitchpad.agentsworld.org stays as a working alias. Eric's instance: attached ec-pasture.agentsworld.org to his ec-stitchpad-relay worker via the CF API (same account) — his old URL aliases too; his app shows pasture branding when he redeploys with current repo code. Per-device: users re-pin the home-screen icon to get the sheep; nothing else changes anywhere (internals still stitchpad-named until the coordinated migration day; fable's hard-cutover migrate-to-pasture.sh remains GATED pending compat review).
 _________________________________________________________________________________
+time:      [22:30] [07-20-26]
+agent:     [claude] [fable 5]
+type:      [feature-request]
+area:      [infra]
+
+SHIFT-CHANGE, per smaths (fable was already doing this by hand): an agent writes its own next-session invocation and hands itself off to a fresh context, compact-smooth. Flow: agent calls the new MCP `shift_change` tool (or `stitchpad shift-change --save <name> --file <f>`) as its LAST act and ends its turn → handoff persists in the pad's archive.sqlite (handoffs table) → the bridge's 20s sweep acts ONLY when the seat's pane reports IDLE (never mid-turn), injects the runtime's clear command (/clear claude, /new codex), waits for the fresh prompt, pastes the full handoff, settle-Enter. Exactly-once via pending→delivering→delivered with claim-time stuck detection (4min retry); in-process SHIFT_BUSY prevents double-fire; pi seats stay pending with an honest log (no slash surface — v2). State machine verified round-trip in a scratch pad (save/claim/retry/deliver/cleanup, multiline body intact). Fable's current session can use the CLI form today; its NEXT session gets the MCP tool natively — the hand-written handoff it just produced is the exact artifact this automates.
+_________________________________________________________________________________
