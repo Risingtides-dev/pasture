@@ -465,11 +465,20 @@ async function uploadFiles(files) {
     if (f.size > 15 * 1024 * 1024) { notice("⚠ " + f.name + " is over the 15MB cap", true); continue; }
     notice("⬆ uploading " + f.name + "…");
     try {
-      const fd = new FormData(); fd.append("file", f);
-      const r = await fetch(RELAY + "/upload-file?pad=" + encodeURIComponent(store.pad), { method: "POST", headers: { authorization: "Bearer " + store.token }, body: fd });
+      // Images EMBED inline (upload-image → ![alt](/img/…) markdown) — the
+      // old path shoved screenshots into the dropbox as a text line, which is
+      // why "attach a screenshot" rendered nothing. Other files keep the
+      // dropbox flow.
+      const isImg = ["image/png", "image/jpeg", "image/gif", "image/webp"].includes(f.type);
+      const fd = new FormData(); fd.append(isImg ? "image" : "file", f);
+      const route = isImg ? "/upload-image" : "/upload-file";
+      const r = await fetch(RELAY + route + "?pad=" + encodeURIComponent(store.pad), { method: "POST", headers: { authorization: "Bearer " + store.token }, body: fd });
       if (!r.ok) throw new Error("HTTP " + r.status);
       const j = await r.json();
-      await api("/say?pad=" + encodeURIComponent(store.pad), { method: "POST", body: JSON.stringify({ from: store.me, text: "📎 dropped **" + j.name + "** → .stitchpad/dropbox/" + j.name }) });
+      const text = isImg
+        ? "![" + (f.name || "image").replace(/[\[\]()]/g, "_") + "](" + j.url + ")"
+        : "📎 dropped **" + j.name + "** → .stitchpad/dropbox/" + j.name;
+      await api("/say?pad=" + encodeURIComponent(store.pad), { method: "POST", body: JSON.stringify({ from: store.me, text }) });
       setTimeout(poll, 400);
     } catch (err) { notice("⚠ upload failed for " + f.name + " (" + err.message + ")", true); }
   }
