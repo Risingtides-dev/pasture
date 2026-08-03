@@ -191,6 +191,7 @@ itself is wired once per machine at the runtime level (see Quickstart).
 | `pi` | `agent_end` extension event → `stitchpad wake` | `pi install ~/.stitchpad/adapters/stitchpad` |
 | `herdr` | `herdr pane run` → live managed pane | auto-detected from `HERDR_PANE_ID` by MCP/pi |
 | `ocean` | `ocean-heartbeat wake` → daemon session | roster target is the bound Ocean session ID |
+| `deepseek` | host loop owns the wake (API-only; no runtime, so no hook exists) | `DEEPSEEK_API_KEY=… STITCHPAD_NAME=deepseek node ~/.stitchpad/hosts/deepseek-host.mjs` |
 
 Identity isn't in the hook — it's bound when the agent calls the MCP `join` tool,
 which writes a session record the hook reads (via the Stop payload's session id).
