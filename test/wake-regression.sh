@@ -284,6 +284,7 @@ fi
 	# Regression 12: Adapter FAILURE clears pending — no delivery means
 	# no crash recovery target, so the stamp must be cleared to prevent
 	# the next watcher cycle from deferring forever (the deadlock bug).
+	#
 
 	# --- Regression 10: Watcher defer-or-queue (production) ---
 	case10="$tmp/case10"
@@ -458,5 +459,83 @@ EOF
 	  || fail 'ocean successful delivery did not consume seen cursor'
 	[ ! -f "$case13/.stitchpad/.state/pending.agent" ] \
 	  || fail 'ocean successful delivery left replay-causing pending stamp'
+
+
+	# Regression 14: Per-sender reply ledger — the deafness gate.
+	# The old sp_engagement pinned last_mention to the FIRST mention found
+	# and the caller compared the NEWEST reply against it. Once bob replied
+	# to alice, bob's global last_reply advanced past alice's first mention,
+	# so every later mention — from alice or anyone — was falsely declared
+	# "handled." Four of six live seats were in this state.
+	#
+	# 14a: alice→bob, bob→alice, alice→bob ⇒ bob must have a pending mention.
+	# Bob's reply at ordinal 2 answers alice's mention at ordinal 1, but
+	# alice's second mention at ordinal 3 came AFTER bob's reply and is
+	# unanswered.
+	case14a="$tmp/case14a"
+	mkdir "$case14a"
+	cd "$case14a"
+	"$SP" init --name case14a >/dev/null
+	"$SP" join bob codex >/dev/null
+	stop_watcher "$case14a"
+	STITCHPAD_NAME=alice "$SP" say '@bob first ping' >/dev/null
+	STITCHPAD_NAME=bob "$SP" say '@alice thanks for the first ping' >/dev/null
+	STITCHPAD_NAME=alice "$SP" say '@bob second ping after my reply' >/dev/null
+	out14a="$("$SP" wake bob --peek)"
+	contains "$out14a" 'second ping after my reply' \
+	  || fail 'per-sender ledger (14a): second mention from same sender masked by earlier reply'
+	if contains "$out14a" 'first ping'; then
+	  fail 'per-sender ledger (14a): already-replied mention re-appeared'
+	fi
+
+	# 14b: Cross-sender — replying to X must not clear Y's unanswered mention.
+	# Alice and charlie both mention agent. Agent replies to alice without
+	# consuming either mention first. Charlie's mention must survive.
+	case14b="$tmp/case14b"
+	mkdir "$case14b"
+	cd "$case14b"
+	"$SP" init --name case14b >/dev/null
+	"$SP" join agent codex >/dev/null
+	stop_watcher "$case14b"
+	STITCHPAD_NAME=alice "$SP" say '@agent alice pings agent' >/dev/null
+	STITCHPAD_NAME=charlie "$SP" say '@agent charlie also pings agent' >/dev/null
+	STITCHPAD_NAME=agent "$SP" say '@alice got it alice' >/dev/null
+	out14b="$("$SP" wake agent --peek)"
+	contains "$out14b" 'charlie also pings agent' \
+	  || fail 'per-sender ledger (14b): reply to alice swallowed charlie mention'
+	if contains "$out14b" 'alice pings agent'; then
+	  fail 'per-sender ledger (14b): already-replied alice mention re-appeared'
+	fi
+
+	# Regression 15: sp_recover_inplace truncation race — concurrent say
+	# invocations must not observe the pad at 0 bytes. The old `cat >` in
+	# sp_recover_inplace truncated BEFORE the read, and two concurrent
+	# recoveries could race: process A truncates, process B opens the empty
+	# file between A's truncation and A's write, triggering the "pad roster
+	# is missing" fatal guard. This is a pre-existing master defect that
+	# made wake-regression.sh non-deterministic.
+	case15="$tmp/case15"
+	mkdir "$case15"
+	cd "$case15"
+	"$SP" init --name case15 >/dev/null
+	"$SP" join agent codex >/dev/null
+	stop_watcher "$case15"
+	# Plant a stale .ready file so sp_init_paths triggers recovery on every
+	# say invocation.
+	local_pad_md="$(find "$case15" -name 'stitchpad.md' -o -name 'pasture.md' | head -1)"
+	cp "$local_pad_md" "$local_pad_md.ready"
+	perl -e 'utime time-20, time-20, $ARGV[0]' "$local_pad_md.ready"
+	# Run 20 concurrent says — with the truncation bug, at least a few
+	# hit the "roster is missing" guard and exit non-zero.
+	declare -a _r15_pids=()
+	r15_fails=0
+	for _ in $(seq 1 20); do
+	  STITCHPAD_NAME=tester "$SP" say "concurrent post $$" &
+	  _r15_pids+=($!)
+	done
+	for _pid in "${_r15_pids[@]}"; do
+	  wait "$_pid" 2>/dev/null || r15_fails=$((r15_fails + 1))
+	done
+	[ "$r15_fails" -eq 0 ] || fail "sp_recover_inplace truncation race: $r15_fails of 20 concurrent says failed — roster check observed truncated pad"
 
 	printf 'wake regression ok\n'

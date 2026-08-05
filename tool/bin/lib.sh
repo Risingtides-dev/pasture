@@ -281,7 +281,7 @@ sp_write_inplace() {
 }
 
 sp_recover_inplace() {
-  local target="${1:-$PAD_MD}" ready now mt
+  local target="${1:-$PAD_MD}" ready now mt newsize oldsize
   [ -n "$target" ] || return 0
   ready="$target.ready"
   [ -s "$ready" ] || { rm -f "$ready" 2>/dev/null; return 0; }
@@ -293,7 +293,23 @@ sp_recover_inplace() {
   mt="$(stat -f %m "$ready" 2>/dev/null || stat -c %Y "$ready" 2>/dev/null || echo 0)"
   [ $(( now - mt )) -lt 5 ] && return 0
   echo "stitchpad: recovering interrupted write of $(basename "$target")" >&2
-  cat "$ready" > "$target" && rm -f "$ready" 2>/dev/null
+  # Use the SAME inode-safe discipline as sp_write_inplace: dd conv=notrunc
+  # never truncates the target, so no reader (say, watcher) ever sees an empty
+  # or half-written file. The old `cat "$ready" > "$target"` truncated BEFORE
+  # reading, and a concurrent recovery could remove .ready between truncation
+  # and read — leaving the pad at 0 bytes and triggering the "pad roster is
+  # missing" fatal guard. That is the roster-race bug.
+  newsize="$(wc -c < "$ready" | tr -d ' ')"
+  oldsize="$(wc -c < "$target" 2>/dev/null | tr -d ' ')"; oldsize="${oldsize:-0}"
+  if dd if="$ready" of="$target" conv=notrunc bs=65536 2>/dev/null; then
+    if [ "$newsize" -lt "$oldsize" ]; then
+      perl -e 'truncate($ARGV[0], $ARGV[1]) or exit 1' "$target" "$newsize" 2>/dev/null \
+        || { [ -s "$ready" ] && cat "$ready" > "$target"; }
+    fi
+    rm -f "$ready" 2>/dev/null
+  else
+    echo "stitchpad: in-place recovery of $(basename "$target") failed — content preserved in $ready" >&2
+  fi
   return 0
 }
 
@@ -594,9 +610,28 @@ sp_latest_to() {
 sp_engagement() {
   local who="$1"
   local since="${2:-0}"  # skip mentions with ordinal <= since (FIFO cursor)
-  # roster names, for the implicit-silent word list below: only AGENT authors get
-  # their bare "ack"/"noted" posts silenced. A human operator typing "@pi ack"
-  # means "wake pi" — guessing it silent made operator pings vanish (the pi bug).
+
+  # ── Rust fast-path: wake-gate binary, byte-identical to the awk oracle ──
+  # Gate env: PASTURE_RUST_GATE=1 enables; default OFF because it is new.
+  # The binary lives at $STITCHPAD_HOME/wake-gate/target/debug/wake-gate for
+  # dev builds; a release install would put it directly in $STITCHPAD_HOME/bin/.
+  if [ "${PASTURE_RUST_GATE:-0}" = "1" ]; then
+    local rust_bin
+    if [ -x "$STITCHPAD_HOME/wake-gate/target/debug/wake-gate" ]; then
+      rust_bin="$STITCHPAD_HOME/wake-gate/target/debug/wake-gate"
+    elif [ -x "$STITCHPAD_HOME/bin/wake-gate" ]; then
+      rust_bin="$STITCHPAD_HOME/bin/wake-gate"
+    fi
+    if [ -n "${rust_bin:-}" ] && [ -f "$PAD_MD" ]; then
+      "$rust_bin" "$PAD_MD" "$who" "$since" 2>/dev/null && return 0
+    fi
+    # Fall through to awk if binary not found or pad missing
+  fi
+
+  # ── awk oracle (original, battle-tested) ──
+   # roster names, for the implicit-silent word list below: only AGENT authors get
+   # their bare "ack"/"noted" posts silenced. A human operator typing "@pi ack"
+   # means "wake pi" — guessing it silent made operator pings vanish (the pi bug).
   local agents
   agents="$(sp_roster 2>/dev/null | cut -d'|' -f1 | tr 'A-Z' 'a-z' | paste -sd, -)"
   awk -v who="$(printf '%s' "$1" | tr 'A-Z' 'a-z')" -v agents="$agents" -v since="$since" '
@@ -611,25 +646,37 @@ sp_engagement() {
       if (author==who) {                                          # my own block:
         if (silent || buf ~ /(^|[ \t])@[a-z0-9_-]/) {           # a silent ack OR a real @-address reply
           last_reply=n                                           # last reply ordinal
-          # Try to extract the first @-target: the first non-who agent name address.
-          # This is the sender we replied TO, used for same-sender gate narrowing.
+          # Extract the FIRST @-target: the sender we replied TO.
           # PORTABLE: no gawk match()-with-array; uses substr + sub.
-          split(buf, tokens, /[ \t\n]+/)
-          for (i in tokens) {
-            if (i > 20) break
+          # INDEXED loop, not "for (i in tokens)" — awk array iteration order is
+          # unspecified, so the old form could pick an arbitrary @-token as the
+          # reply target rather than the first one.
+          nt = split(buf, tokens, /[ \t\n]+/)
+          rt = ""
+          for (i = 1; i <= nt && i <= 20; i++) {
             t = tolower(tokens[i])
             if (t ~ /^@[a-z0-9_-]+/) {
               name = substr(t, 2)
               sub(/[^a-z0-9_-].*$/, "", name)
-              if (name != "" && name != "all" && name != who) { reply_target = name; break }
+              if (name != "" && name != "all" && name != who) { rt = name; break }
             }
+          }
+          if (rt != "") {
+            reply_target = rt
+            # PER-SENDER REPLY LEDGER: ordinal of my most recent reply to each
+            # sender. This is what makes "answered" a property of the MENTION
+            # rather than a property of the seat.
+            reply_to[rt] = n
           }
         }
       } else if (!silent && body_mentions(who)) {
-        # FIFO cursor: record the FIRST mention after `since`, never overwrite.
-        # The seen cursor steps one ordinal per delivery; this returns the next
-        # unanswered mention instead of jumping to the newest.
-        if (!last_mention && n > since) { last_mention=n; mention_sender=author }
+        # Collect EVERY candidate after "since", in order. The old code pinned
+        # last_mention to the first one and never overwrote it, so the gate
+        # compared my NEWEST reply against the OLDEST mention: reply once, and
+        # every later mention from that sender was declared handled. The caller
+        # exits before advancing seen, so the pin was permanent — and because a
+        # pinned ordinal can never be displaced, the seat went deaf to EVERYONE.
+        if (n > since) { m_ord[++mc] = n; m_from[mc] = author }
       }
     }
     /^## @/ {
@@ -659,7 +706,20 @@ sp_engagement() {
     # snippets from counting as an address. Real addresses survive because only the
     # backtick-delimited content is blanked, not the surrounding text.
     { line = tolower($0); gsub(/`[^`]*`/, " ", line); buf = buf " " line }
-    END { flush(); print (last_mention+0) " " (mention_sender) " " (last_reply+0) " " (reply_target) }
+    END {
+      flush()
+      # The oldest candidate that is genuinely UNANSWERED: no reply by me to that
+      # sender, newer than the mention itself. Ascending order preserves the FIFO
+      # stepping the seen cursor depends on.
+      last_mention = 0; mention_sender = ""
+      for (j = 1; j <= mc; j++) {
+        snd = m_from[j]
+        if (!(snd in reply_to) || reply_to[snd] < m_ord[j]) {
+          last_mention = m_ord[j]; mention_sender = snd; break
+        }
+      }
+      print (last_mention+0) " " (mention_sender) " " (last_reply+0) " " (reply_target)
+    }
   ' "$PAD_MD"
 }
 

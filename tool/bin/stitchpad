@@ -1457,14 +1457,12 @@ except Exception:
     fi
     read -r oldest_mention_to_me mention_sender last_reply_by_me reply_target <<<"$(sp_engagement "$who" "$_since")"
     [ "${oldest_mention_to_me:-0}" -eq 0 ] && exit 0   # no unanswered mention after seen → nothing to do
-    # REPLY-CLEARS-GATE narrowed to same-sender: my reply only clears the gate
-    # when it's directed at the SAME sender who mentioned me. Replying to X no
-    # longer swallows Y's unanswered mention.
-    if [ "${last_reply_by_me:-0}" -gt "$oldest_mention_to_me" ] \
-       && [ -n "${mention_sender:-}" ] && [ -n "${reply_target:-}" ] \
-       && [ "$reply_target" = "$mention_sender" ]; then
-      exit 0   # my reply to the SAME sender is newer than their mention → handled
-    fi
+    # REPLY-CLEARS-GATE now lives entirely in sp_engagement, which resolves it
+    # PER MENTION against a per-sender reply ledger. The check that used to sit
+    # here compared my NEWEST reply against the OLDEST candidate mention, which
+    # is what made a seat permanently deaf; with a correct oracle it is provably
+    # dead code, and leaving a stale duplicate of the invariant is exactly how
+    # the bug would return.
     # --peek-ordinal: gate is open (mention unanswered) → print the ordinal, done.
     # Uses the already-computed oldest_mention_to_me from sp_engagement; independent
     # of the seen cursor on purpose. Pending stamps answer "owes a reply" while
@@ -1482,7 +1480,14 @@ except Exception:
       exit 0   # muted locally; leave seen untouched so the mention queues
     fi
     # Unanswered → compact one-liner wake message (no "untrusted" alarm noise).
-    _latest="$(sp_latest_to "$who" "$_since")"
+    # Render EXACTLY the mention the oracle chose. sp_latest_to has its own
+    # independent scan ("first block after since that mentions me"), so passing
+    # the raw cursor let the two disagree: sp_engagement would correctly open the
+    # gate on a later unanswered mention while sp_latest_to rendered an EARLIER,
+    # already-answered one — waking an agent about a message it had already
+    # replied to. Anchoring to oldest_mention_to_me - 1 makes the renderer follow
+    # the oracle by construction rather than by coincidence.
+    _latest="$(sp_latest_to "$who" "$(( oldest_mention_to_me - 1 ))")"
     _sender="$(printf '%s\n' "$_latest" | sed -n 's/^## @\([^ ]*\).*/\1/p' | head -1)"
     [ -n "$_sender" ] || _sender="$who"
     _snip="$(printf '%s\n' "$_latest" | grep -v '^## ' | grep -v '^[[:space:]]*$' | head -1 | sed 's/^[[:space:]]*//' | cut -c1-120)"
