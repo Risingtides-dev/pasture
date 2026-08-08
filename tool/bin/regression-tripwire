@@ -1,0 +1,471 @@
+#!/usr/bin/env bash
+# regression-tripwire — ALL-SUITE regression gate.
+#
+# Enforces every test suite in test/ against a committed baseline.
+# Four pillar suites produce the headline numbers; all others also run
+# unless explicitly QUARANTINED (env-dependent, nondeterministic, or
+# requires external daemons).  A quarantined suite never runs but is
+# printed as SKIPPED so reviewers know it exists.
+#
+# META-GATE: any *.sh file in test/ that is NOT in the baseline AND NOT
+# in quarantine causes the tripwire to FAIL.  Ungated gates are impossible.
+#
+# Usage:
+#   regression-tripwire [--sha <ref>]   default: HEAD
+#
+# Hardened (pro3, r1 T-1): exit-code required, anchored regex, delta>0 fails.
+# Compatible with bash 3.2 (macOS default).
+set -euo pipefail
+
+_script_path="${BASH_SOURCE[0]:-$0}"
+HERE="$(cd "$(dirname "$_script_path")" 2>/dev/null && pwd)" || HERE="$(pwd)"
+TOP="$(cd "$HERE/../.." && pwd)"
+
+# ── args ───────────────────────────────────────────────────────────────────
+SHA=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --sha) SHA="$2"; shift 2 ;;
+    *) echo "regression-tripwire: unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+# ── worktree setup ─────────────────────────────────────────────────────────
+if [ -n "$SHA" ]; then
+  WT="$(mktemp -d "${TMPDIR:-/tmp}/tripwire-wt.XXXXXX")"
+  git -C "$TOP" worktree add --detach "$WT" "$SHA" >&2
+  STITCHPAD_HOME="$WT/tool"
+  BASELINE="$WT/test/suite-baseline.txt"
+  QUARANTINE="$WT/test/suite-quarantine.txt"
+  _cleanup() {
+    git -C "$TOP" worktree remove --force "$WT" 2>/dev/null || true
+    rm -rf "$WT" 2>/dev/null || true
+  }
+else
+  WT="$TOP"
+  STITCHPAD_HOME="$TOP/tool"
+  BASELINE="$TOP/test/suite-baseline.txt"
+  QUARANTINE="$TOP/test/suite-quarantine.txt"
+  _cleanup() { true; }
+fi
+# An EXIT trap must NEVER change the exit status.
+# `kill -9 $(jobs -p)` with no background jobs is `kill -9` with NO ARGUMENTS,
+# which fails — and under `set -e` that aborts the trap, so _cleanup never ran
+# AND a clean `exit 0` came back as 1. This gate printed
+#     "TRIPWIRE: PASSED — all 68 enforced suites green"
+# and exited 1, every single run, for the whole build. Anything keying on the
+# exit code (CI, the release step, a human running `&& push`) saw failure on a
+# green board and success never existed.
+# It survived because tripwire-gate's setup_fixture sed-patched `|| true` into
+# its COPY — the gate guarding the gate quietly repaired the defect it exists to
+# catch, so T1 ("all GREEN -> exit 0") passed against a build nobody ships.
+# That workaround is removed; this trap is now correct in the real script.
+_on_exit() {
+  _rc=$?
+  set +e
+  _j="$(jobs -p 2>/dev/null)"
+  [ -n "$_j" ] && kill -9 $_j 2>/dev/null
+  _cleanup
+  exit "$_rc"
+}
+trap _on_exit EXIT
+
+[ -f "$BASELINE" ] || { echo "tripwire: FATAL — baseline not found: $BASELINE" >&2; exit 2; }
+[ -f "$QUARANTINE" ] || { echo "tripwire: FATAL — quarantine not found: $QUARANTINE" >&2; exit 2; }
+
+# ── discover suites ─────────────────────────────────────────────────────────
+# All *.sh files in test/ are candidates.
+ALL_SUITES=()
+for f in "$WT/test/"*.sh; do
+  [ -f "$f" ] && ALL_SUITES+=("$(basename "$f")")
+done
+
+# Four pillar suites always run first (fastest then most critical).
+PILLARS="pro5-tier1-mutant-gates.sh roster-recovery-guard-regression.sh recover-migrated-pad.sh recovery-hardening3-regression.sh"
+
+# ── quarantine resolver ─────────────────────────────────────────────────────
+is_quarantined() {
+  grep -q "^${1}[[:space:]]" "$QUARANTINE" 2>/dev/null
+}
+quarantine_reason() {
+  grep "^${1}[[:space:]]" "$QUARANTINE" 2>/dev/null | sed "s/^${1}[[:space:]]*//" || echo "no reason recorded"
+}
+
+# ── baseline resolver ──────────────────────────────────────────────────────
+has_baseline() {
+  grep -q "^${1}[[:space:]]" "$BASELINE" 2>/dev/null
+}
+baseline_pass() { awk -v suite="$1" '$1 == suite { print $2 }' "$BASELINE"; }
+baseline_fail() { awk -v suite="$1" '$1 == suite { print $3 }' "$BASELINE"; }
+
+# ── run helper ─────────────────────────────────────────────────────────────
+run_suite() {
+  local suite="$1" outfile rc output p f result_line
+  outfile="$(mktemp "${TMPDIR:-/tmp}/tripwire-out.XXXXXX")"
+
+  set +e
+  STITCHPAD_HOME="$STITCHPAD_HOME" \
+    HERDR_PANE_ID= HERDR_TAB_ID= HERDR_ENV= HERDR_SOCKET_PATH= HERDR_WORKSPACE_ID= \
+    bash "$WT/test/$suite" >"$outfile" 2>&1
+  rc=$?
+  set -e
+
+  output="$(cat "$outfile")"
+  rm -f "$outfile"
+
+  # Check for VOID: mkdtemp failed
+  if echo "$output" | grep -q 'mkdtemp failed'; then
+    echo "$suite|VOID|0|$rc"
+    return 0
+  fi
+
+  # ── CRASH SIGNATURE — exit status alone cannot be trusted ────────────────
+  # bash 3.2 (macOS default): when `set -e`/`set -u` ABORTS a script, the EXIT
+  # trap still runs, and if the trap's last command SUCCEEDS the shell exits 0.
+  # The crash is masked. Proven on this machine:
+  #   cleanup(){ true; }; trap cleanup EXIT; set -u; echo "$UNSET"   -> rc=0
+  #   (same without the trap -> rc=1; an explicit `exit 1` is never masked)
+  # 70 of our suites install an EXIT trap, and five are baselined 0/0 — judged on
+  # rc ALONE — so for those a mid-run crash would be recorded as a clean pass.
+  # This is exactly how oversight-gate.sh reported rc=0 while dying at assertion
+  # 6 of 14 with "PROJ1<0xe2>: unbound variable", and how it got a false 14/0
+  # baseline. A fatal shell diagnostic in the output IS a crash, whatever rc says.
+  # kimi-adv (adversarial review) broke this by enumeration: a suite that dies on
+  # `x=$((1/0))` prints "line 8: 1/0: division by 0", keeps running with a wrong
+  # value, and exits 0 through its EXIT trap — GREEN despite crashing. Enumerating
+  # messages can only ever catch the ones somebody thought of.
+  # Match the SHAPE of a bash fatal diagnostic instead: "<script>: line <N>: ...".
+  # That catches division by 0, unbound variable, command not found, syntax
+  # errors, bad substitution and everything else bash reports the same way. The
+  # enumerated list is kept as belt-and-braces for diagnostics that lack the
+  # line prefix (Segmentation fault, Killed).
+  # FALSE-POSITIVE GUARD, found by this very widening. When a script kills a
+  # background job it started, bash reports the job status as
+  #     <script>: line 103: 46691 Killed: 9    <command>
+  # which carries the SAME "<script>: line N: " shape as a fatal diagnostic but
+  # is a normal, deliberate event — watcher-races.sh kills its own fswatch on
+  # every run and was scored CRASHED for it while exiting 0 and printing
+  # "watcher races ok". The discriminator is exact: a job-status line always has
+  # a bare PID immediately after "line N: ". Crash-shaped statuses
+  # (Segmentation fault, Bus error, Abort trap) are deliberately NOT stripped —
+  # a child dying that way is worth flagging even when it was started on purpose.
+  # Enumerating the status WORDS repeats the mistake this whole check exists to
+  # fix — a run under load produced a status line no word in that list matched.
+  # The structural rule is enough and needs no list: a job-status line always has
+  # a bare PID immediately after "line N: ", where a fatal diagnostic never does.
+  # Crash-shaped statuses are re-admitted explicitly, so a child that segfaults is
+  # still reported even though it was started on purpose.
+  # NOTE the `|| true` on both: a grep that matches nothing exits 1, and under
+  # `set -e` that status propagates out of the assignment and kills this
+  # classifier outright — which is how a first attempt at this filter turned 21
+  # of the gate's own assertions red.
+  # WIDTH BUG (found by measuring, not by reading): bash RIGHT-ALIGNS the pid in a
+  # 5-character field when it reports a job status, so the separator after
+  # "line N:" is ONE space for a 5-digit pid and TWO for a 4-digit one:
+  #     watcher-races.sh: line 103: 26495 Killed: 9   ...   <- stripped, GREEN
+  #     watcher-races.sh: line 103:  8971 Killed: 9   ...   <- NOT stripped, CRASHED
+  # Both regexes hard-coded a single space, so watcher-races.sh — which kills its
+  # own fswatch every run — was scored CRASHED whenever the OS happened to hand it
+  # a pid below 10000. Measured 1 red in 5 standalone runs plus the full-tripwire
+  # run; the discriminator is the pid's DIGIT COUNT, nothing about the suite.
+  # `[[:space:]]+` preserves the discriminator exactly (a bare pid immediately
+  # after "line N:", then a status word) and only stops caring how wide it is.
+  # _hardstat is widened the same way so the two regexes agree on what a job-status
+  # line looks like. Be precise about what that buys: a 4-digit-pid segfault was
+  # already reported CRASH before this change, but via the fallback alternation
+  # (which matches a bare "Segmentation fault") rather than via the hard-status
+  # check — the right verdict for the wrong reason. Now the hard-status path
+  # recognises it directly, which is what keeps Bus error / Abort trap /
+  # Illegal instruction / Trace-BPT — none of which appear in that fallback
+  # alternation — classified by the rule that was written for them.
+  _scan="$(printf '%s' "$output" | grep -vE ': line [0-9]+:[[:space:]]+[0-9]+ [A-Za-z]' || true)"
+  _hardstat="$(printf '%s' "$output" | grep -E ': line [0-9]+:[[:space:]]+[0-9]+ .*(Segmentation fault|Bus error|Abort trap|Illegal instruction|Trace/BPT)' || true)"
+  if [ -n "$_hardstat" ] || echo "$_scan" | grep -qE ': line [0-9]+: |unbound variable|command not found|syntax error near|: cannot execute|Segmentation fault'; then
+    echo "$suite|CRASH|0|$rc"
+    return 0
+  fi
+
+  # ── Anchored parse ──
+  # PARSER FIX: suites print counts in several honest shapes and the strict matcher
+  # rejected most of them, producing FORMAT-DRIFT for 29 working suites — which would
+  # have pushed them into quarantine and DELETED real coverage (the exact abuse this
+  # build set out to stop). Strip ANSI colour first and match case-insensitively:
+  #   "RESULTS: 30 passed, 0 failed"  and  "Results: \033[32m30 passed\033[0m, ..."
+  # macOS sed has no \x1b escape — strip ANSI portably with a literal ESC via tr/perl.
+  output="$(printf '%s' "$output" | perl -pe 's/\e\[[0-9;]*[mK]//g' 2>/dev/null || printf '%s' "$output")"
+  result_line="$(echo "$output" | grep -iE 'results:' | tail -1 || true)"
+  if [ -n "$result_line" ]; then
+    p="$(echo "$result_line" | grep -oE '[0-9]+ PASS' | grep -oE '[0-9]+' | tail -1 || true)"
+    if [ -n "$p" ]; then
+      f="$(echo "$result_line" | grep -oE '[0-9]+ FAIL' | grep -oE '[0-9]+' | tail -1 || echo 0)"
+      echo "$suite|$p|$f|$rc"
+      return 0
+    fi
+    p="$(echo "$result_line" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | tail -1 || true)"
+    if [ -n "$p" ]; then
+      f="$(echo "$result_line" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+' | tail -1 || echo 0)"
+      echo "$suite|$p|$f|$rc"
+      return 0
+    fi
+  fi
+
+  p="$(echo "$output" | grep -iE '^passed:' | tail -1 | grep -oE '[0-9]+' || true)"
+  if [ -n "$p" ]; then
+    f="$(echo "$output" | grep -E '^Failed:' | tail -1 | grep -oE '[0-9]+' || echo 0)"
+    echo "$suite|$p|$f|$rc"
+    return 0
+  fi
+
+  # Special case: "All N ... gates PASSED" (single-line all-pass output)
+  # Suites report counts in several honest shapes; a narrow matcher turns a WORKING
+  # suite into FORMAT-DRIFT, which tempts an operator to quarantine it and silently
+  # delete real coverage. Accept every shape that exists in this repo:
+  #   "Results: 30 passed, 0 failed"   (handled above)
+  #   "6 passed, 0 failed"             — bare, no prefix
+  #   "PASS: 15 delivery supervision"  — PASS: N
+  #   "ALL 9 GATES PASSED"             — handled below
+  #   "bridge-heartbeat-interval ok"   — NO counts: exit-code-only, judged on rc alone
+  p="$(echo "$output" | grep -oiE '[0-9]+ passed' | grep -oE '[0-9]+' | tail -1 || true)"
+  if [ -n "$p" ]; then
+    f="$(echo "$output" | grep -oiE '[0-9]+ failed' | grep -oE '[0-9]+' | tail -1 || echo 0)"
+    echo "$suite|$p|${f:-0}|$rc"; return 0
+  fi
+  p="$(echo "$output" | grep -oiE 'PASS: [0-9]+' | grep -oE '[0-9]+' | tail -1 || true)"
+  if [ -n "$p" ]; then echo "$suite|$p|0|$rc"; return 0; fi
+  p="$(echo "$output" | grep -oiE 'all [0-9]+' | grep -oE '[0-9]+' | tail -1 || true)"
+  if [ -n "$p" ]; then
+    echo "$suite|$p|0|$rc"
+    return 0
+  fi
+
+  # Final honest shape: suites that print one PASS/FAIL line per assertion and no
+  # summary count at all. Counting the lines IS the count:
+  #   "  PASS fresh heartbeat with interval reads alive"   (bridge-heartbeat-interval)
+  #   "PASS: pad runtime survives outer stash ..."         (pad-runtime-safety)
+  #   "PASS: health is structured, actionable ..."         (test-health-readonly)
+  #   "ALL PROVIDER AVAILABILITY TESTS PASSED" + 8 PASS:   (test-provider-availability)
+  # ANSI was stripped above, so these match bare. A suite is NEVER quarantined for
+  # lacking a summary line — that deletes real coverage instead of measuring it.
+  p="$(echo "$output" | grep -cE '^[[:space:]]*PASS([:[:space:]]|$)' 2>/dev/null || true)"
+  if [ "${p:-0}" -gt 0 ] 2>/dev/null; then
+    f="$(echo "$output" | grep -cE '^[[:space:]]*FAIL([:[:space:]]|$)' 2>/dev/null || true)"
+    echo "$suite|$p|${f:-0}|$rc"
+    return 0
+  fi
+
+  echo "$suite|?|?|$rc"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# META-GATE: detect unregistered suites (test file exists but NO baseline
+# and NOT quarantined).  This MUST fail the tripwire — every gate must be
+# gated, or the gate itself is unenforceable.
+# ═══════════════════════════════════════════════════════════════════════════
+UNREGISTERED=()
+for suite in "${ALL_SUITES[@]}"; do
+  if has_baseline "$suite"; then continue; fi
+  if is_quarantined "$suite"; then continue; fi
+  UNREGISTERED+=("$suite")
+done
+
+if [ ${#UNREGISTERED[@]} -gt 0 ]; then
+  echo "==========================================="
+  echo "  TRIPWIRE: UNREGISTERED SUITES DETECTED"
+  echo "==========================================="
+  echo ""
+  echo "The following test files have NEITHER a baseline entry in test/suite-baseline.txt"
+  echo "NOR a quarantine entry in test/suite-quarantine.txt:"
+  echo ""
+  for u in "${UNREGISTERED[@]}"; do
+    echo "  • $u"
+  done
+  echo ""
+  echo "ACTION REQUIRED:"
+  echo "  1. Measure the suite's true pass/fail counts on a quiet machine."
+  echo "  2. Add to test/suite-baseline.txt:  <suite> <pass> <fail>"
+  echo "  3. OR add to test/suite-quarantine.txt with a one-line reason."
+  echo ""
+  echo "Every gate must have a baseline. Ungated gates are impossible."
+  exit 1
+fi
+
+# ── build run list: pillars first, then all other baselined & non-quarantined ─
+RUN_LIST=()
+for suite in $PILLARS; do
+  has_baseline "$suite" && RUN_LIST+=("$suite")
+done
+for suite in "${ALL_SUITES[@]}"; do
+  # skip pillars (already added)
+  [[ " $PILLARS " == *" $suite "* ]] && continue
+  has_baseline "$suite" || continue
+  is_quarantined "$suite" && continue
+  RUN_LIST+=("$suite")
+done
+
+# ── run all suites ──────────────────────────────────────────────────────────
+echo "" >&2
+RFILE="$(mktemp "${TMPDIR:-/tmp}/tripwire-results.XXXXXX")"
+: > "$RFILE"
+
+for suite in "${RUN_LIST[@]}"; do
+  echo "tripwire: running $suite ..." >&2
+  # EXACTLY ONE record per suite. A parse rule that matched twice used to emit a
+  # multi-line record, and the report loop then read the overflow as its own
+  # suite — that is where the phantom row named "6" came from, and it also ate
+  # the rc field of the real row (watcher-singleton-gate showed "rc=?" and a
+  # bogus +2 INFLATED while three clean runs of it are 6/0 rc=0). The rules are
+  # anchored with `tail -1` now; this call-site guard makes the invariant
+  # structural so no future rule can re-invent a suite.
+  run_suite "$suite" | head -1 >> "$RFILE"
+done
+
+# ── also list quarantined suites so reviewers see them ──────────────────────
+QUARANTINED_LIST=()
+for suite in "${ALL_SUITES[@]}"; do
+  is_quarantined "$suite" && QUARANTINED_LIST+=("$suite")
+done
+
+# ── build report table ─────────────────────────────────────────────────────
+echo ""
+echo "==========================================="
+echo "  REGRESSION TRIPWIRE — ALL-SUITE REPORT"
+echo "==========================================="
+echo ""
+
+printf "%-41s %10s %10s %10s %-16s\n" "SUITE" "BASELINE" "OBSERVED" "CHANGE" "STATUS"
+printf "%-41s %10s %10s %10s %-16s\n" "-----------------------------------------" "----------" "----------" "----------" "----------------"
+
+REGRESSIONS=0; PARSED=0; FAILS=0; VOIDS=0
+
+while IFS='|' read -r suite obs_p obs_f obs_rc; do
+  [ -n "$suite" ] || continue
+  obs_p="${obs_p:-?}"; obs_f="${obs_f:-0}"; obs_rc="${obs_rc:-?}"
+  bl_p="$(baseline_pass "$suite")"
+  bl_f="$(baseline_fail "$suite")"
+
+  # VOID runs
+  if [ "$obs_p" = "VOID" ]; then
+    VOIDS=$((VOIDS + 1))
+    printf "%-41s %10s %10s %10s %-16s\n" "$suite" "${bl_p:-?} pass" "VOID (mkdtemp)" "?" "VOID"
+    continue
+  fi
+
+  # CRASHED mid-run — a fatal shell diagnostic was printed. This is a hard FAIL
+  # even when rc=0, because an EXIT trap can mask the abort (see run_suite).
+  if [ "$obs_p" = "CRASH" ]; then
+    FAILS=$((FAILS + 1))
+    printf "%-41s %10s %10s %10s %-16s\n" "$suite" "${bl_p:-?} pass" "fatal (rc=$obs_rc)" "?" "CRASHED"
+    continue
+  fi
+
+  # Unparseable
+  if [ "$obs_p" = "?" ]; then
+    # EXIT-CODE-ONLY suites print no counts at all (e.g. "bridge-heartbeat-interval ok").
+    # They are NOT format drift — declaring them unmeasurable is how real coverage gets
+    # quarantined away. If the baseline is 0/0, judge them purely on exit status.
+    if [ "$obs_rc" = "0" ] && [ "${bl_p:-0}" = "0" ] && [ "${bl_f:-0}" = "0" ]; then
+      printf "%-41s %10s %10s %10s %-16s\n" "$suite" "exit-only" "rc=0" "-" "GREEN"
+      continue
+    fi
+    FAILS=$((FAILS + 1))
+    if [ "$obs_rc" != "0" ]; then
+      printf "%-41s %10s %10s %10s %-16s\n" "$suite" "${bl_p:-?} pass" "PARSE_ERR" "?" "CRASHED"
+    else
+      printf "%-41s %10s %10s %10s %-16s\n" "$suite" "${bl_p:-?} pass" "PARSE_ERR" "?" "FORMAT-DRIFT"
+    fi
+    continue
+  fi
+
+  # Baseline check
+  if [ "$bl_p" = "?" ]; then
+    # Suite is baselined as "? ?" — measured but not yet locked. Show as MEASURED.
+    printf "%-41s %10s %10s %10s %-16s\n" "$suite" "?" "${obs_p} pass (${obs_f} fail)" "0" "MEASURED"
+    PARSED=$((PARSED + 1))
+    continue
+  fi
+
+  PARSED=$((PARSED + 1))
+  delta=$((obs_p - bl_p))
+  _trap_status="" _trap_fail=0
+
+  if [ "$delta" -lt 0 ]; then
+    _trap_status="REGRESSION"; _trap_fail=1
+  elif [ "$delta" -gt 0 ]; then
+    _trap_status="INFLATED"; _trap_fail=1
+  elif [ "$obs_f" -gt "${bl_f:-0}" ]; then
+    _trap_status="MORE-FAILURES"; _trap_fail=1
+  elif [ "$obs_rc" != "0" ]; then
+    _trap_status="EXIT-CODE"; _trap_fail=1
+  else
+    _trap_status="GREEN"
+  fi
+
+  [ "$_trap_fail" -eq 1 ] && FAILS=$((FAILS + 1))
+
+  _obs_str="${obs_p} pass (${obs_f} fail)"
+  [ "$obs_rc" != "0" ] && [ "$_trap_status" != "EXIT-CODE" ] && _obs_str="${obs_p} pass (${obs_f} fail, rc=$obs_rc)"
+
+  case "$_trap_status" in
+    REGRESSION) _obs_change="$delta" ;;
+    INFLATED)   _obs_change="+$delta" ;;
+    *)          _obs_change="0" ;;
+  esac
+
+  printf "%-41s %10s %10s %10s %-16s\n" \
+    "$suite" "${bl_p} pass" "$_obs_str" "$_obs_change" "$_trap_status"
+done < "$RFILE"
+
+rm -f "$RFILE"
+
+# ── quarantined suites ──────────────────────────────────────────────────────
+if [ ${#QUARANTINED_LIST[@]} -gt 0 ]; then
+  echo ""
+  echo "────────────────────────────────────────────"
+  echo "  QUARANTINED SUITES (skipped)"
+  echo "────────────────────────────────────────────"
+  for q in "${QUARANTINED_LIST[@]}"; do
+    printf "  %-39s  %s\n" "$q" "$(quarantine_reason "$q")"
+  done
+fi
+
+echo ""
+
+# ── verdict ────────────────────────────────────────────────────────────────
+if [ "$VOIDS" -gt 0 ]; then
+  echo "WARNING: $VOIDS suite(s) returned VOID (mkdtemp failed) — re-run in a quiet window"
+  echo ""
+fi
+
+if [ "$PARSED" -eq 0 ] && [ "$FAILS" -eq 0 ] && [ "$VOIDS" -eq 0 ]; then
+  echo "TRIPWIRE: INCONCLUSIVE — no suites produced parseable output"
+  exit 2
+fi
+
+if [ "$FAILS" -gt 0 ]; then
+  echo "TRIPWIRE: FAILED — $FAILS suite(s) failed"
+  echo ""
+  echo "  STATUS key:"
+  echo "    GREEN         pass count matches baseline, failures ≤ baseline, exit 0"
+  echo "    MEASURED      measured but baseline is '?' — not yet locked"
+  echo "    REGRESSION    pass count dropped vs baseline"
+  echo "    INFLATED      pass count exceeds baseline (unexplained increase)"
+  echo "    MORE-FAILURES pass count matches but failure count increased"
+  echo "    EXIT-CODE     pass/fail counts match baseline but suite exited non-zero"
+  echo "    CRASHED       no parseable RESULTS line + non-zero exit"
+  echo "    FORMAT-DRIFT  no parseable RESULTS line + exit 0 — format changed"
+  echo "    VOID          mkdtemp failed — environment contention, re-run"
+  echo ""
+  echo "  When baseline is intentionally changed, update test/suite-baseline.txt."
+  exit 1
+fi
+
+# kimi-adv: this printed "TRIPWIRE: PASSED" and then exited 2 whenever any suite
+# VOIDed — the same self-contradiction as the EXIT-trap bug (P41): a board that
+# reads PASSED while the process reports failure. A VOID means the run could not
+# be measured, which is not a pass. Say so, and keep the distinct exit code.
+if [ "$VOIDS" -gt 0 ]; then
+  echo "TRIPWIRE: INCONCLUSIVE — $PARSED suites green, but $VOIDS VOID (mkdtemp failed); re-run in a quiet window"
+  exit 2
+fi
+echo "TRIPWIRE: PASSED — all $PARSED enforced suites green"
+exit 0
