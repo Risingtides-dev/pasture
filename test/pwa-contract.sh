@@ -8,7 +8,7 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; NC='\033[0m'
 PASS=0; FAIL=0
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-SP="$(command -v stitchpad || echo "$HOME/.stitchpad/bin/stitchpad")"
+SP="$ROOT/tool/bin/stitchpad"
 RELAY="${STITCHPAD_RELAY:-}"
 TOKEN="${STITCHPAD_TOKEN:-}"
 
@@ -34,7 +34,7 @@ echo ""
 
 # ── 1. Bridge script exists and is valid ──────────────────────────────
 echo "--- bridge fixture ---"
-BRIDGE="$HOME/.stitchpad/relay/bridge.sh"
+BRIDGE="$ROOT/tool/relay/bridge.sh"
 check "bridge.sh exists"        test -f "$BRIDGE"
 check "bridge.sh bash -n clean" bash -n "$BRIDGE"
 
@@ -73,11 +73,19 @@ echo "--- bridge loop fixture ---"
 # Simulate: outbox contains a message from PWA → bridge drains it → stitchpad say injects it
 FIXTURE_DIR="$(mktemp -d)"
 trap 'rm -rf "$FIXTURE_DIR"' EXIT
+mkdir -p "$FIXTURE_DIR/home"
+export HOME="$FIXTURE_DIR/home"
+unset HERDR_PANE_ID HERDR_TAB_ID HERDR_ENV HERDR_SOCKET_PATH HERDR_WORKSPACE_ID 2>/dev/null || true
 
 # Create a minimal pad for the fixture (needs git init for stitchpad say to work)
 mkdir -p "$FIXTURE_DIR/.stitchpad/.state"
 cd "$FIXTURE_DIR"
 "$SP" init --name fixture >/dev/null 2>&1 || true
+
+# This release hardened `say` to REFUSE when the roster is empty (fail-closed).
+# These fixtures predate that and never joined, so they posted into a rosterless pad.
+# The refusal is correct; the fixture owed a join.
+STITCHPAD_SESSION="fx-alice-$$" "$SP" join alice cli pull - >/dev/null 2>&1 || true
 
 # Simulate an outbox response as the bridge would receive it
 OUTBOX_JSON='{"messages":[{"from":"pwa-user","text":"hello from PWA","at":1700000000000}]}'

@@ -1,0 +1,398 @@
+#!/usr/bin/env bash
+# tripwire-gate.sh — prove the regression-tripwire correctly classifies every
+# blindness class AND that the process exit status matches the verdict.
+#
+# T1-T5: assert the SHIPPED tripwire exits correctly for every verdict class.
+# M0-M3: mutant-proof — each blindness re-introduced, gate detects it.
+# M0 is the captain's bounce case: FAILED branch exit 1 → exit 0.
+#
+# Verdict → expected exit:
+#   GREEN         → 0
+#   EXIT-CODE     → non-zero
+#   INFLATED      → non-zero
+#   FORMAT-DRIFT  → non-zero
+#   CRASHED       → non-zero
+#   REGRESSION    → non-zero
+#   MORE-FAILURES → non-zero
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+pass=0; fail=0
+
+ok()  { printf '  \033[0;32mPASS\033[0m %s\n' "$1"; pass=$((pass+1)); }
+bad() { printf '  \033[0;31mFAIL\033[0m %s\n' "$1"; fail=$((fail+1)); }
+
+assert_eq() {
+  if [ "$2" = "$3" ]; then ok "$1 (= $2)"; else bad "$1 (expected $2, got $3)"; fi
+}
+assert_ne() {
+  if [ "$2" != "$3" ]; then ok "$1 (!= $2, got $3)"; else bad "$1 (expected != $2)"; fi
+}
+assert_contains() {
+  if echo "$1" | grep -qF "$2"; then ok "$3"; else bad "$3 (not found: '$2')"; fi
+}
+has_verdict() { echo "$1" | grep -qE "^.{41}.*\b${2}\b\s*$"; }
+assert_verdict() {
+  if has_verdict "$1" "$2"; then ok "$3"; else bad "$3 (verdict '$2' not in STATUS column)"; fi
+}
+assert_no_verdict() {
+  if has_verdict "$1" "$2"; then bad "$3 (forbidden '$2' found)"; else ok "$3"; fi
+}
+
+# ── fixture ──────────────────────────────────────────────────────────────
+
+# Helper: create temp files, run tripwire, capture both stdout and exit code.
+# Usage: run_tw; echo "$_tw_stdout"; cat $_tw_rcfile
+# _tw_stdout, _tw_rcfile are global vars set by run_tw.
+_tw_stdout=""
+
+run_tw() {
+  _tw_stdout="$(mktemp "${TMPDIR:-/tmp}/sp-tw-out.XXXXXX")"
+  _tw_rcfile="$(mktemp "${TMPDIR:-/tmp}/sp-tw-rc.XXXXXX")"
+  set +e
+  (cd "$FIXTURE" && bash "$FIXTURE/tool/bin/regression-tripwire" >"$_tw_stdout" 2>&1; echo $? > "$_tw_rcfile")
+  set -e
+}
+tw_rc() { cat "${_tw_rcfile:-/dev/null}" 2>/dev/null || echo 255; }
+tw_stdout() { cat "${_tw_stdout:-/dev/null}" 2>/dev/null; }
+tw_clean() { rm -f "${_tw_stdout:-}" "${_tw_rcfile:-}" 2>/dev/null || true; }
+
+setup_fixture() {
+  FIXTURE="$(mktemp -d "${TMPDIR:-/tmp}/sp-tripwire-gate.XXXXXX")"
+  mkdir -p "$FIXTURE/tool/bin" "$FIXTURE/test"
+  cp "$HERE/../tool/bin/regression-tripwire" "$FIXTURE/tool/bin/regression-tripwire"
+  chmod +x "$FIXTURE/tool/bin/regression-tripwire"
+  # NO WORKAROUND PATCH HERE. This used to sed `|| true` into the EXIT trap of
+  # the copy under test, which repaired the exact defect this gate exists to
+  # catch: the trap's failing `kill -9` (no background jobs) overrode a clean
+  # `exit 0` with 1, so the real tripwire printed PASSED and exited non-zero for
+  # the entire build while T1 happily asserted "exit 0" against the patched copy.
+  # The gate must test the shipped script, byte for byte.
+}
+
+write_bl() {
+  # The tripwire gained a suite-level baseline + quarantine + meta-gate (P14/P16)
+  # and now exits 2 ("FATAL — baseline not found") without them. This fixture
+  # still wrote only pillar-baseline.txt, so EVERY case here failed with rc=2 and
+  # all 21 assertions were reporting one stale interface, not 21 defects.
+  cat > "$FIXTURE/test/pillar-baseline.txt" <<'BL'
+pro5-tier1-mutant-gates.sh 3 0
+roster-recovery-guard-regression.sh 3 0
+recover-migrated-pad.sh 3 0
+recovery-hardening3-regression.sh 3 0
+BL
+  cp "$FIXTURE/test/pillar-baseline.txt" "$FIXTURE/test/suite-baseline.txt"
+  printf '# fixture: nothing quarantined\n' > "$FIXTURE/test/suite-quarantine.txt"
+}
+
+
+# Apply an anchored mutation and PROVE it landed. A mutation that does not apply
+# is INCONCLUSIVE and must never be scored as a pass — these three were addressed
+# by absolute line number ('175s/...'), so any edit to the tripwire silently
+# turned them into no-ops that still "passed".
+mutate() { # $1=file $2=needle $3=replacement $4=label
+  python3 - "$1" "$2" "$3" <<'PY_MUT'
+import sys
+p,old,new=sys.argv[1],sys.argv[2],sys.argv[3]
+s=open(p,encoding='utf-8').read()
+if s.count(old)!=1: sys.exit(9)
+open(p,'w',encoding='utf-8').write(s.replace(old,new))
+PY_MUT
+  if [ $? -ne 0 ]; then bad "$4: MUTATION DID NOT APPLY — inconclusive"; return 1; fi
+  return 0
+}
+
+write_suite() {
+  printf '#!/usr/bin/env bash\n%s\n' "$2" > "$FIXTURE/test/$1"
+  chmod +x "$FIXTURE/test/$1"
+}
+
+echo "=== tripwire-gate ==="
+echo ""
+
+# ═════════════════════════════════════════════════════════════════════════
+# T1: all GREEN — exit 0
+# ═════════════════════════════════════════════════════════════════════════
+echo "--- T1: all GREEN, exit 0 ---"
+setup_fixture; write_bl
+write_suite pro5-tier1-mutant-gates.sh          'echo "=== RESULTS ==="; echo "Passed:  3"; echo "Failed:  0"; exit 0'
+write_suite roster-recovery-guard-regression.sh 'echo "=== RESULTS ==="; echo "Passed:  3"; echo "Failed:  0"; exit 0'
+write_suite recover-migrated-pad.sh             'echo "=== RESULTS ==="; echo "Passed:  3"; echo "Failed:  0"; exit 0'
+write_suite recovery-hardening3-regression.sh   'echo "=== RESULTS ==="; echo "Passed:  3"; echo "Failed:  0"; exit 0'
+
+run_tw; out="$(tw_stdout)"
+_tw_rc="$(tw_rc)"
+assert_eq "T1: exit 0" 0 "$_tw_rc"
+assert_contains "$out" "TRIPWIRE: PASSED" "T1: PASSED printed"
+assert_verdict "$out" "GREEN" "T1: all suites GREEN"
+rm -rf "$FIXTURE"; tw_clean
+echo ""
+
+# ═════════════════════════════════════════════════════════════════════════
+# T2: Mixed failures — exit non-zero
+# ═════════════════════════════════════════════════════════════════════════
+echo "--- T2: mixed failures, exit non-zero ---"
+setup_fixture; write_bl
+write_suite pro5-tier1-mutant-gates.sh          'echo "=== RESULTS ==="; echo "Passed:  3"; echo "Failed:  0"; exit 1'
+write_suite roster-recovery-guard-regression.sh 'echo "=== RESULTS ==="; echo "Passed:  8"; echo "Failed:  0"; exit 0'
+write_suite recover-migrated-pad.sh             'echo "noise"; echo "no RESULTS"; exit 0'
+write_suite recovery-hardening3-regression.sh   'echo "SIGSEGV"; exit 139'
+
+run_tw; out="$(tw_stdout)"
+_tw_rc="$(tw_rc)"
+assert_ne "T2: exit non-zero" 0 "$_tw_rc"
+assert_contains "$out" "TRIPWIRE: FAILED" "T2: FAILED printed"
+assert_verdict "$out" "EXIT-CODE"    "T2a: exit-1 → EXIT-CODE"
+assert_verdict "$out" "INFLATED"     "T2b: inflated → INFLATED"
+assert_verdict "$out" "FORMAT-DRIFT" "T2c: unparseable+rc0 → FORMAT-DRIFT"
+assert_verdict "$out" "CRASHED"      "T2d: unparseable+rc139 → CRASHED"
+rm -rf "$FIXTURE"; tw_clean
+echo ""
+
+# ═════════════════════════════════════════════════════════════════════════
+# T3: REGRESSION — exit non-zero
+# ═════════════════════════════════════════════════════════════════════════
+echo "--- T3: REGRESSION, exit non-zero ---"
+setup_fixture; write_bl
+write_suite pro5-tier1-mutant-gates.sh          'echo "=== RESULTS ==="; echo "Passed:  1"; echo "Failed:  0"; exit 0'
+write_suite roster-recovery-guard-regression.sh 'echo "=== RESULTS ==="; echo "Passed:  3"; echo "Failed:  0"; exit 0'
+write_suite recover-migrated-pad.sh             'echo "=== RESULTS ==="; echo "Passed:  3"; echo "Failed:  0"; exit 0'
+write_suite recovery-hardening3-regression.sh   'echo "=== RESULTS ==="; echo "Passed:  3"; echo "Failed:  0"; exit 0'
+
+run_tw; out="$(tw_stdout)"
+_tw_rc="$(tw_rc)"
+assert_ne "T3: exit non-zero" 0 "$_tw_rc"
+assert_contains "$out" "TRIPWIRE: FAILED" "T3: FAILED printed"
+assert_verdict "$out" "REGRESSION" "T3: REGRESSION detected"
+rm -rf "$FIXTURE"; tw_clean
+echo ""
+
+# ═════════════════════════════════════════════════════════════════════════
+# T4: MORE-FAILURES — exit non-zero
+# ═════════════════════════════════════════════════════════════════════════
+echo "--- T4: MORE-FAILURES, exit non-zero ---"
+setup_fixture; write_bl
+write_suite pro5-tier1-mutant-gates.sh          'echo "=== RESULTS ==="; echo "Passed:  3"; echo "Failed:  2"; exit 0'
+write_suite roster-recovery-guard-regression.sh 'echo "=== RESULTS ==="; echo "Passed:  3"; echo "Failed:  0"; exit 0'
+write_suite recover-migrated-pad.sh             'echo "=== RESULTS ==="; echo "Passed:  3"; echo "Failed:  0"; exit 0'
+write_suite recovery-hardening3-regression.sh   'echo "=== RESULTS ==="; echo "Passed:  3"; echo "Failed:  0"; exit 0'
+
+run_tw; out="$(tw_stdout)"
+_tw_rc="$(tw_rc)"
+assert_ne "T4: exit non-zero" 0 "$_tw_rc"
+assert_contains "$out" "TRIPWIRE: FAILED" "T4: FAILED printed"
+assert_verdict "$out" "MORE-FAILURES" "T4: MORE-FAILURES detected"
+rm -rf "$FIXTURE"; tw_clean
+echo ""
+
+# ═════════════════════════════════════════════════════════════════════════
+# T5: Single-suite EXIT-CODE only — exit non-zero
+# ═════════════════════════════════════════════════════════════════════════
+echo "--- T5: EXIT-CODE only, exit non-zero ---"
+setup_fixture; write_bl
+write_suite pro5-tier1-mutant-gates.sh          'echo "=== RESULTS ==="; echo "Passed:  3"; echo "Failed:  0"; exit 1'
+write_suite roster-recovery-guard-regression.sh 'echo "=== RESULTS ==="; echo "Passed:  3"; echo "Failed:  0"; exit 0'
+write_suite recover-migrated-pad.sh             'echo "=== RESULTS ==="; echo "Passed:  3"; echo "Failed:  0"; exit 0'
+write_suite recovery-hardening3-regression.sh   'echo "=== RESULTS ==="; echo "Passed:  3"; echo "Failed:  0"; exit 0'
+
+run_tw; out="$(tw_stdout)"
+_tw_rc="$(tw_rc)"
+assert_ne "T5: exit non-zero" 0 "$_tw_rc"
+assert_contains "$out" "TRIPWIRE: FAILED" "T5: FAILED printed"
+assert_verdict "$out" "EXIT-CODE" "T5: EXIT-CODE detected"
+rm -rf "$FIXTURE"; tw_clean
+echo ""
+
+# ═════════════════════════════════════════════════════════════════════════
+# MUTANT PROOF
+# ═════════════════════════════════════════════════════════════════════════
+echo "=== MUTANT PROOF ==="
+echo ""
+
+# ═══ M0: FAILED branch exit 1 → exit 0 (THE BOUNCE CASE) ═══════════════
+echo "--- M0: FAILED branch exits 0 (CAPTAIN'S MUTANT) ---"
+setup_fixture; write_bl
+write_suite pro5-tier1-mutant-gates.sh          'echo "=== RESULTS ==="; echo "Passed:  1"; echo "Failed:  0"; exit 0'
+write_suite roster-recovery-guard-regression.sh 'echo "=== RESULTS ==="; echo "Passed:  3"; echo "Failed:  0"; exit 0'
+write_suite recover-migrated-pad.sh             'echo "=== RESULTS ==="; echo "Passed:  3"; echo "Failed:  0"; exit 0'
+write_suite recovery-hardening3-regression.sh   'echo "=== RESULTS ==="; echo "Passed:  3"; echo "Failed:  0"; exit 0'
+
+sed -i '' 's/^  exit 1$/  exit 0  # MUTATED: was exit 1/' "$FIXTURE/tool/bin/regression-tripwire"
+
+run_tw; out="$(tw_stdout)"
+_tw_rc="$(tw_rc)"
+if [ "$_tw_rc" -eq 0 ] && echo "$out" | grep -q "TRIPWIRE: FAILED"; then
+  ok "M0: gate detects FAILED+exit0 — regression-tripwire is blind (caught)"
+elif [ "$_tw_rc" -ne 0 ]; then
+  bad "M0: mutation did not take — exit still non-zero ($_tw_rc)"
+else
+  bad "M0: unexpected: exit=$_tw_rc"
+fi
+rm -rf "$FIXTURE"; tw_clean
+echo ""
+
+# ═══ M1: EXIT-CODE → GREEN (T-1 fix 1 blindness) ═══════════════════════
+echo "--- M1: exit-code blindness ---"
+setup_fixture; write_bl
+write_suite pro5-tier1-mutant-gates.sh          'echo "=== RESULTS ==="; echo "Passed:  3"; echo "Failed:  0"; exit 1'
+write_suite roster-recovery-guard-regression.sh 'echo "=== RESULTS ==="; echo "Passed:  3"; echo "Failed:  0"; exit 0'
+write_suite recover-migrated-pad.sh             'echo "=== RESULTS ==="; echo "Passed:  3"; echo "Failed:  0"; exit 0'
+write_suite recovery-hardening3-regression.sh   'echo "=== RESULTS ==="; echo "Passed:  3"; echo "Failed:  0"; exit 0'
+
+mutate "$FIXTURE/tool/bin/regression-tripwire" \
+  '_trap_status="EXIT-CODE"; _trap_fail=1' '_trap_status="GREEN"; _trap_fail=0' "M1"
+
+run_tw; out="$(tw_stdout)"
+_tw_rc="$(tw_rc)"
+if [ "$_tw_rc" -eq 0 ]; then
+  ok "M1: blind tripwire exits 0 on exit-1 suite — PROVES BLIND"
+else
+  bad "M1: blind tripwire exited non-zero ($_tw_rc) — unexpected"
+fi
+assert_no_verdict "$out" "EXIT-CODE" "M1: EXIT-CODE absent (blind)"
+assert_verdict "$out" "GREEN" "M1: pro5-tier1 shows GREEN despite exit 1"
+rm -rf "$FIXTURE"; tw_clean
+echo ""
+
+# ═══ M2: INFLATED → GREEN (T-1 fix 2 blindness) ════════════════════════
+echo "--- M2: inflation blindness ---"
+setup_fixture; write_bl
+write_suite pro5-tier1-mutant-gates.sh          'echo "=== RESULTS ==="; echo "Passed:  9"; echo "Failed:  0"; exit 0'
+write_suite roster-recovery-guard-regression.sh 'echo "=== RESULTS ==="; echo "Passed:  3"; echo "Failed:  0"; exit 0'
+write_suite recover-migrated-pad.sh             'echo "=== RESULTS ==="; echo "Passed:  3"; echo "Failed:  0"; exit 0'
+write_suite recovery-hardening3-regression.sh   'echo "=== RESULTS ==="; echo "Passed:  3"; echo "Failed:  0"; exit 0'
+
+mutate "$FIXTURE/tool/bin/regression-tripwire" \
+  '_trap_status="INFLATED"; _trap_fail=1' '_trap_status="GREEN"; _trap_fail=0' "M2"
+
+run_tw; out="$(tw_stdout)"
+_tw_rc="$(tw_rc)"
+if [ "$_tw_rc" -eq 0 ]; then
+  ok "M2: blind tripwire exits 0 on inflated suite — PROVES BLIND"
+else
+  bad "M2: blind tripwire exited non-zero ($_tw_rc) — unexpected"
+fi
+assert_no_verdict "$out" "INFLATED" "M2: INFLATED absent (blind)"
+assert_verdict "$out" "GREEN" "M2: pro5-tier1 shows GREEN despite +6 inflation"
+rm -rf "$FIXTURE"; tw_clean
+echo ""
+
+# ═══ M3: FORMAT-DRIFT → SKIP, no FAILS++ (T-1 fix 3 blindness) ═════════
+echo "--- M3: format-drift blindness ---"
+setup_fixture; write_bl
+write_suite pro5-tier1-mutant-gates.sh          'echo "=== RESULTS ==="; echo "Passed:  3"; echo "Failed:  0"; exit 0'
+write_suite roster-recovery-guard-regression.sh 'echo "=== RESULTS ==="; echo "Passed:  3"; echo "Failed:  0"; exit 0'
+write_suite recover-migrated-pad.sh             'echo "=== RESULTS ==="; echo "Passed:  3"; echo "Failed:  0"; exit 0'
+write_suite recovery-hardening3-regression.sh   'echo "no RESULTS line"; echo "just junk"; exit 0'
+
+mutate "$FIXTURE/tool/bin/regression-tripwire" \
+  '    FAILS=$((FAILS + 1))
+    if [ "$obs_rc" != "0" ]; then' '    : # FAILS blinded — FORMAT-DRIFT no longer fails
+    if [ "$obs_rc" != "0" ]; then' "M3-a"
+mutate "$FIXTURE/tool/bin/regression-tripwire" '"FORMAT-DRIFT"' '"SKIP"' "M3-b"
+
+run_tw; out="$(tw_stdout)"
+_tw_rc="$(tw_rc)"
+if [ "$_tw_rc" -eq 0 ]; then
+  ok "M3: blind tripwire exits 0 despite unparseable suite — PROVES BLIND"
+else
+  bad "M3: blind tripwire exited non-zero ($_tw_rc) — unexpected"
+fi
+assert_no_verdict "$out" "FORMAT-DRIFT" "M3: FORMAT-DRIFT absent (blind)"
+assert_verdict "$out" "SKIP" "M3: unparseable suite shows SKIP (blind)"
+rm -rf "$FIXTURE"; tw_clean
+echo ""
+
+# ═════════════════════════════════════════════════════════════════════════
+# ── Crash detection must tell a FATAL DIAGNOSTIC from a JOB STATUS ─────────
+# The gate detects crashes by matching the SHAPE of a bash fatal diagnostic
+# ("<script>: line <N>: ..."), because enumerating messages only ever catches the
+# ones somebody thought of — a suite dying on `x=$((1/0))` printed
+# "line 8: 1/0: division by 0", carried on with a wrong value and exited 0.
+# But bash uses that SAME shape to report the status of a background job the
+# script killed on purpose:
+#     <script>: line 103: 46691 Killed: 9    <command>
+# watcher-races.sh does exactly this on every run and was scored CRASHED while
+# exiting 0 and printing "watcher races ok". The discriminator is a bare PID
+# immediately after "line N: ". Crash-shaped statuses are NOT stripped.
+# PID FIELD WIDTH — the fixtures below are written the way bash actually prints,
+# not the way it is convenient to type. bash RIGHT-ALIGNS the pid in a 5-character
+# field, so the run of spaces after "line N:" is a function of the pid's digit
+# count: one space at 5 digits, two at 4, three at 3. Every fixture here used to
+# hard-code a single space, so the 4- and 3-digit cases below asserted against
+# spacing bash never emits — and the real gate, which hard-coded a single space in
+# the same place, scored watcher-races.sh CRASHED on every run that happened to
+# draw a pid under 10000 (measured: 1 red in 5 standalone runs). The assertions
+# are unchanged in strength; only the simulation was corrected.
+crash_scan() {
+  local out="$1" scan
+  local hard
+  scan="$(printf '%s' "$out" | grep -vE ': line [0-9]+:[[:space:]]+[0-9]+ [A-Za-z]' || true)"
+  hard="$(printf '%s' "$out" | grep -E ': line [0-9]+:[[:space:]]+[0-9]+ .*(Segmentation fault|Bus error|Abort trap|Illegal instruction|Trace/BPT)' || true)"
+  [ -n "$hard" ] && return 0
+  echo "$scan" | grep -qE ': line [0-9]+: |unbound variable|command not found|syntax error near|: cannot execute|Segmentation fault'
+}
+
+crash_scan 'test/watcher-races.sh: line 103: 46691 Killed: 9    fswatch -0 pad' \
+  && bad "crash-scan: a deliberate job kill was scored as a CRASH" \
+  || ok  "crash-scan: a deliberate job kill is NOT a crash"
+crash_scan 'suite.sh: line 8: 1/0: division by 0' \
+  && ok  "crash-scan: division by 0 is a crash (the shape catches it)" \
+  || bad "crash-scan: division by 0 was MISSED"
+# NOTE: these assertion DESCRIPTIONS must never quote an enumerated crash phrase
+# verbatim. The gate's own PASS line is part of its output, and the release gate
+# scans suite output for those phrases — a message reading "unbound variable is a
+# crash" made this suite score itself CRASHED while exiting 0 with 34 passes.
+crash_scan 'suite.sh: line 12: PROJ1: unbound variable' \
+  && ok  "crash-scan: an unset-variable diagnostic is a crash" \
+  || bad "crash-scan: an unset-variable diagnostic was MISSED"
+crash_scan 'suite.sh: line 77:  1234 Suspended (tty output)   ./thing' \
+  && bad "crash-scan: an UNENUMERATED job status was scored as a CRASH" \
+  || ok  "crash-scan: an unenumerated job status is still not a crash"
+crash_scan 'suite.sh: line 4:   999 Segmentation fault: 11  ./thing' \
+  && ok  "crash-scan: a segfaulting child is still a crash" \
+  || bad "crash-scan: segfault job status was wrongly stripped"
+# ── pid field width: the exact shape that made this gate green while the real
+# ── tripwire went red. Each width must behave identically; the pid the OS hands
+# ── out must never decide whether a suite is reported as having crashed.
+crash_scan 'test/watcher-races.sh: line 103:  8971 Killed: 9    fswatch -0 pad' \
+  && bad "crash-scan: a job kill with a 4-digit pid was scored as a CRASH" \
+  || ok  "crash-scan: a job kill with a 4-digit pid is NOT a crash"
+crash_scan 'test/watcher-races.sh: line 103:   897 Killed: 9    fswatch -0 pad' \
+  && bad "crash-scan: a job kill with a 3-digit pid was scored as a CRASH" \
+  || ok  "crash-scan: a job kill with a 3-digit pid is NOT a crash"
+crash_scan 'suite.sh: line 4:  8971 Bus error: 10          ./thing' \
+  && ok  "crash-scan: a child dying on a bus fault is still a crash at 4 digits" \
+  || bad "crash-scan: a bus-fault job status was wrongly stripped at 4 digits"
+# The real script and this helper must not drift: a gate that carries its own COPY
+# of the logic can go green while the shipped classifier is broken, which is how
+# the width bug survived. Assert the shipped regexes are width-tolerant too.
+# Resolve the SAME way every other assertion here does — repo-relative, never via
+# PATH: `command -v regression-tripwire` would find the LIVE INSTALL and grade a
+# script that is not the one under test.
+_tw_src="$HERE/../tool/bin/regression-tripwire"
+if [ -r "$_tw_src" ]; then
+  if grep -Fq ': line [0-9]+:[[:space:]]+[0-9]+ [A-Za-z]' "$_tw_src"; then
+    ok  "crash-scan: the shipped classifier tolerates any pid field width"
+  else
+    bad "crash-scan: the shipped classifier still hard-codes a single space"
+  fi
+else
+  bad "crash-scan: could not read the shipped tripwire to check for drift"
+fi
+crash_scan 'all good here, 30 passed, 0 failed' \
+  && bad "crash-scan: clean output scored as a crash" \
+  || ok  "crash-scan: clean output is clean"
+
+echo "=== RESULTS ==="
+echo "Passed:  $pass"
+echo "Failed:  $fail"
+echo ""
+
+if [ "$fail" -eq 0 ]; then
+  echo "tripwire-gate: ALL GATES PASSED"
+  exit 0
+else
+  echo "tripwire-gate: $fail GATE(S) FAILED"
+  exit 1
+fi

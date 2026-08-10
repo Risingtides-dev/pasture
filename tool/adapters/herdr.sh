@@ -40,7 +40,18 @@ fi
 # ONE TERMINAL = ONE PAD: never inject a wake into a terminal that is live in a
 # DIFFERENT pad or under a different name. ~/.stitchpad-terminals/<surface> is
 # the machine-global claim registry ("pad_dir|name|epoch", heartbeat-refreshed).
-lockf="$HOME/.pasture-terminals/${target##*@@}"; [ -f "$lockf" ] || lockf="$HOME/.stitchpad-terminals/${target##*@@}"
+# C12 (rc1): the registry path is built from the ROSTER target — a roster-write
+# primitive (C7) with a `../` component and no `@@` traversed the path into an
+# arbitrary local file read. The terminal component must be a plain filename;
+# anything else is never a legitimate surface id. Fail closed: a wake whose
+# target cannot be safety-checked is not delivered.
+_tcomp="${target##*@@}"
+case "$_tcomp" in
+  *[!A-Za-z0-9._-]*|''|..)
+    echo "[$(ts)] CROSS-PAD CHECK REFUSED: roster target '$target' has a malformed terminal component — wake NOT delivered (re-pin the roster target)" >>"$log"
+    exit 1 ;;
+esac
+lockf="$HOME/.pasture-terminals/${_tcomp}"; [ -f "$lockf" ] || lockf="$HOME/.stitchpad-terminals/${_tcomp}"
 if [ -f "$lockf" ]; then
   IFS='|' read -r _lpad _lname _lts < "$lockf"
   if [ $(( $(date +%s) - ${_lts:-0} )) -lt 300 ] \
@@ -80,7 +91,39 @@ nudge="$(STITCHPAD_PAD_DIR="$pad_dir" STITCHPAD_NAME="$to" stitchpad wake "$to" 
 # SANITIZE — pane run reaches a raw pty. Strip ALL control bytes (ESC for
 # escape-sequence injection, CR/LF for embedded second-command injection), then
 # collapse whitespace. Pad body text is untrusted.
-nudge="$(printf '%s' "$nudge" | LC_ALL=C tr -d '\000-\037\177' | tr -s ' ')"
+#
+# k3 F15 was filed UNPROVEN because it needs two things to be true at once. The
+# first half is now PROVEN by execution: posting
+#     @eve check $(id) and `whoami` ; echo pwned | sh && ls > /tmp/x
+# produced a nudge carrying every one of those bytes intact, because the old
+# sanitizer removed control characters ONLY. So untrusted pad text with live
+# shell metacharacters was being typed into a raw pty and submitted with Enter.
+#
+# The second half — that the pane is a SHELL rather than an agent TUI — is a
+# herdr property this adapter cannot verify (the cross-pad claim check proves
+# only that the terminal is not claimed by another pad within 5 minutes, not
+# that the agent that owned it is still running). Rather than argue about how
+# often that happens, remove the dependency: neutralise the metacharacters, and
+# the question stops mattering. A shell handed the sanitised text can only fail
+# to find a command named "pasture:".
+#
+# Mapped to spaces, not deleted, so the words a human reads stay readable. The
+# full untouched text is always on the pad; this is a nudge, not the message.
+nudge="$(printf '%s' "$nudge" \
+  | LC_ALL=C tr -d '\000-\037\177' \
+  | LC_ALL=C tr '`$;|&<>()\\' '          ' \
+  | tr -s ' ')"
+# And a bound: `pane run` TYPES this, one keystroke at a time, into a live TUI.
+# The canonical nudge already carries the whole shared-discipline preamble, so
+# an un-capped wake types thousands of characters into the operator's terminal.
+_n_max="${STITCHPAD_HERDR_NUDGE_MAX:-600}"
+if [ "${#nudge}" -gt "$_n_max" ]; then
+  # NOTE the wording: this suffix is appended AFTER sanitising, so it must not
+  # contain a metacharacter itself. The first version used parentheses and put
+  # them straight back into the pty — caught by the gate, which is the only
+  # reason it is not still there.
+  nudge="${nudge:0:$_n_max} … full message on the pad — stitchpad read -n 30"
+fi
 
 if "$hd_bin" pane run "$pane" "$nudge" >>"$log" 2>&1; then
   # SETTLE-RETRY: pane run types text + Enter, but a busy TUI (mid-turn

@@ -14,20 +14,37 @@ ROOTS=("${@:-$HOME}")
 SP="$(command -v stitchpad || echo "$HOME/.stitchpad/bin/stitchpad")"
 INTERVAL="${STITCHPAD_BRIDGE_INTERVAL:-3}"
 
+# P26 reconcile state is keyed PER RELAY. Two bridge instances (the main
+# all-of-$HOME bridge plus a teammate-scoped mirror — `stitchpad bridge mirror`)
+# sharing one prev-list would each read the other's pad list and issue spurious
+# DELETEs against their own relay every cycle.
+bridge_prev_path() {
+  local slug
+  slug="$(printf '%s' "$RELAY" | tr -c 'a-zA-Z0-9' '-' | tr -s '-')"
+  printf '%s/.stitchpad/relay/state/bridge-pads.%s.prev' "$HOME" "${slug%-}"
+}
+# test hook: print the resolved prev path and exit (no token/network needed)
+[ "${BRIDGE_PRINT_PREV_PATH:-0}" = "1" ] && { bridge_prev_path; echo; exit 0; }
+
 api() { curl -fsS -H "authorization: Bearer $TOKEN" -H "content-type: application/json" "$@"; }
 
-# find all .stitchpad pads under the roots (skip the ~/.stitchpad install symlink)
+# find all .stitchpad pads under the roots, excluding scratch pads (P18)
 find_pads() {
   for r in "${ROOTS[@]}"; do
     find "$r" -maxdepth 4 -type d -name .stitchpad 2>/dev/null
-  done | grep -v "/.stitchpad/.stitchpad" | sort -u
+  done | grep -v "/.stitchpad/.stitchpad" \
+        | while IFS= read -r pd; do [ -f "$pd/.scratch" ] || printf '%s\n' "$pd"; done \
+        | sort -u
 }
 
 echo "[bridge] relay=$RELAY  interval=${INTERVAL}s  scanning: ${ROOTS[*]}"
 while :; do
+  _bridge_current=""
   while IFS= read -r padd; do
     [ -f "$padd/stitchpad.md" ] || continue
     name="$(basename "$(dirname "$padd")")"            # pad name = project dir
+    _bridge_current="${_bridge_current}${name}
+"
     md="$(cat "$padd/stitchpad.md")"
     roster="$(cd "$(dirname "$padd")" && "$SP" roster 2>/dev/null | awk -F'|' '{printf "%s{\"name\":\"%s\",\"adapter\":\"%s\"}", (NR>1?",":""), $1, $2}')"
     # file list for the `>` attach dropdown: project files, relative paths, skip junk/dotdirs
@@ -91,9 +108,10 @@ print(json.dumps(skills))
         _status="dnd"
       else
         # Check if agent posted within last 90s (working)
-        _last_post_epoch="$(grep -a "^## @$_name" "$padd/stitchpad.md" | tail -1 | grep -o '[0-9]\{2\}:[0-9]\{2\}' | tail -1 | xargs -I{} date -j -f '%H:%M' '{}' +%s 2>/dev/null || echo 0)"
+        # Portable date arithmetic: BSD date -j first, GNU date -d second.
+        _last_post_epoch="$(grep -a "^## @$_name" "$padd/stitchpad.md" | tail -1 | grep -o '[0-9]\{2\}:[0-9]\{2\}' | tail -1 | xargs -I{} bash -c 'date -j -f "%H:%M" "$1" +%s 2>/dev/null || date -d "$1" +%s 2>/dev/null || echo 0' _ '{}')"
         _now_hour="$(date +%H:%M)"
-        _now_epoch="$(date -j -f '%H:%M' "$_now_hour" +%s 2>/dev/null || echo 0)"
+        _now_epoch="$(date -j -f '%H:%M' "$_now_hour" +%s 2>/dev/null || date -d "$_now_hour" +%s 2>/dev/null || echo 0)"
         _post_age=$(( _now_epoch - _last_post_epoch ))
         if [ "$_post_age" -gt 0 ] && [ "$_post_age" -lt 90 ]; then
           _status="working"
@@ -164,5 +182,23 @@ print(json.dumps(skills))
     # Write heartbeat after successful push+drain for this pad
     printf '{"ts":"%s","pad":"%s","interval":%s}' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$name" "$INTERVAL" > "$padd/.state/bridge-heartbeat" 2>/dev/null || true
   done < <(find_pads)
+
+  # P26: reconcile — DELETE any pad on the relay that was pushed last cycle
+  # but no longer exists on disk (pad directory deleted). Uses a simple
+  # persisted name list in the relay state dir.
+  _bridge_state_dir="${HOME}/.stitchpad/relay/state"
+  mkdir -p "$_bridge_state_dir" 2>/dev/null || true
+  _bridge_prev="$(bridge_prev_path)"
+  if [ -f "$_bridge_prev" ]; then
+    while IFS= read -r _old_name; do
+      [ -z "$_old_name" ] && continue
+      if ! echo "$_bridge_current" | grep -Fxq "$_old_name"; then
+        api -X DELETE "$RELAY/pads?pad=$_old_name" >/dev/null 2>&1 || true
+        echo "[bridge] unregistered: #$_old_name (pad no longer on disk)"
+      fi
+    done < "$_bridge_prev"
+  fi
+  printf '%s\n' "$_bridge_current" > "$_bridge_prev"
+
   sleep "$INTERVAL"
 done

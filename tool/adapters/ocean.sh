@@ -7,8 +7,10 @@
 # The roster target (the session id) arrives as $SP_TARGET.
 #
 # Delivery = `ocean-heartbeat wake`: POST the nudge as a turn on that exact
-# session and wait for the turn to finish. Exit contract:
-#   0 delivered (turn completed) · 3 deferred (busy/timeout) · 1 failed.
+# session. Standalone callers wait for completion. The per-seat supervisor sets
+# SP_DELIVERY_ACK_FILE, uses --no-wait, persists the returned turn_id, monitors
+# it, and can cancel that exact request if work is superseded. Exit contract:
+#   0 accepted/delivered · 3 deferred (busy/timeout) · 1 failed.
 # The Stop hook (stitchpad hook via [[hooks.Stop]] in ocean.toml) then keeps
 # the agent engaged at turn boundaries; bind the session once with:
 #   stitchpad bind-session <session-id> <name>
@@ -27,51 +29,182 @@ bin="$(command -v ocean-heartbeat 2>/dev/null || true)"
 
 pad_dir="$(cd "$(dirname "$pad")/.." && pwd)"
 msg="$(head -c 2000 "$taskfile" 2>/dev/null)"
+sp_bin="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/stitchpad"
+[ -x "$sp_bin" ] || sp_bin="$(command -v stitchpad 2>/dev/null || true)"
+[ -n "$sp_bin" ] && [ -x "$sp_bin" ] || { echo "[ocean.sh] stitchpad CLI not found" >&2; exit 1; }
+# TASK-1 model pinning: requested (.state/seat-model.<name>) vs resolved
+# (.state/resolved-model.<name>) with a refuse/surface policy.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../bin" && pwd)/lib.sh"
+state_dir="$(dirname "$pad")/.state"
+# PREFLIGHT: never let a wake silently inherit the daemon global default.
+# policy=refuse turns an unpinned seat or an active requested/resolved
+# mismatch into a refused wake (loud, never silent).
+sp_model_pin_preflight "$state_dir" "$name" || exit 1
+
+# Per-seat working directory override (opt-in). A build seat runs in its own
+# git worktree, not the pad's checkout — without this, a woken seat is rooted
+# at the pad dir and any file work lands in the wrong tree (or collides with
+# main / another seat). When .state/seat-cwd.<name> holds an existing dir, the
+# wake is rooted there and the prompt directs the seat to DO its lane's work,
+# not merely reply. No file (every chat pad) = unchanged reply-oriented wake.
+seat_cwd=""
+_seat_cwd_file="$state_dir/seat-cwd.$name"
+if [ -f "$_seat_cwd_file" ] && [ ! -L "$_seat_cwd_file" ]; then
+  _sc="$(head -c 4096 "$_seat_cwd_file" 2>/dev/null | tr -d '[:space:]')"
+  if [ -n "$_sc" ] && [ -d "$_sc" ]; then
+    seat_cwd="$_sc"
+  else
+    echo "[ocean.sh] seat-cwd for @$name is set but not a dir ($_sc) — falling back to pad dir" >&2
+  fi
+fi
+wake_cwd="${seat_cwd:-$pad_dir}"
+
+# Ocean-backed seats include Kimi, GLM, and DeepSeek. Build their wake through
+# the same canonical prompt path as Stop/Herdr/Pi rather than maintaining a
+# model-specific copy here.
+if [ -n "$seat_cwd" ]; then
+  prompt="$("$sp_bin" prompt-context <<EOF
+stitchpad: new @${name} mention — you are a BUILD seat, working in ${seat_cwd}.
+
+${msg}
+
+You are @${name}. Your workspace is ${seat_cwd} (your own git worktree —
+never work in another tree). Read the pad for coordination:
+  cd $(dirname "$pad")/.. && ~/.stitchpad/bin/stitchpad read -n 30
+then DO your lane's work in ${seat_cwd}: read the build's GOAL/LOOP docs,
+make small test-first commits on your branch, push, and report progress or a
+blocker on the pad with:
+  cd $(dirname "$pad")/.. && STITCHPAD_NAME=${name} ~/.stitchpad/bin/stitchpad say '<progress or blocker>'
+Replying on the pad is NOT the deliverable — landing reviewed, tested code is.
+EOF
+)"
+else
+  prompt="$("$sp_bin" prompt-context <<EOF
+stitchpad: new @${name} mention on the pad at ${pad}.
+
+${msg}
+
+You are @${name} on this pad. Read the recent conversation with:
+  cd ${pad_dir} && ~/.stitchpad/bin/stitchpad read -n 30
+then reply with:
+  cd ${pad_dir} && STITCHPAD_NAME=${name} ~/.stitchpad/bin/stitchpad say '<your reply>'
+EOF
+)"
+fi
 
 # IDLE-GUARD: posting a wake turn while the session is mid-turn queues it as
 # stale pending input (the parked-message bug smaths hit). Defer instead — the
 # watcher keeps the gate and retries, and the Stop hook covers turn-end
 # delivery for a session that is already running.
+#
+# k3 F13: this guard USED TO FAIL OPEN. `active` was computed as busy|idle|
+# unknown but only "busy" deferred, so a 3s timeout, a dead daemon or an
+# unparseable body all fell through to "idle" and the wake fired — precisely
+# when the daemon is too sick to answer quickly but still accepting turns
+# (overloaded, GC-paused, mid-restart with a half-up listener), which is exactly
+# when a session is most likely to be mid-turn. Measured with a mock daemon and
+# a stub ocean-heartbeat: unparseable body → rc=0, wake FIRED; daemon gone →
+# rc=0, wake FIRED.
+#
+# The fail direction was backwards. A deferred mention is retried by the watcher
+# — that is what the whole delivery-supervision machinery is for — while a wake
+# posted into a mid-turn session is the corruption this guard exists to prevent.
+# seat-keeper.sh already encodes the right policy in its own probe: "a probe has
+# three outcomes, not two: up, down, and unknown — unknown never moves a seat."
+# Same three states here, same reason strings, and unknown NEVER wakes.
+# (The retry it defers into is itself bounded now — ds F5 / k3 F14 — so a daemon
+# that stays unreachable ends in an announced terminal state instead of a spin.)
 daemon_url="${OCEAN_DAEMON_URL:-http://127.0.0.1:4780}"
-active="$(curl -sf --max-time 3 "$daemon_url/v1/agent/sessions/$session_id" 2>/dev/null \
-  | python3 -c 'import json,sys
+probe_session_state() {
+  local body
+  body="$(curl -sf --max-time 3 "$daemon_url/v1/agent/sessions/$session_id" 2>/dev/null)" \
+    || { printf 'unknown:http-fail'; return; }
+  [ -z "$body" ] && { printf 'unknown:empty-body'; return; }
+  printf '%s' "$body" | python3 -c '
+import json, sys
 try:
-    s=json.load(sys.stdin).get("session",{})
-    print("busy" if s.get("active_turn") else "idle")
+    d = json.load(sys.stdin)
 except Exception:
-    print("unknown")' 2>/dev/null)"
-if [ "$active" = "busy" ]; then
-  echo "[ocean.sh] session $session_id mid-turn — deferring wake for @$name" >&2
-  exit 3
+    print("unknown:unparseable"); raise SystemExit(0)
+s = d.get("session")
+if not isinstance(s, dict):
+    print("unknown:no-session-object"); raise SystemExit(0)
+print("busy" if s.get("active_turn") else "idle")
+' 2>/dev/null || printf 'unknown:probe-crashed'
+}
+active="$(probe_session_state)"
+[ -n "$active" ] || active="unknown:empty-probe"
+case "$active" in
+  busy)
+    echo "[ocean.sh] session $session_id mid-turn — deferring wake for @$name" >&2
+    exit 3 ;;
+  idle) ;;
+  *)
+    echo "[ocean.sh] session $session_id state UNKNOWN (${active#unknown:}) — cannot tell whether it is mid-turn; NOT waking @$name. The watcher keeps the mention and retries." >&2
+    exit 3 ;;
+esac
+
+seat_model="$(sp_model_pin_requested "$state_dir" "$name")"
+# master annotates the model on the roster row and exports SP_MODEL. Keep that as
+# a FALLBACK so a roster-pinned seat still works; the explicit per-seat pin wins.
+# NOTE on master's form (model_args=()): an EMPTY array expanded unguarded under
+# `set -u` is fatal on stock bash 3.2.57 — "model_args[@]: unbound variable" — the
+# adapter exits 1, the wake gate never clears, and the seat goes silently deaf.
+# wake_args below is always initialised NON-EMPTY, so it cannot hit that.
+[ -z "$seat_model" ] && [ -n "${SP_MODEL:-}" ] && [ "${SP_MODEL}" != "-" ] && seat_model="$SP_MODEL"
+wake_args=(wake --session-id "$session_id" --cwd "$wake_cwd" --client-type stitchpad \
+  --timeout-seconds 600 --prompt "$prompt")
+[ -n "$seat_model" ] && wake_args+=(--model "$seat_model")
+[ -n "${SP_DELIVERY_ACK_FILE:-}" ] && wake_args+=(--no-wait)
+
+# RESOLVED telemetry: after an accepted wake, read the session's own config
+# back from the daemon and persist it as the resolved truth, then re-check
+# against the requested pin. Best-effort: a daemon that cannot answer leaves
+# the previous resolved record untouched (an empty read never erases truth).
+record_resolved_from_daemon() {
+  local cfg rmodel rprovider rsource
+  cfg="$(curl -sf --max-time 3 "$daemon_url/v1/agent/sessions/$session_id/config" 2>/dev/null || true)"
+  [ -n "$cfg" ] || return 0
+  rmodel="$(printf '%s' "$cfg" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("model") or "")
+except Exception: print("")' 2>/dev/null)"
+  rprovider="$(printf '%s' "$cfg" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("provider") or "")
+except Exception: print("")' 2>/dev/null)"
+  rsource="$(printf '%s' "$cfg" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("model_source") or "")
+except Exception: print("")' 2>/dev/null)"
+  # The session-config RPC reports the SESSION's model, whose model_source is
+  # "global" whenever no session-level pin exists. A per-turn `--model` wake is
+  # invisible to it — the daemon applies model_id as a hard per-turn override
+  # (explicit model_id always wins; heartbeat preflights it against
+  # /v1/models before posting). Recording the global model here stamped a
+  # FALSE MISMATCH on every correctly-pinned wake. When we passed a pin this
+  # turn and the config read is only echoing the global default, the pin IS
+  # the effective model — record that, from its real source.
+  if [ "$rsource" = "global" ] && [ -n "$seat_model" ]; then
+    sp_model_pin_record_resolved "$state_dir" "$name" "$seat_model" "" \
+      "ocean-wake-model-arg" "$session_id" || true
+    sp_model_pin_check "$state_dir" "$name" || true
+    return 0
+  fi
+  [ -n "$rmodel" ] || return 0
+  sp_model_pin_record_resolved "$state_dir" "$name" "$rmodel" "$rprovider" \
+    "ocean-wake-config-rpc" "$session_id" || true
+  sp_model_pin_check "$state_dir" "$name" || true
+}
+
+if [ -n "${SP_DELIVERY_ACK_FILE:-}" ]; then
+  "$bin" "${wake_args[@]}" > "$SP_DELIVERY_ACK_FILE" || exit $?
+  turn_id="$(python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get("turn_id", ""))
+except Exception: print("")' "$SP_DELIVERY_ACK_FILE" 2>/dev/null)"
+  [ -n "$turn_id" ] || { echo '[ocean.sh] accepted wake omitted turn_id' >&2; exit 1; }
+  record_resolved_from_daemon
+  cat "$SP_DELIVERY_ACK_FILE"
+else
+  "$bin" "${wake_args[@]}"
+  wake_rc=$?
+  [ "$wake_rc" -eq 0 ] && record_resolved_from_daemon
+  exit "$wake_rc"
 fi
-
-# Pin the seat's model when the roster annotates one (name|adapter|MODEL|wake|target).
-# Without it the daemon's single current model answers for EVERY seat, so a pad of
-# differently-named agents is really one model wearing name tags.
-model_args=()
-[ -n "${SP_MODEL:-}" ] && [ "${SP_MODEL}" != "-" ] && model_args=(--model "$SP_MODEL")
-
-"$bin" wake \
-  --session-id "$session_id" \
-  "${model_args[@]}" \
-  --cwd "$pad_dir" \
-  --client-type "stitchpad" \
-  --timeout-seconds 600 \
-  --prompt "You are @${name} on the stitchpad at ${pad}.
-
-THE MESSAGE ADDRESSED TO YOU:
-${msg}
-
-Answer THAT message. Post exactly one reply:
-  cd ${pad_dir} && STITCHPAD_NAME=${name} ~/.stitchpad/bin/stitchpad say '@<sender> <your answer>'
-
-Rules:
-- Start your reply with @ and the name of whoever addressed you, so they are woken.
-- Answer the question asked. Do not summarise the pad or report on its state.
-- If you need context first: cd ${pad_dir} && ~/.stitchpad/bin/stitchpad read --new
-  (unread only — do NOT dump the whole history, it drowns the actual question).
-- Post ONCE. Your turn-end hook may wake you again after this; if there is nothing
-  new addressed to you, post NOTHING and simply stop. Never post filler such as
-  'no new messages', 'already replied', or 'roll call complete' — an empty turn is
-  the correct, expected outcome and costs nobody anything."
-exit $?
