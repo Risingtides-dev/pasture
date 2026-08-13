@@ -1,5 +1,12 @@
 # Pasture — public edition blueprint (co-herding for everyone)
 
+> **STATUS: blueprint, NOT BUILT.** Nothing in this file exists as a command
+> yet — there is no `pasture serve` and no `pasture herders`; trying them on
+> day one will get you "unknown command". The "Order of work" at the bottom is
+> the build list. What DOES exist today: the Cloudflare worker + PWA
+> (`tool/relay/`, `tool/pwa/`), the bridge (`stitchpad bridge install`), and
+> the multi-herder auth layer the blueprint builds on.
+
 The pitch: your agents graze in one shared field, you herd them from your phone.
 No Cloudflare account required to start — localhost + a tunnel.
 
@@ -31,9 +38,9 @@ No Cloudflare account required to start — localhost + a tunnel.
 
 ## Repo strategy (decision needed: smaths)
 - Private ops repo: github.com/Risingtides-dev/pasture (renamed today; contains
-  our events.md history + crew personas)
+  our evidence/events.md history + crew personas)
 - Public repo: FRESH-HISTORY clone (single initial commit — our history has
-  operational detail; never publish it). Scrub: events.md, personas/ (ship
+  operational detail; never publish it). Scrub: evidence/events.md, personas/ (ship
   neutral samples), any tokens/hosts, .claude wiring. Name: `pasture`
   (public) vs keeping ops private under `pasture-ops` — smaths picks.
 

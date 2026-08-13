@@ -9,8 +9,26 @@ set -uo pipefail
 
 HERE="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SP="$HERE/../tool/bin/stitchpad"
+# P12: sp_this_surface() falls back to the runner's session id, and the tripwire
+# blanks HERDR_* but NOT CLAUDE_CODE_SESSION_ID. This fixture was therefore
+# claiming the CAPTAIN'S OWN terminal — the refusal read
+#   "terminal <captain-session-uuid> is live as @tester"
+# and every crash-recovery join failed against it. Fixtures own their surface.
+unset STITCHPAD_SESSION CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID 2>/dev/null || true
+export STITCHPAD_TERMINAL_NAMESPACE="padio-main"
+
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/sp-padio.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT
+writer_pid=""
+crash_pid=""
+cleanup() {
+  for pid in "$writer_pid" "$crash_pid"; do
+    [ -n "$pid" ] && kill -KILL "$pid" 2>/dev/null || true
+    [ -n "$pid" ] && wait "$pid" 2>/dev/null || true
+  done
+  HOME="$WORK/home" STITCHPAD_PAD_DIR="$WORK/.stitchpad" "$SP" daemon stop >/dev/null 2>&1 || true
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
 
 pass=0; fail=0
 ok()   { printf '  \033[32mPASS\033[0m %s\n' "$1"; pass=$(( pass + 1 )); }
@@ -18,8 +36,15 @@ bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$1"; fail=$(( fail + 1 )); }
 check(){ if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (want '$3', got '$2')"; fi; }
 
 inode() { stat -f %i "$1" 2>/dev/null || stat -c %i "$1" 2>/dev/null; }
+ready_digest() {
+  local f
+  for f in "$PAD.ready"/*; do
+    [ -f "$f" ] && cksum "$f"
+  done | sort
+}
 
 export STITCHPAD_HEARTBEAT_AUTOSTART=0
+unset HERDR_PANE_ID HERDR_TAB_ID HERDR_ENV HERDR_SOCKET_PATH HERDR_WORKSPACE_ID 2>/dev/null || true
 # Isolate the MACHINE-GLOBAL terminal registry ($HOME/.stitchpad-terminals) so a
 # test run can neither be refused by, nor leak a claim into, the developer's
 # real pads.
@@ -35,6 +60,7 @@ sp init --name padio >/dev/null 2>&1
 PAD="$WORK/.stitchpad/stitchpad.md"
 TASKS="$WORK/.stitchpad/tasks.md"
 [ -f "$PAD" ] && ok "init created the pad" || bad "init created the pad"
+sp daemon stop >/dev/null 2>&1 || true
 
 sp join tester claude pull - >/dev/null 2>&1
 check "join added tester to the roster" "$(sp roster | cut -d'|' -f1 | tr '\n' ' ')" "tester "
@@ -50,12 +76,33 @@ check "new task card is in tasks.md" "$(grep -c "^\`\`\`task $T1\$" "$TASKS")" "
 grep -q '<!-- tasks:file -->' "$PAD" && ok "pad carries a pointer to tasks.md" \
   || bad "pad carries a pointer to tasks.md"
 
-padsum_before="$(cksum < "$PAD")"
+# TASK/MESSAGE SEPARATION — the invariant, restated to match its own purpose.
+# This was a byte-exact `cksum` equality, which also forbade P19 progress
+# narration ("### @tester moved TASK-2 -> done"). The hazard this check exists to
+# stop is E-13 DUAL WRITE: the same mutable card state living in two files and
+# diverging. A narration line is append-only HISTORY of an event that already
+# happened — it cannot diverge from tasks.md, because nothing ever reads card
+# state back out of it. The checksum was therefore stronger than the contract it
+# was written to protect, and it blocked a requirement the operator asked for
+# (P19: the pad must show progress BY DEFAULT).
+# The replacement is narrower where it matters: task ops may add NOTHING to the
+# conversation except narration lines — no task card fence, no conversation
+# block, no card fields. If a ticket op ever writes card state into the pad
+# again, this fails exactly as the checksum did.
+cp "$PAD" "$WORK/pad-before-tickets"
 T2="$(sp task new "second task" 2>/dev/null | awk '{print $1}')"
 sp task move "$T2" done >/dev/null 2>&1
 sp task edit "$T2" --to tester >/dev/null 2>&1
-padsum_after="$(cksum < "$PAD")"
-check "ticket ops no longer touch the conversation at all" "$padsum_before" "$padsum_after"
+_added="$(diff "$WORK/pad-before-tickets" "$PAD" | grep '^>' | sed 's/^> //' | grep -v '^[[:space:]]*$' || true)"
+_illegal="$(printf '%s\n' "$_added" | grep -v '^### @' | grep -v '^[[:space:]]*$' || true)"
+if [ -z "$_illegal" ]; then
+  ok "ticket ops add only P19 narration to the conversation (no card state)"
+else
+  bad "ticket ops wrote non-narration content into the conversation: $(printf '%s' "$_illegal" | head -2 | tr '\n' ' ')"
+fi
+printf '%s\n' "$_added" | grep -q '^```task' \
+  && bad "ticket ops wrote a task CARD into the pad (E-13 dual write)" \
+  || ok "no task card fence leaked into the conversation"
 
 check "task list sees pad template + both new tasks" "$(sp task list | wc -l | tr -d ' ')" "3"
 check "$T2 status" "$(sp task list | awk -F'|' -v t="$T2" '$1==t{print $3}')" "done"
@@ -181,21 +228,289 @@ printf '\n```task TASK-88\ntitle: fresh copy\nstatus: done\npriority: low\nassig
 laststatus="$(brdoc | awk '/^```task TASK-88$/{inblk=1} inblk && /^status:/{s=$2} inblk && /^```$/{inblk=0} END{print s}')"
 check "stale inline copy loses to the tasks.md copy (last wins)" "$laststatus" "done"
 
-# ── 6. crash recovery ───────────────────────────────────────────────
+# ── 6. generation-owned crash recovery ──────────────────────────────
 echo "── crash recovery"
-cp "$PAD" "$WORK/expected.md"
-printf 'RECOVERED PAD CONTENT\n' > "$PAD.ready"     # simulate a write killed mid-copy
-: > "$PAD"                                          # ...leaving the pad truncated
+
+# Pause writer A after it atomically promotes its complete generation while it
+# still owns the mutation lock. Passive init/roster B must not recover, replace,
+# or delete that live generation.
+barrier="$WORK/active-promotion"
+(
+  trap - EXIT
+  # Each background writer simulates a SEPARATE agent process. Without its own
+  # terminal surface it races the main thread for the one terminal claim, and
+  # the crash-recovery simulation never arms — which is why all 13 failures in
+  # this suite began exactly at "crash recovery".
+  STITCHPAD_TERMINAL_NAMESPACE="padio-paused-writer" \
+  HOME="$WORK/home" STITCHPAD_PAD_DIR="$WORK/.stitchpad" STITCHPAD_NAME=tester \
+    STITCHPAD_WRITE_TEST_AFTER_PROMOTION_BARRIER="$barrier" \
+    exec "$SP" join paused-writer claude pull -
+) > "$WORK/paused-writer.out" 2>&1 &
+writer_pid=$!
+for _ in $(seq 1 100); do
+  [ -f "$barrier.ready" ] && [ -d "$PAD.ready" ] && break
+  sleep 0.02
+done
+if [ -f "$barrier.ready" ] && [ -d "$PAD.ready" ]; then
+  ok "writer promoted an owned generation before pausing"
+else
+  bad "writer promoted an owned generation before pausing"
+fi
+ready_before="$(ready_digest)"
 sp roster >/dev/null 2>&1
-# a FRESH .ready may belong to a live writer mid-copy — it must NOT be replayed
-# (recovery runs outside the lock; see sp_recover_inplace)
-check "fresh .ready is left for its writer (no replay)" "$(cat "$PAD")" ""
-[ -f "$PAD.ready" ] && ok "fresh .ready is kept, not consumed" || bad "fresh .ready is kept, not consumed"
-touch -t 202001010000 "$PAD.ready"                  # now provably abandoned
-sp roster >/dev/null 2>&1                           # any command triggers recovery
-check "interrupted write is replayed on next command" "$(cat "$PAD")" "RECOVERED PAD CONTENT"
-[ -f "$PAD.ready" ] && bad "recovery cleared its .ready file" || ok "recovery cleared its .ready file"
-cp "$WORK/expected.md" "$PAD"
+ready_after="$(ready_digest)"
+check "passive init leaves the active .ready generation byte-exact" "$ready_after" "$ready_before"
+kill -0 "$writer_pid" 2>/dev/null \
+  && ok "passive init leaves the active writer running" \
+  || bad "passive init leaves the active writer running"
+touch "$barrier.release"
+wait "$writer_pid" \
+  && ok "paused writer completes after release" \
+  || bad "paused writer completes after release"
+writer_pid=""
+[ ! -e "$PAD.ready" ] && ok "writer clears only its completed generation" \
+  || bad "writer clears only its completed generation"
+grep -q '^paused-writer[[:space:]]*|' "$PAD" \
+  && ok "paused writer content reaches the pad" \
+  || bad "paused writer content reaches the pad"
+
+# Now kill a different writer after promotion. Its lock records an exact dead
+# process and its .ready directory contains a checksummed generation. The next
+# mutator may break that dead lock, replay the abandoned content in-place, and
+# then apply its own mutation.
+crash_barrier="$WORK/crash-promotion"
+(
+  trap - EXIT
+  # Each background writer simulates a SEPARATE agent process. Without its own
+  # terminal surface it races the main thread for the one terminal claim, and
+  # the crash-recovery simulation never arms — which is why all 13 failures in
+  # this suite began exactly at "crash recovery".
+  STITCHPAD_TERMINAL_NAMESPACE="padio-crash-writer" \
+  HOME="$WORK/home" STITCHPAD_PAD_DIR="$WORK/.stitchpad" STITCHPAD_NAME=tester \
+    STITCHPAD_WRITE_TEST_AFTER_PROMOTION_BARRIER="$crash_barrier" \
+    exec "$SP" join crash-writer claude pull -
+) > "$WORK/crash-writer.out" 2>&1 &
+crash_pid=$!
+for _ in $(seq 1 100); do
+  [ -f "$crash_barrier.ready" ] && [ -d "$PAD.ready" ] && break
+  sleep 0.02
+done
+if [ -f "$crash_barrier.ready" ] && [ -d "$PAD.ready" ]; then
+  ok "crash fixture promoted a complete generation"
+else
+  bad "crash fixture promoted a complete generation"
+fi
+kill -KILL "$crash_pid" 2>/dev/null || true
+wait "$crash_pid" 2>/dev/null || true
+crash_pid=""
+SP_LOCK_STALE=0 STITCHPAD_TERMINAL_NAMESPACE=padio-recovery sp join recovery-trigger claude pull - >/dev/null 2>&1 \
+  && ok "next mutator recovers an abandoned proven generation" \
+  || bad "next mutator recovers an abandoned proven generation"
+grep -q '^crash-writer[[:space:]]*|' "$PAD" \
+  && ok "abandoned writer content survives recovery" \
+  || bad "abandoned writer content survives recovery"
+grep -q '^recovery-trigger[[:space:]]*|' "$PAD" \
+  && ok "post-recovery mutation is serialized after replay" \
+  || bad "post-recovery mutation is serialized after replay"
+[ ! -e "$PAD.ready" ] && ok "recovery clears the exact abandoned generation" \
+  || bad "recovery clears the exact abandoned generation"
+
+# TERM must exit the writer before releasing its lock; it may not continue the
+# copy after unlock. The proven generation remains recoverable by the next
+# mutator, while the target itself is unchanged until that recovery acquires.
+signal_barrier="$WORK/signal-promotion"
+(
+  trap - EXIT
+  # Each background writer simulates a SEPARATE agent process. Without its own
+  # terminal surface it races the main thread for the one terminal claim, and
+  # the crash-recovery simulation never arms — which is why all 13 failures in
+  # this suite began exactly at "crash recovery".
+  STITCHPAD_TERMINAL_NAMESPACE="padio-signal-writer" \
+  HOME="$WORK/home" STITCHPAD_PAD_DIR="$WORK/.stitchpad" STITCHPAD_NAME=tester \
+    STITCHPAD_WRITE_TEST_AFTER_PROMOTION_BARRIER="$signal_barrier" \
+    exec "$SP" join signal-writer claude pull -
+) > "$WORK/signal-writer.out" 2>&1 &
+writer_pid=$!
+for _ in $(seq 1 100); do
+  [ -f "$signal_barrier.ready" ] && [ -d "$PAD.ready" ] && break
+  sleep 0.02
+done
+kill -TERM "$writer_pid" 2>/dev/null || true
+wait "$writer_pid" 2>/dev/null || true
+writer_pid=""
+[ ! -d "$WORK/.stitchpad/.state/.lock" ] \
+  && ok "TERM exits before releasing its exact lock generation" \
+  || bad "TERM exits before releasing its exact lock generation"
+grep -q '^signal-writer[[:space:]]*|' "$PAD" \
+  && bad "signaled writer continued mutation after unlock" \
+  || ok "signaled writer does not mutate after unlock"
+STITCHPAD_TERMINAL_NAMESPACE=padio-signal-recovery sp join signal-recovery claude pull - >/dev/null 2>&1 \
+  && ok "next mutator recovers the signaled writer generation" \
+  || bad "next mutator recovers the signaled writer generation"
+grep -q '^signal-writer[[:space:]]*|' "$PAD" \
+  && ok "signaled writer content survives owned recovery" \
+  || bad "signaled writer content survives owned recovery"
+
+# SIGKILL in the owner-publication window leaves only an empty canonical lock.
+# With an immediate stale threshold, the next writer reclaims it without losing
+# bytes or inheriting any old-generation publication temp.
+lock_barrier="$WORK/lock-before-owner"
+pad_before_lock_kill="$(cksum < "$PAD")"
+(
+  trap - EXIT
+  HOME="$WORK/home" STITCHPAD_PAD_DIR="$WORK/.stitchpad" STITCHPAD_NAME=tester \
+    STITCHPAD_LOCK_TEST_BEFORE_OWNER_BARRIER="$lock_barrier" \
+    exec "$SP" say 'killed before lock ownership'
+) > "$WORK/lock-kill.out" 2>&1 &
+writer_pid=$!
+for _ in $(seq 1 100); do [ -f "$lock_barrier.ready" ] && break; sleep 0.02; done
+[ -f "$lock_barrier.ready" ] && ok "lock crash seam reached before owner publication" \
+  || bad "lock crash seam reached before owner publication"
+kill -KILL "$writer_pid" 2>/dev/null || true; wait "$writer_pid" 2>/dev/null || true; writer_pid=""
+check "pre-owner SIGKILL leaves target byte-exact" "$(cksum < "$PAD")" "$pad_before_lock_kill"
+SP_LOCK_STALE=0 sp say 'writer after empty-lock crash' >/dev/null 2>&1 \
+  && ok "next writer reclaims empty crashed lock at stale=0" \
+  || bad "next writer reclaims empty crashed lock at stale=0"
+grep -q 'writer after empty-lock crash' "$PAD" \
+  && ok "post-lock-crash content reaches pad" || bad "post-lock-crash content reaches pad"
+[ ! -d "$WORK/.stitchpad/.state/.lock" ] \
+  && [ -z "$(find "$WORK/.stitchpad/.state" -maxdepth 1 \( -name '.lock-owner.*' -o -name '.pid-capture.*' \) -print -quit)" ] \
+  && ok "lock crash leaves no canonical or publication residue" \
+  || bad "lock crash leaves no canonical or publication residue"
+
+# Once content has been copied, .ready is atomically retired before cleanup.
+# A SIGKILL there leaves a non-blocking tombstone which the next locked mutator
+# validates and removes; the applied content and successor mutation both remain.
+retire_barrier="$WORK/after-ready-retire"
+(
+  trap - EXIT
+  # Own surface, like every other background writer here — this one was missed,
+  # so it raced the main thread for the terminal claim and its barrier never armed.
+  STITCHPAD_TERMINAL_NAMESPACE="padio-retired-writer" \
+  HOME="$WORK/home" STITCHPAD_PAD_DIR="$WORK/.stitchpad" STITCHPAD_NAME=tester \
+    STITCHPAD_WRITE_TEST_AFTER_RETIRE_BARRIER="$retire_barrier" \
+    exec "$SP" join retired-writer claude pull -
+) > "$WORK/retired-writer.out" 2>&1 &
+writer_pid=$!
+for _ in $(seq 1 100); do [ -f "$retire_barrier.ready" ] && break; sleep 0.02; done
+[ -f "$retire_barrier.ready" ] && [ ! -e "$PAD.ready" ] \
+  && [ -n "$(find "$WORK/.stitchpad" -maxdepth 1 -name 'stitchpad.md.ready.applied.*' -print -quit)" ] \
+  && ok "writer retires canonical ready before cleanup" \
+  || bad "writer retires canonical ready before cleanup"
+kill -KILL "$writer_pid" 2>/dev/null || true; wait "$writer_pid" 2>/dev/null || true; writer_pid=""
+SP_LOCK_STALE=0 STITCHPAD_TERMINAL_NAMESPACE=padio-after-retire sp join after-retire claude pull - >/dev/null 2>&1 \
+  && ok "next mutator crosses an applied-generation crash" \
+  || bad "next mutator crosses an applied-generation crash"
+grep -q '^retired-writer[[:space:]]*|' "$PAD" \
+  && grep -q '^after-retire[[:space:]]*|' "$PAD" \
+  && ok "retired and successor mutations both survive" \
+  || bad "retired and successor mutations both survive"
+[ ! -e "$PAD.ready" ] \
+  && [ -z "$(find "$WORK/.stitchpad" -maxdepth 1 -name 'stitchpad.md.ready.applied.*' -print -quit)" ] \
+  && ok "next mutator reaps exact applied tombstone" \
+  || bad "next mutator reaps exact applied tombstone"
+
+# Symlinked recovery components and targets are never followed by the writer.
+outside_ready="$WORK/outside-ready"; mkdir "$outside_ready"
+printf 'outside-content' > "$outside_ready/content"
+ln -s "$outside_ready" "$PAD.ready"
+outside_sum="$(cksum < "$outside_ready/content")"
+if sp say 'must not follow ready symlink' >/dev/null 2>&1; then
+  bad "symlinked ready directory should block mutation"
+else
+  ok "symlinked ready directory blocks mutation"
+fi
+check "ready symlink target remains byte-exact" "$(cksum < "$outside_ready/content")" "$outside_sum"
+rm -f "$PAD.ready" "$outside_ready/content"; rmdir "$outside_ready"
+
+# Manifest generations become part of the applied-tombstone pathname. Reject
+# separators/traversal even when every other target/size/digest field is valid.
+mkdir "$PAD.ready"
+cp "$PAD" "$PAD.ready/content"
+pad_canon="$(cd -P "$(dirname "$PAD")" && pwd)/$(basename "$PAD")"
+python3 - "$PAD.ready/content" "$PAD.ready/owner" "$pad_canon" <<'PY'
+import hashlib, json, os, sys
+content, owner, target = sys.argv[1:]
+with open(content, "rb") as handle:
+    body = handle.read()
+with open(owner, "w", encoding="utf-8") as handle:
+    json.dump({"generation": "bad/../escape", "pid": 99999991,
+               "processStart": "dead", "command": "dead", "target": target,
+               "size": len(body), "sha256": hashlib.sha256(body).hexdigest()},
+              handle, separators=(",", ":"))
+PY
+unsafe_ready_before="$(ready_digest)"
+if SP_LOCK_STALE=0 sp say 'must not apply unsafe generation' >/dev/null 2>&1; then
+  bad "unsafe ready generation should block mutation"
+else
+  ok "unsafe ready generation blocks mutation"
+fi
+check "unsafe ready generation evidence remains byte-exact" "$(ready_digest)" "$unsafe_ready_before"
+rm -f "$PAD.ready/content" "$PAD.ready/owner"; rmdir "$PAD.ready"
+
+mv "$TASKS" "$TASKS.real"
+printf 'outside-task-target' > "$WORK/outside-tasks"
+ln -s "$WORK/outside-tasks" "$TASKS"
+outside_sum="$(cksum < "$WORK/outside-tasks")"
+if sp task new 'must not follow task target' >/dev/null 2>&1; then
+  bad "symlinked mutation target should be rejected"
+else
+  ok "symlinked mutation target is rejected"
+fi
+check "symlinked target remains byte-exact" "$(cksum < "$WORK/outside-tasks")" "$outside_sum"
+rm -f "$TASKS" "$WORK/outside-tasks"; mv "$TASKS.real" "$TASKS"
+
+mv "$PAD" "$WORK/outside-pad"
+ln -s "$WORK/outside-pad" "$PAD"
+outside_sum="$(cksum < "$WORK/outside-pad")"
+if sp say 'must not follow pad target' >/dev/null 2>&1; then
+  bad "symlinked pad target should be rejected"
+else
+  ok "symlinked pad target is rejected"
+fi
+check "symlinked pad target remains byte-exact" "$(cksum < "$WORK/outside-pad")" "$outside_sum"
+rm -f "$PAD"; mv "$WORK/outside-pad" "$PAD"
+
+mv "$TASKS" "$TASKS.real"
+ln -s "$WORK/outside-tasks-missing" "$TASKS"
+if sp task new 'must not create broken task target' >/dev/null 2>&1; then
+  bad "broken tasks symlink should be rejected"
+else
+  ok "broken tasks symlink is rejected"
+fi
+[ ! -e "$WORK/outside-tasks-missing" ] \
+  && ok "broken tasks symlink target is not created" \
+  || bad "broken tasks symlink target is not created"
+rm -f "$TASKS"; mv "$TASKS.real" "$TASKS"
+
+# Legacy or malformed state lacks sufficient authority. Even with an immediate
+# stale threshold, neither an unowned regular .ready nor an unknown lock owner
+# may be consumed, replaced, or silently broken.
+pad_before_fail_closed="$(cksum < "$PAD")"
+printf 'legacy-unowned-content\n' > "$PAD.ready"
+if SP_LOCK_STALE=0 sp say 'must not cross legacy ready' >/dev/null 2>&1; then
+  bad "legacy unowned .ready should block mutation"
+else
+  ok "legacy unowned .ready blocks mutation"
+fi
+[ -f "$PAD.ready" ] && ok "legacy unowned .ready is preserved for repair" \
+  || bad "legacy unowned .ready is preserved for repair"
+check "legacy recovery refusal leaves target byte-exact" "$(cksum < "$PAD")" "$pad_before_fail_closed"
+rm -f "$PAD.ready"
+
+mkdir "$WORK/.stitchpad/.state/.lock"
+printf 'malformed-owner' > "$WORK/.stitchpad/.state/.lock/owner"
+if SP_LOCK_STALE=0 sp say 'must not cross malformed lock' >/dev/null 2>&1; then
+  bad "malformed lock owner should fail closed"
+else
+  ok "malformed lock owner fails closed"
+fi
+check "malformed lock evidence remains exact" \
+  "$(cat "$WORK/.stitchpad/.state/.lock/owner")" "malformed-owner"
+check "malformed lock refusal leaves target byte-exact" "$(cksum < "$PAD")" "$pad_before_fail_closed"
+rm -f "$WORK/.stitchpad/.state/.lock/owner"
+rmdir "$WORK/.stitchpad/.state/.lock"
+sp daemon stop >/dev/null 2>&1 || true
 
 echo
 printf '%d passed, %d failed\n' "$pass" "$fail"

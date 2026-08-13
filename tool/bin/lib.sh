@@ -25,6 +25,9 @@ for _pv_name in NAME SESSION PAD_DIR STEAL HOME CWD RELAY TOKEN PAD HANDLE INVIT
 done
 unset _pv_name _pv_val
 
+# TASK-5: scope manifests and deployment authority
+[ -n "${BIN_DIR:-}" ] && [ -f "$BIN_DIR/scope-authority.sh" ] && source "$BIN_DIR/scope-authority.sh" || true
+
 # STITCHPAD_HOME is the checkout's tool/ dir (holds bin/ + adapters/). If the
 # caller already resolved BIN_DIR (via the symlink-safe header), derive HOME from
 # it so install-by-symlink works without anyone exporting STITCHPAD_HOME.
@@ -34,13 +37,77 @@ fi
 STITCHPAD_HOME="${STITCHPAD_HOME:-$HOME/.stitchpad}"
 ADAPTER_DIR="$STITCHPAD_HOME/adapters"
 
+# Watch admission policy has one shell-owned source of truth.  Python health
+# receives this exact value from the CLI rather than carrying a drifting copy.
+STITCHPAD_WATCH_START_GRACE="${STITCHPAD_WATCH_START_GRACE:-5}"
+STITCHPAD_WATCH_STAGE_STALE_SECONDS="${STITCHPAD_WATCH_STAGE_STALE_SECONDS:-60}"
+export STITCHPAD_WATCH_START_GRACE STITCHPAD_WATCH_STAGE_STALE_SECONDS
+
+# One canonical prompt fragment for every runtime. Keep model adapters thin:
+# they call this builder instead of carrying per-model copies that drift.
+# `full` is Ponytail's upstream default; an explicit `off` is the only opt-out.
+sp_ponytail_mode() {
+  local mode="${STITCHPAD_PONYTAIL_MODE:-${PONYTAIL_DEFAULT_MODE:-full}}"
+  mode="$(printf '%s' "$mode" | tr '[:upper:]' '[:lower:]')"
+  case "$mode" in off) printf 'off\n' ;; *) printf 'full\n' ;; esac
+}
+
+sp_ponytail_instructions() {
+  [ "$(sp_ponytail_mode)" = "off" ] && return 0
+  local fragment="$STITCHPAD_HOME/instructions/ponytail.md"
+  [ -f "$fragment" ] || return 0
+  cat "$fragment"
+}
+
+# Read a complete prompt on stdin and emit it with the canonical fragment at
+# most once. Prefix by default; `append` preserves the wake nudge's historical
+# first-line contract. Only the complete canonical block at a prompt boundary
+# counts as composed. Spoofed boundary tokens in untrusted text are neutralized.
+sp_prompt_with_ponytail() {
+  local placement="${1:-prepend}" body rules trusted_placement=""
+  body="$(cat)"
+  rules="$(sp_ponytail_instructions)"
+  if [ -z "$rules" ]; then
+    printf '%s\n' "$body"
+    return 0
+  fi
+  # Preserve one complete, exact trusted block only when it occupies a prompt
+  # boundary. Remove it temporarily so every marker token in the remaining
+  # user-controlled text is neutralized before the prompt is reconstructed.
+  case "$body" in
+    "$rules") printf '%s\n' "$rules"; return 0 ;;
+    "$rules"$'\n\n'*)
+      body="${body#"$rules"$'\n\n'}"
+      trusted_placement="prepend"
+      ;;
+    *$'\n\n'"$rules")
+      body="${body%$'\n\n'"$rules"}"
+      trusted_placement="append"
+      ;;
+  esac
+  # Pad/handoff text is untrusted. A copied marker must remain ordinary text,
+  # not an instruction-suppression primitive or a second canonical block.
+  body="$(printf '%s' "$body" | sed \
+    -e 's|<!-- stitchpad:ponytail:v1 |<!-- stitchpad:user-text:ponytail:v1 |g' \
+    -e 's|<!-- /stitchpad:ponytail:v1 -->|<!-- stitchpad:user-text:/ponytail:v1 -->|g')"
+  [ -n "$trusted_placement" ] && placement="$trusted_placement"
+  if [ "$placement" = "append" ]; then
+    printf '%s\n\n%s\n' "$body" "$rules"
+  else
+    printf '%s\n\n%s\n' "$rules" "$body"
+  fi
+}
+
 # ── Pad resolution ──────────────────────────────────────────────────
 # Find the pad dir: explicit $PAD_DIR, else nearest .stitchpad up the tree.
 # The install home is ~/.stitchpad -> <checkout>/tool, which matches the very
-# marker name this walk-up looks for — and the checkout ships tool/stitchpad.md,
-# so it reads as a fully valid pad. Without this guard every directory under
-# $HOME resolves to it: writes land in the tracked repo file, and the claim hook
-# denies Write/Edit machine-wide. Never treat the install home as a pad.
+# marker name this walk-up looks for. The checkout used to ship a stray
+# tool/stitchpad.md (removed — it was a real pad's debris), which made the
+# install home read as a fully valid pad: every directory under $HOME resolved
+# to it, writes landed in the tracked repo file, and the claim hook denied
+# Write/Edit machine-wide. The guard stays as defense-in-depth — any
+# pad-shaped file that lands in the install home must never make it a pad
+# (p29-p30-claim-hook-gate plants exactly that bait to prove it).
 sp_is_install_home() {
   local cand="$1" home
   home="$(cd "${STITCHPAD_HOME:-$HOME/.stitchpad}" 2>/dev/null && pwd -P)" || return 1
@@ -79,7 +146,7 @@ sp_ensure_outer_git_ignore() {
   grep -Fqx "$pattern" "$exclude" 2>/dev/null || printf '\n# stitchpad runtime (isolated history)\n%s\n' "$pattern" >> "$exclude"
 }
 
-sp_init_paths() {
+sp_init_paths_readonly() {
   # Resolution order for which pad we operate on:
   #   1. explicit arg ($1)            — caller passed a dir
   #   2. STITCHPAD_PAD_DIR env        — pin a pad regardless of cwd (daemons/hooks)
@@ -87,19 +154,33 @@ sp_init_paths() {
   # Without #2, a watcher/daemon launched from the wrong cwd silently watched the
   # wrong pad (ocean-os's watcher latched onto stitchpad-live). Honor the pin.
   PAD_DIR="$(sp_find_pad "${1:-${STITCHPAD_PAD_DIR:-$PWD}}")" || { echo "no pasture found (run: pasture init)" >&2; return 1; }
+  PAD_DIR="$(cd -P "$PAD_DIR" 2>/dev/null && pwd)" \
+    || { echo "stitchpad: could not canonicalize pad directory" >&2; return 1; }
   # migrated pads carry pasture.md/pasture-git; legacy names accepted until stage 4
   if [ -f "$PAD_DIR/pasture.md" ]; then PAD_MD="$PAD_DIR/pasture.md"; else PAD_MD="$PAD_DIR/stitchpad.md"; fi
   if [ -d "$PAD_DIR/pasture-git" ]; then PAD_GIT="$PAD_DIR/pasture-git"; else PAD_GIT="$PAD_DIR/stitchpad-git"; fi
+  # Refuse symlinked pad git directories: a dangling symlink reads as absent
+  # to [ -d ] but routes through fallback/auto-create, enabling an empty-repo
+  # attack. Even a valid symlink-to-directory is refused — the pad git must
+  # be a genuine directory, not an alias that can be swapped mid-operation.
+  if [ -L "$PAD_GIT" ]; then
+    echo "stitchpad: pad git directory is a symlink — refusing" >&2
+    return 1
+  fi
   PAD_STATE="$PAD_DIR/.state"
   # Task cards live in a SIBLING file so a `task move` never rewrites (or
   # commits) the whole conversation. Legacy inline ```task blocks in the pad are
   # still read — see sp_tasks() — so existing pads keep working untouched.
   PAD_TASKS="$PAD_DIR/tasks.md"
   PAD_ARCHIVE_DIR="$PAD_DIR/archive"
+}
+
+sp_init_paths() {
+  sp_init_paths_readonly "${1:-}" || return 1
   mkdir -p "$PAD_STATE/sessions"
-  # Replay an in-place rewrite that was interrupted between truncate and write.
-  sp_recover_inplace "$PAD_MD"
-  sp_recover_inplace "$PAD_TASKS"
+  # Recovery is intentionally NOT performed here. sp_init_paths is used by
+  # passive/read-only commands and runs outside the pad mutation lock. Only
+  # sp_lock may reconcile a promoted write generation.
   sp_ensure_outer_git_ignore
   # Pad git is load-bearing (read --new deltas, say auto-commits, compaction
   # audit trail) but NOTHING ever initialized it — sp_commit just no-ops when
@@ -109,6 +190,20 @@ sp_init_paths() {
     git --git-dir="$PAD_GIT" --work-tree="$PAD_DIR" add stitchpad.md 2>/dev/null || true
     git --git-dir="$PAD_GIT" --work-tree="$PAD_DIR" -c user.name=stitchpad -c user.email=pad@local \
       commit -q -m "bootstrap: pad git (re)initialized" 2>/dev/null || true
+  fi
+}
+
+# Evidence label (TASK-6): stamp the current environment + immutable candidate
+# for a verification artifact. Delegates to tool/bin/evidence-stamp when
+# present and never fails the caller when the helper is unavailable — the
+# stamp is a label on evidence, not a gate.
+sp_evidence_stamp() {
+  local _stamp
+  _stamp="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)/evidence-stamp"
+  if [ -x "$_stamp" ]; then
+    "$_stamp" "$@"
+  else
+    echo "# evidence-stamp: unavailable"
   fi
 }
 
@@ -171,11 +266,406 @@ sp_session_name() {
   fi
 }
 
+# ── Model pinning (requested vs resolved) ───────────────────────────
+# Every seat carries TWO model truths, persisted separately:
+#   .state/seat-model.<name>          REQUESTED — operator-owned pin. Never
+#                                     written by telemetry; roster columns are
+#                                     not a second authority either.
+#   .state/resolved-model.<name>      RESOLVED — written ONLY from telemetry:
+#                                     the binding runtime's own env, or the
+#                                     daemon session-config readback after a
+#                                     wake. An empty read never overwrites.
+#   .state/resolved-provider.<name>   RESOLVED provider (best-effort).
+#   .state/resolved-model-meta.<name> provenance: <source>|<epoch>|<session>
+#   .state/model-mismatch.<name>      ACTIVE mismatch marker:
+#                                     <requested>|<resolved>|<epoch>. Written
+#                                     when requested != resolved, removed when
+#                                     truth heals. Its presence is the signal.
+# Policy (STITCHPAD_MODEL_PIN_POLICY or .state/model-pin-policy):
+#   surface (default) — loud stderr line + marker; work continues.
+#   refuse            — wake paths (ocean adapter, seat-keeper) refuse to wake
+#                       while a mismatch is active or the seat is unpinned.
+# Identity binding (bind-session) always surfaces, never refuses: the resolved
+# record is evidence, and refusing to record identity over metadata would hide
+# exactly the drift this mechanism exists to catch.
+
+sp_model_pin_valid_name() {
+  case "$1" in ''|.*|*/*|*[[:space:]]*) return 1 ;; *) return 0 ;; esac
+}
+
+sp_model_pin_policy() {
+  # $1 = state dir. Prints "refuse" or "surface" (default).
+  local p="${STITCHPAD_MODEL_PIN_POLICY:-}"
+  [ -n "$p" ] || p="$(cat "$1/model-pin-policy" 2>/dev/null || true)"
+  case "$p" in refuse) printf 'refuse\n' ;; *) printf 'surface\n' ;; esac
+}
+
+sp_model_pin_requested() {
+  # $1 = state dir, $2 = name. Prints the operator-pinned model (may be empty).
+  sp_model_pin_valid_name "${2:-}" || return 1
+  cat "$1/seat-model.$2" 2>/dev/null || true
+}
+
+sp_model_pin_record_resolved() {
+  # $1=state $2=name $3=model $4=provider $5=source $6=session(optional).
+  # Telemetry writer. An empty model read NEVER erases a prior resolved truth.
+  local state="$1" name="$2" model="$3" provider="${4:-}" source="$5" session="${6:-}" now
+  sp_model_pin_valid_name "$name" || return 1
+  [ -n "$model" ] || return 0
+  now="$(date +%s)"
+  printf '%s' "$model" > "$state/resolved-model.$name.tmp.$$" \
+    && mv "$state/resolved-model.$name.tmp.$$" "$state/resolved-model.$name" || return 1
+  if [ -n "$provider" ]; then
+    printf '%s' "$provider" > "$state/resolved-provider.$name.tmp.$$" \
+      && mv "$state/resolved-provider.$name.tmp.$$" "$state/resolved-provider.$name"
+  fi
+  printf '%s|%s|%s' "$source" "$now" "$session" > "$state/resolved-model-meta.$name.tmp.$$" \
+    && mv "$state/resolved-model-meta.$name.tmp.$$" "$state/resolved-model-meta.$name"
+}
+
+sp_model_pin_check() {
+  # $1 = state dir, $2 = name. Compares requested vs resolved.
+  # rc 0 = no active mismatch (marker cleared); rc 2 = mismatch (marker
+  # written, loud line on stderr). Never fails closed on missing data:
+  # an unpinned seat or an uninstrumented runtime is not a mismatch.
+  local state="$1" name="$2" req res now
+  sp_model_pin_valid_name "$name" || return 1
+  req="$(sp_model_pin_requested "$state" "$name")"
+  res="$(cat "$state/resolved-model.$name" 2>/dev/null || true)"
+  if [ -n "$req" ] && [ -n "$res" ] && [ "$req" != "$res" ]; then
+    now="$(date +%s)"
+    printf '%s|%s|%s' "$req" "$res" "$now" > "$state/model-mismatch.$name.tmp.$$" \
+      && mv "$state/model-mismatch.$name.tmp.$$" "$state/model-mismatch.$name"
+    echo "[model-pin] MISMATCH @$name: requested '$req' (.state/seat-model.$name) != resolved '$res' — marker .state/model-mismatch.$name" >&2
+    return 2
+  fi
+  rm -f "$state/model-mismatch.$name" 2>/dev/null
+  return 0
+}
+
+sp_model_pin_preflight() {
+  # $1 = state dir, $2 = name. Gate run by wake paths (ocean adapter,
+  # seat-keeper) BEFORE posting a turn. Guarantees no seat silently inherits
+  # the daemon global default: unpinned seats are always surfaced, and under
+  # policy=refuse they (and active mismatches) refuse the wake with rc 2.
+  local state="$1" name="$2" policy req rc
+  sp_model_pin_valid_name "$name" || return 1
+  policy="$(sp_model_pin_policy "$state")"
+  req="$(sp_model_pin_requested "$state" "$name")"
+  if [ -z "$req" ]; then
+    echo "[model-pin] @$name has NO requested pin (.state/seat-model.$name) — a wake would silently inherit the daemon global default" >&2
+    if [ "$policy" = "refuse" ]; then
+      echo "[model-pin] policy=refuse: refusing unpinned wake for @$name" >&2
+      return 2
+    fi
+  fi
+  sp_model_pin_check "$state" "$name"
+  rc=$?
+  if [ "$rc" -eq 2 ] && [ "$policy" = "refuse" ]; then
+    echo "[model-pin] policy=refuse: refusing wake for @$name while a requested/resolved mismatch is active" >&2
+    return 2
+  fi
+  return 0
+}
+
 # ── Do Not Disturb ──────────────────────────────────────────────────
 # DND is a local wake-suppression flag. It never mutates the pad or seen cursor:
 # mentions accumulate behind .state/seen.<name> and can be drained on return.
 sp_dnd_file() { printf '%s/dnd.%s\n' "$PAD_STATE" "$1"; }
 sp_dnd_is_on() { [ -f "$(sp_dnd_file "$1")" ]; }
+
+# ── Heartbeat ticker ownership ────────────────────────────────────────
+# A PID alone is never ownership proof: after a crash the kernel may reuse it
+# for an unrelated process.  New ticker locks therefore carry the process start
+# identity, exact command line, pad, and seat that the spawning parent observed.
+# Stop/reset callers must match every field against the live process before
+# sending any signal.  Legacy locks without this record deliberately fail
+# closed while their recorded PID is live.
+sp_process_start() {
+  # MP-1: lstart output is LOCALE-DEPENDENT (%a %b localize — C: "Mon Aug  3",
+  # de_DE: "Mo.  3 Aug."). Claim start tokens are written once and compared
+  # byte-for-byte by later checks possibly running under a different locale;
+  # force LC_ALL=C so writer and checker always see the same format (flash
+  # re-attack MP-1; TASK-14 env-invariance applied to production code).
+  LC_ALL=C ps -p "$1" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+sp_process_command() {
+  ps -p "$1" -o command= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+sp_process_identity_matches() {
+  local pid="$1" expected_start="$2" expected_command="$3" started command
+  case "$pid" in ''|*[!0-9]*) return 1;; esac
+  kill -0 "$pid" 2>/dev/null || return 1
+  started="$(sp_process_start "$pid")"
+  command="$(sp_process_command "$pid")"
+  [ -n "$expected_start" ] && [ -n "$expected_command" ] \
+    && [ "$started" = "$expected_start" ] && [ "$command" = "$expected_command" ]
+}
+
+sp_b64_encode() {
+  python3 - "$1" <<'PY'
+import base64, sys
+print(base64.b64encode(sys.argv[1].encode()).decode())
+PY
+}
+
+sp_b64_decode() {
+  python3 - "$1" <<'PY'
+import base64, sys
+try:
+    print(base64.b64decode(sys.argv[1], validate=True).decode(), end="")
+except Exception:
+    raise SystemExit(1)
+PY
+}
+
+sp_generation_is_safe() {
+  case "$1" in
+    ''|*[!A-Za-z0-9._-]* ) return 1 ;;
+    * ) [ "${#1}" -le 128 ] ;;
+  esac
+}
+
+sp_ticker_launcher_claim() {
+  local lockd="$1" generation="$2" who="$3" pid started command tmp
+  pid="$$"
+  started="$(sp_process_start "$pid")"
+  command="$(sp_process_command "$pid")"
+  [ -n "$generation" ] && [ -n "$started" ] && [ -n "$command" ] || return 1
+  tmp="$PAD_STATE/.heartbeat-launcher.$$.$RANDOM"
+  python3 - "$generation" "$pid" "$started" "$command" "$PAD_DIR" "$who" > "$tmp" <<'PY'
+import json, sys
+generation, pid, started, command, pad, name = sys.argv[1:]
+print(json.dumps({
+    "generation": generation,
+    "pid": int(pid),
+    "processStart": started,
+    "command": command,
+    "pad": pad,
+    "name": name,
+}, separators=(",", ":")))
+PY
+  [ -d "$lockd" ] && [ "$(cat "$lockd/generation" 2>/dev/null || true)" = "$generation" ] \
+    && [ -s "$tmp" ] && ln "$tmp" "$lockd/launcher" 2>/dev/null || {
+    rm -f "$tmp" 2>/dev/null || true
+    return 1
+  }
+  rm -f "$tmp" 2>/dev/null || true
+}
+
+sp_ticker_manifest_is_valid() {
+  local path="$1" generation="$2" who="$3"
+  [ -f "$path" ] || return 1
+  python3 - "$path" "$generation" "$PAD_DIR" "$who" <<'PY'
+import json, sys
+path, generation, pad, name = sys.argv[1:]
+try:
+    with open(path, encoding="utf-8") as handle:
+        owner = json.load(handle)
+    assert set(owner) == {"generation", "pid", "processStart", "command", "pad", "name"}
+    assert owner["generation"] == generation and owner["pad"] == pad and owner["name"] == name
+    assert isinstance(owner["pid"], int) and owner["pid"] > 0
+    assert all(isinstance(owner[k], str) and owner[k]
+               for k in ("processStart", "command"))
+except Exception:
+    raise SystemExit(1)
+PY
+}
+
+sp_ticker_manifest_is_live() {
+  local path="$1" generation="$2" who="$3" pid started command
+  sp_ticker_manifest_is_valid "$path" "$generation" "$who" || return 1
+  pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$path" 2>/dev/null || true)"
+  started="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["processStart"])' "$path" 2>/dev/null || true)"
+  command="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["command"])' "$path" 2>/dev/null || true)"
+  sp_process_identity_matches "$pid" "$started" "$command"
+}
+
+sp_ticker_owner_claim() {
+  local lockd="$1" generation="$2" pid="$3" who="$4" started command tmp
+  [ "${STITCHPAD_HEARTBEAT_TEST_OWNER_WRITE_FAIL:-0}" != "1" ] || return 1
+  started="$(sp_process_start "$pid")"
+  command="$(sp_process_command "$pid")"
+  [ -n "$generation" ] && [ -n "$started" ] && [ -n "$command" ] || return 1
+  tmp="$PAD_STATE/.heartbeat-owner.$pid.$RANDOM"
+  python3 - "$generation" "$pid" "$started" "$command" "$PAD_DIR" "$who" > "$tmp" <<'PY'
+import json, sys
+generation, pid, started, command, pad, name = sys.argv[1:]
+print(json.dumps({
+    "generation": generation,
+    "pid": int(pid),
+    "processStart": started,
+    "command": command,
+    "pad": pad,
+    "name": name,
+}, separators=(",", ":")))
+PY
+  [ -d "$lockd" ] && [ "$(cat "$lockd/generation" 2>/dev/null || true)" = "$generation" ] \
+    && [ -s "$tmp" ] && ln "$tmp" "$lockd/owner" 2>/dev/null || {
+      rm -f "$tmp" 2>/dev/null || true
+      return 1
+    }
+  rm -f "$tmp" 2>/dev/null || true
+  sp_ticker_owner_matches "$lockd" "$generation" "$pid" "$who"
+}
+
+sp_ticker_owner_matches() {
+  local lockd="$1" generation="$2" pid="$3" who="$4" started command
+  [ "$(cat "$lockd/generation" 2>/dev/null || true)" = "$generation" ] || return 1
+  sp_ticker_manifest_is_valid "$lockd/owner" "$generation" "$who" || return 1
+  started="$(sp_process_start "$pid")"
+  command="$(sp_process_command "$pid")"
+  [ -n "$started" ] && [ -n "$command" ] || return 1
+  python3 - "$lockd/owner" "$pid" "$started" "$command" <<'PY'
+import json, sys
+path, pid, started, command = sys.argv[1:]
+try:
+    with open(path, encoding="utf-8") as handle:
+        owner = json.load(handle)
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(0 if owner["pid"] == int(pid)
+                 and owner["processStart"] == started
+                 and owner["command"] == command else 1)
+PY
+}
+
+sp_ticker_retire_generation() {
+  local lockd="$1" generation="$2" retired="$1.retired.$2"
+  sp_generation_is_safe "$generation" \
+    && [ "$(cat "$lockd/generation" 2>/dev/null || true)" = "$generation" ] || return 1
+  [ ! -e "$retired" ] || return 1
+  mv "$lockd" "$retired" 2>/dev/null || return 1
+  printf '%s\n' "$retired"
+}
+
+sp_ticker_retired_cleanup() {
+  local retired="$1"
+  rm -f "$retired/owner" "$retired/launcher" "$retired/pid" "$retired/cancel" \
+    "$retired/generation" 2>/dev/null || true
+  rmdir "$retired" 2>/dev/null
+}
+
+sp_ticker_cancel_generation() {
+  local lockd="$1" generation="$2" tmp="$PAD_STATE/.heartbeat-cancel.$$.$RANDOM"
+  sp_generation_is_safe "$generation" \
+    && [ "$(cat "$lockd/generation" 2>/dev/null || true)" = "$generation" ] || return 1
+  if [ -f "$lockd/cancel" ]; then
+    [ "$(cat "$lockd/cancel" 2>/dev/null || true)" = "$generation" ]
+    return
+  fi
+  printf '%s' "$generation" > "$tmp" || return 1
+  [ "$(cat "$lockd/generation" 2>/dev/null || true)" = "$generation" ] \
+    && ln "$tmp" "$lockd/cancel" 2>/dev/null || {
+      rm -f "$tmp" 2>/dev/null || true
+      [ "$(cat "$lockd/cancel" 2>/dev/null || true)" = "$generation" ]
+      return
+    }
+  rm -f "$tmp" 2>/dev/null || true
+}
+
+sp_ticker_generation_cleanup() {
+  local lockd="$1" generation="$2"
+  sp_generation_is_safe "$generation" \
+    && [ "$(cat "$lockd/generation" 2>/dev/null || true)" = "$generation" ] || return 1
+  rm -f "$lockd/owner" "$lockd/launcher" "$lockd/pid" "$lockd/cancel" "$lockd/generation" 2>/dev/null || true
+  rmdir "$lockd" 2>/dev/null
+}
+
+sp_ticker_alive_remove_generation() {
+  local who="$1" generation="$2" alive="$PAD_STATE/alive.$1" observed actual
+  [ -f "$alive" ] || return 0
+  actual="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("generation",""))' "$alive" 2>/dev/null || true)"
+  [ "$actual" = "$generation" ] || return 0
+  observed="$(cat "$alive" 2>/dev/null || true)"
+  [ -n "$observed" ] && [ "$(cat "$alive" 2>/dev/null || true)" = "$observed" ] \
+    && rm -f "$alive" 2>/dev/null || true
+}
+
+sp_ticker_alive_remove_snapshot() {
+  local who="$1" alive="$PAD_STATE/alive.$1" observed
+  [ -f "$alive" ] || return 0
+  observed="$(cat "$alive" 2>/dev/null || true)"
+  [ -n "$observed" ] && [ "$(cat "$alive" 2>/dev/null || true)" = "$observed" ] \
+    && rm -f "$alive" 2>/dev/null || true
+}
+
+sp_ticker_stop_owned() {
+  local who="$1" lockd="$PAD_STATE/heartbeat.$1.lock" generation pid started command launcher_pid launcher_start launcher_command i=0 legacy_pid
+  if [ ! -d "$lockd" ]; then
+    sp_ticker_alive_remove_snapshot "$who"
+    return 0
+  fi
+  generation="$(cat "$lockd/generation" 2>/dev/null || true)"
+  if [ -z "$generation" ] || ! sp_ticker_manifest_is_valid "$lockd/launcher" "$generation" "$who"; then
+    # Legacy/unknown state is removable only when its bare PID is not live.
+    # A live numeric PID without a valid exact manifest is never signal authority.
+    legacy_pid="$(cat "$lockd/pid" 2>/dev/null || true)"
+    if [ -n "$legacy_pid" ] && kill -0 "$legacy_pid" 2>/dev/null; then
+      echo "stitchpad: heartbeat @$who has live but unverified pid $legacy_pid; refusing to signal or remove its state" >&2
+      return 1
+    fi
+    # Only the exact legacy pid-only shape is understood. Malformed manifests
+    # and unknown files are preserved byte-for-byte for operator repair.
+    if [ -n "$(find "$lockd" -mindepth 1 -maxdepth 1 ! -name pid -print -quit 2>/dev/null)" ]; then
+      echo "stitchpad: malformed heartbeat @$who lock left untouched" >&2
+      return 1
+    fi
+    rm -f "$lockd/pid" 2>/dev/null || true
+    rmdir "$lockd" 2>/dev/null || return 1
+    return 0
+  fi
+  if [ -f "$lockd/owner" ]; then
+    if ! sp_ticker_manifest_is_valid "$lockd/owner" "$generation" "$who"; then
+      echo "stitchpad: malformed heartbeat @$who owner left untouched" >&2
+      return 1
+    fi
+    pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$lockd/owner" 2>/dev/null || true)"
+    started="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["processStart"])' "$lockd/owner" 2>/dev/null || true)"
+    command="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["command"])' "$lockd/owner" 2>/dev/null || true)"
+  else
+    pid=""; started=""; command=""
+  fi
+  launcher_pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$lockd/launcher" 2>/dev/null || true)"
+  launcher_start="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["processStart"])' "$lockd/launcher" 2>/dev/null || true)"
+  launcher_command="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["command"])' "$lockd/launcher" 2>/dev/null || true)"
+  # Keep the canonical name occupied while cancellation drains publishers. This
+  # prevents an old check-then-link/write from landing in a successor's lock.
+  sp_ticker_cancel_generation "$lockd" "$generation" || return 1
+  if [ -n "${STITCHPAD_HEARTBEAT_TEST_STOP_AFTER_CANCEL_BARRIER:-}" ]; then
+    local stop_barrier="$STITCHPAD_HEARTBEAT_TEST_STOP_AFTER_CANCEL_BARRIER"
+    printf '%s' ready > "$stop_barrier.ready"
+    while [ ! -f "$stop_barrier.release" ]; do sleep 0.01; done
+  fi
+  if [ -n "$pid" ] && sp_process_identity_matches "$pid" "$started" "$command"; then
+    kill "$pid" 2>/dev/null || true
+  fi
+  while [ "$i" -lt 20 ]; do
+    # A child may publish owner just after cancellation was recorded. It cannot
+    # write a heartbeat, and once visible it is stopped using exact identity.
+    if [ -f "$lockd/owner" ] && sp_ticker_manifest_is_valid "$lockd/owner" "$generation" "$who"; then
+      pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$lockd/owner" 2>/dev/null || true)"
+      started="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["processStart"])' "$lockd/owner" 2>/dev/null || true)"
+      command="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["command"])' "$lockd/owner" 2>/dev/null || true)"
+      sp_process_identity_matches "$pid" "$started" "$command" && kill "$pid" 2>/dev/null || true
+    fi
+    if ! sp_process_identity_matches "$pid" "$started" "$command" \
+      && ! sp_process_identity_matches "$launcher_pid" "$launcher_start" "$launcher_command"; then
+      break
+    fi
+    sleep 0.1; i=$((i + 1))
+  done
+  sp_process_identity_matches "$pid" "$started" "$command" && kill -KILL "$pid" 2>/dev/null || true
+  if sp_process_identity_matches "$launcher_pid" "$launcher_start" "$launcher_command"; then
+    echo "stitchpad: heartbeat @$who launcher did not observe cancellation; state preserved" >&2
+    return 1
+  fi
+  sp_ticker_alive_remove_generation "$who" "$generation"
+  # A child's exact cleanup may already have removed the generation.
+  [ ! -d "$lockd" ] || sp_ticker_generation_cleanup "$lockd" "$generation"
+}
 
 # ── Atomic pad mutation lock ─────────────────────────────────────────
 # Multiple agents may say/join the same pad concurrently. stitchpad.md is mutated
@@ -185,32 +675,297 @@ sp_dnd_is_on() { [ -f "$(sp_dnd_file "$1")" ]; }
 # stale lock so a crashed writer can't wedge the pad forever.
 SP_LOCK_TIMEOUT="${SP_LOCK_TIMEOUT:-5}"   # seconds to wait for the lock
 SP_LOCK_STALE="${SP_LOCK_STALE:-30}"      # seconds before a held lock is "stale"
+SP_LOCK_EMPTY_RECLAIM="${SP_LOCK_EMPTY_RECLAIM:-1}"  # seconds before an empty (ownerless) lock is reclaimed
 _SP_LOCK_DIR=""
+_SP_LOCK_GENERATION=""
+_SP_LOCK_PID=""
+_SP_LOCK_SUBSHELL=""
+
+sp_lock_owner_write() {
+  local lock="$1" generation="$2" pid="$3" started command tmp
+  started="$(sp_process_start "$pid")"
+  command="$(sp_process_command "$pid")"
+  [ -n "$started" ] && [ -n "$command" ] || return 1
+  # Build outside the canonical lock directory. A SIGKILL during publication
+  # can leave only an empty reclaimable lock, never a non-empty ownerless wedge.
+  tmp="$PAD_STATE/.lock-owner.$$.$RANDOM"
+  python3 - "$generation" "$pid" "$started" "$command" > "$tmp" <<'PY'
+import json, sys
+generation, pid, started, command = sys.argv[1:]
+print(json.dumps({
+    "generation": generation,
+    "pid": int(pid),
+    "processStart": started,
+    "command": command,
+}, separators=(",", ":")))
+PY
+  [ -s "$tmp" ] && mv "$tmp" "$lock/owner" || {
+    rm -f "$tmp" 2>/dev/null || true
+    return 1
+  }
+}
+
+sp_lock_owner_matches() {
+  local lock="$1" generation="$2" pid="$3" started command
+  [ -f "$lock/owner" ] || return 1
+  started="$(sp_process_start "$pid")"
+  command="$(sp_process_command "$pid")"
+  [ -n "$started" ] && [ -n "$command" ] || return 1
+  python3 - "$lock/owner" "$generation" "$pid" "$started" "$command" <<'PY'
+import json, sys
+path, generation, pid, started, command = sys.argv[1:]
+try:
+    with open(path, encoding="utf-8") as handle:
+        owner = json.load(handle)
+except Exception:
+    raise SystemExit(1)
+expected = {
+    "generation": generation,
+    "pid": int(pid),
+    "processStart": started,
+    "command": command,
+}
+raise SystemExit(0 if owner == expected else 1)
+PY
+}
+
+sp_lock_owner_is_live() {
+  local lock="$1" pid started command expected_start expected_command
+  [ -f "$lock/owner" ] || return 1
+  pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("pid",""))' "$lock/owner" 2>/dev/null || true)"
+  expected_start="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("processStart",""))' "$lock/owner" 2>/dev/null || true)"
+  expected_command="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("command",""))' "$lock/owner" 2>/dev/null || true)"
+  case "$pid" in ''|*[!0-9]*) return 1;; esac
+  kill -0 "$pid" 2>/dev/null || return 1
+  started="$(sp_process_start "$pid")"
+  command="$(sp_process_command "$pid")"
+  [ -n "$expected_start" ] && [ -n "$expected_command" ] \
+    && [ "$started" = "$expected_start" ] && [ "$command" = "$expected_command" ]
+}
+
+sp_lock_owner_is_valid() {
+  local lock="$1"
+  [ -f "$lock/owner" ] || return 1
+  python3 - "$lock/owner" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        owner = json.load(handle)
+    assert set(owner) == {"generation", "pid", "processStart", "command"}
+    assert isinstance(owner["pid"], int) and owner["pid"] > 0
+    assert all(isinstance(owner[k], str) and owner[k]
+               for k in ("generation", "processStart", "command"))
+except Exception:
+    raise SystemExit(1)
+PY
+}
+
+# Every mutation lock protects the two canonical content paths.  Recovery
+# already refuses symlinked targets, but append-only writers do not pass through
+# recovery when no .ready generation exists.  Validate with lstat before any
+# locked recovery, create, rewrite, or append so neither an existing symlink nor
+# a broken tasks.md symlink can redirect a write outside the pad.
+sp_mutation_targets_are_safe() {
+  [ -n "${PAD_MD:-}" ] && [ -n "${PAD_TASKS:-}" ] || return 1
+  python3 - "$PAD_MD" "$PAD_TASKS" <<'PY'
+import os, stat, sys
+pad, tasks = sys.argv[1:]
+try:
+    if os.path.lexists(pad) and not stat.S_ISREG(os.lstat(pad).st_mode):
+        raise ValueError("pad is not a regular file")
+    if os.path.lexists(tasks) and not stat.S_ISREG(os.lstat(tasks).st_mode):
+        raise ValueError("tasks is not a regular file")
+except Exception:
+    raise SystemExit(1)
+PY
+}
+
+# Roster handle length cap, enforced at every PRODUCER (join, rename, spawn).
+# 64 is well inside the 255-byte single-component filesystem limit once the
+# longest state prefix is added ("delivered_no_reply.<name>", "scope-violation.<name>"),
+# and no real handle needs more. Refusing here is what stops the downstream
+# workarounds: E-17 had to hash the identity to keep the read cursor writable
+# precisely because an unbounded handle was allowed in at join time.
+SP_NAME_MAX="${SP_NAME_MAX:-64}"
+sp_assert_name_length() {
+  local n="$1"
+  [ "${#n}" -le "$SP_NAME_MAX" ] && return 0
+  echo "stitchpad: name too long (${#n} chars, max $SP_NAME_MAX) — per-agent state files are '<prefix>.<name>' and a filesystem caps one path component at 255 bytes" >&2
+  return 1
+}
+
+# Is somebody mid-publication inside this lock right now?
+# The claim marker is written with a builtin redirect the instant mkdir wins, so
+# a lock is "ownerless but claimed" only while its winner is still spawning the
+# processes sp_lock_owner_write needs. Read with `read <`, not `cat`, so probing
+# stays fork-free too.
+sp_lock_claimer_is_live() {
+  local claim=""
+  [ -f "$1/claiming" ] || return 1
+  # NO `|| return 1` on the read. `read` returns NON-ZERO when it hits EOF
+  # without a delimiter — which is exactly what happens on a file written by a
+  # bare `printf '%s'` — while still having assigned the variable. Treating that
+  # status as failure made this function answer "not live" every single time, so
+  # the guard was present, passed review, and protected nothing. The marker is
+  # now written with a trailing newline as well; both halves are belt and braces
+  # because a lock guard that silently never fires is the worst kind.
+  read -r claim < "$1/claiming" 2>/dev/null
+  case "$claim" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$claim" 2>/dev/null
+}
 
 sp_lock() {
-  local lock="$PAD_STATE/.lock" waited=0
+  local lock="$PAD_STATE/.lock" age now mtime observed pid_capture _jitter
+  local _start _elapsed
+  _start=$(date +%s)
   while ! mkdir "$lock" 2>/dev/null; do
-    # Break a stale lock (holder died without releasing).
+    # Break a stale lock when its exact recorded owner is no longer live.
+    # A long-running but live writer is never evicted merely because the lock's
+    # directory mtime is old.
     if [ -d "$lock" ]; then
-      local age now mtime
       now=$(date +%s)
       mtime=$(stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || echo "$now")
       age=$(( now - mtime ))
-      if [ "$age" -ge "$SP_LOCK_STALE" ]; then rmdir "$lock" 2>/dev/null || true; continue; fi
+      # F2: proactive dead-holder reclaim. Before waiting out SP_LOCK_STALE,
+      # check if the owner manifest is valid AND the owner PID is provably
+      # dead (kill -0 fails or processStart/command mismatch). A SIGKILL'd
+      # holder is dead immediately — there's no reason to wait 30s for the
+      # stale window. This runs on EVERY loop iteration (every ~0.05s).
+      # Falls through to the age-based check below for empty/unknown locks.
+      if [ -f "$lock/owner" ] && sp_lock_owner_is_valid "$lock"; then
+        if ! sp_lock_owner_is_live "$lock"; then
+          observed="$(cat "$lock/owner" 2>/dev/null || true)"
+          [ -n "$observed" ] && [ "$(cat "$lock/owner" 2>/dev/null || true)" = "$observed" ] \
+            && rm -f "$lock/owner" 2>/dev/null || true
+          rmdir "$lock" 2>/dev/null || true
+          [ -d "$lock" ] || continue
+        fi
+      elif [ ! -f "$lock/owner" ] && [ "$age" -ge "$SP_LOCK_EMPTY_RECLAIM" ]; then
+        # E1: empty (ownerless) lock reclaim. The premise WAS "the owner file is
+        # written within ~ms of mkdir, so a still-empty lock means the creator
+        # was SIGKILLed in the mkdir→owner-write window". That premise was false.
+        # sp_lock_owner_write cannot publish until it has spawned /bin/sh (for
+        # PPID), ps twice, and a python3 interpreter — comfortably longer than
+        # SP_LOCK_EMPTY_RECLAIM (1s) on a loaded machine. So this branch was
+        # stealing the lock from writers that were alive and mid-publication:
+        # two writers then believed they held the same critical section, the
+        # robbed one failed with "could not publish pad-lock ownership", and its
+        # journal rollback could rewind work the thief had already committed.
+        # Reproduced deterministically via STITCHPAD_LOCK_TEST_BEFORE_OWNER_BARRIER.
+        # Only ever reclaim from a claimant that is provably GONE.
+        if ! sp_lock_claimer_is_live "$lock"; then
+          rm -f "$lock/claiming" 2>/dev/null || true
+          rmdir "$lock" 2>/dev/null || true
+          [ -d "$lock" ] || continue
+        fi
+      elif [ "$age" -ge "$SP_LOCK_STALE" ]; then
+        # Fallback: age-based stale-break for pre-generation or empty locks.
+        # Non-empty unknown locks fail closed because their contents are not
+        # ownership proof.
+        # DELIBERATELY NOT liveness-gated, unlike E1 above. The claim marker
+        # holds a pid, and pids get REUSED — if an unrelated process inherits
+        # the number, `kill -0` says "live" forever and a liveness-only rule
+        # would wedge the pad permanently with no way out. Publishing ownership
+        # takes well under a second; a lock still unowned after SP_LOCK_STALE
+        # (30s) is not a slow writer under any plausible load, so age remains
+        # the ultimate escape hatch. E1 fixes the 1-second steal; this bounds
+        # the blast radius of the fix.
+        rm -f "$lock/claiming" 2>/dev/null || true
+        rmdir "$lock" 2>/dev/null || true
+        [ -d "$lock" ] || continue
+      fi
     fi
-    waited=$(( waited + 1 ))
-    [ "$waited" -ge $(( SP_LOCK_TIMEOUT * 10 )) ] && { echo "stitchpad: pad busy (lock timeout)" >&2; return 1; }
-    sleep 0.1
+    # F1: track elapsed wall-clock time (not iteration count) since jitter
+    # makes each iteration variable-length.
+    now=$(date +%s)
+    _elapsed=$(( now - _start ))
+    [ "$_elapsed" -ge "$SP_LOCK_TIMEOUT" ] && { echo "stitchpad: pad busy (lock timeout)" >&2; return 1; }
+    # F1: jittered backoff instead of fixed 0.1s. Under N>=10 concurrent
+    # writers, a fixed sleep causes thundering-herd: all losers retry on the
+    # same tick and the winner is one mkdir among N. Jitter spreads the
+    # retries across the interval, increasing the effective admission rate.
+    _jitter=$(( (RANDOM % 10) + 1 ))   # 1-10 centiseconds (0.01-0.10s)
+    sleep 0.${_jitter}
   done
+  # CLAIM THE LOCK IMMEDIATELY — builtin redirect, ZERO forks, so this runs in
+  # microseconds. Everything below (the /bin/sh PPID capture, then ps/ps/python3
+  # inside sp_lock_owner_write) takes orders of magnitude longer, and until it
+  # finishes the lock has no `owner` file. That gap is what E1 above used to
+  # reclaim out from under a live writer. Nothing between mkdir and this line
+  # may fork, or the gap reopens.
+  printf '%s\n' "$$" > "$lock/claiming" 2>/dev/null || true
   _SP_LOCK_DIR="$lock"
-  # Release on any exit so a killed writer doesn't wedge the pad.
-  trap 'sp_unlock' EXIT INT TERM
+  # `$$` does not change in a Bash 3.2 subshell. Ask a direct child for its
+  # parent PID so the lock records the shell that actually owns this execution
+  # context, not an ancestor whose EXIT trap may be inherited.
+  if [ -n "${STITCHPAD_LOCK_TEST_BEFORE_OWNER_BARRIER:-}" ]; then
+    local barrier="$STITCHPAD_LOCK_TEST_BEFORE_OWNER_BARRIER" barrier_i=0
+    printf '%s' ready > "$barrier.ready"
+    while [ ! -f "$barrier.release" ] && [ "$barrier_i" -lt 500 ]; do
+      sleep 0.01; barrier_i=$((barrier_i + 1))
+    done
+    [ -f "$barrier.release" ] || return 1
+  fi
+  pid_capture="$PAD_STATE/.pid-capture.$$.$RANDOM"
+  /bin/sh -c 'printf "%s" "$PPID"' > "$pid_capture" || true
+  _SP_LOCK_PID="$(cat "$pid_capture" 2>/dev/null || true)"
+  rm -f "$pid_capture" 2>/dev/null || true
+  case "$_SP_LOCK_PID" in ''|*[!0-9]*)
+    rmdir "$lock" 2>/dev/null || true
+    _SP_LOCK_DIR=""; _SP_LOCK_PID=""
+    echo "stitchpad: could not resolve pad-lock owner pid" >&2
+    return 1
+    ;;
+  esac
+  _SP_LOCK_SUBSHELL="${BASH_SUBSHELL:-0}"
+  _SP_LOCK_GENERATION="$(date +%s).${_SP_LOCK_PID}.${RANDOM:-0}"
+  if ! sp_lock_owner_write "$lock" "$_SP_LOCK_GENERATION" "$_SP_LOCK_PID"; then
+    rm -f "$lock/claiming" 2>/dev/null || true
+    rmdir "$lock" 2>/dev/null || true
+    _SP_LOCK_DIR=""; _SP_LOCK_GENERATION=""; _SP_LOCK_PID=""; _SP_LOCK_SUBSHELL=""
+    echo "stitchpad: could not publish pad-lock ownership" >&2
+    return 1
+  fi
+  # Ownership is published; the claim marker has done its job. Removing it keeps
+  # the lock directory to exactly the one file every other path expects, so a
+  # later rmdir cannot fail on unexpected contents.
+  rm -f "$lock/claiming" 2>/dev/null || true
+  # Signals exit first; the EXIT trap then releases only this exact generation.
+  # An INT/TERM handler that merely unlocked and returned could let mutation
+  # continue after forfeiting ownership.
+  trap 'sp_unlock' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  if ! sp_mutation_targets_are_safe; then
+    echo "stitchpad: refusing non-regular or symlinked mutation target" >&2
+    sp_unlock
+    return 1
+  fi
+  # Reconcile only after acquiring the same generation-owned mutation lock
+  # used by writers. A passive sp_init_paths call can never consume .ready.
+  if ! sp_recover_inplace "$PAD_MD" || ! sp_recover_inplace "$PAD_TASKS"; then
+    sp_unlock
+    return 1
+  fi
+  sp_reap_applied_generations "$PAD_MD"
+  sp_reap_applied_generations "$PAD_TASKS"
   return 0
 }
 
 sp_unlock() {
-  [ -n "$_SP_LOCK_DIR" ] && rmdir "$_SP_LOCK_DIR" 2>/dev/null || true
-  _SP_LOCK_DIR=""
+  # An EXIT trap inherited by command substitution must not release its
+  # parent's live lock. Bash 3.2 exposes the nesting level via BASH_SUBSHELL.
+  if [ "${BASH_SUBSHELL:-0}" = "${_SP_LOCK_SUBSHELL:-}" ] \
+    && [ -n "$_SP_LOCK_DIR" ] && [ -n "$_SP_LOCK_GENERATION" ] && [ -n "$_SP_LOCK_PID" ] \
+    && sp_lock_owner_matches "$_SP_LOCK_DIR" "$_SP_LOCK_GENERATION" "$_SP_LOCK_PID"; then
+    rm -f "$_SP_LOCK_DIR/owner" 2>/dev/null || true
+    # Defensive: a claim marker should already be gone by the time ownership was
+    # published, but an rmdir that fails on leftover contents wedges the pad for
+    # every future writer, so never let one survive our own release.
+    rm -f "$_SP_LOCK_DIR/claiming" 2>/dev/null || true
+    rmdir "$_SP_LOCK_DIR" 2>/dev/null || true
+  fi
+  _SP_LOCK_DIR=""; _SP_LOCK_GENERATION=""; _SP_LOCK_PID=""; _SP_LOCK_SUBSHELL=""
 }
 
 # ── Inode-stable rewrites ────────────────────────────────────────────
@@ -232,21 +987,134 @@ sp_unlock() {
 #   sp_stage <target>            → path to a staging file next to <target>
 #   sp_write_inplace <staged> <target>
 #       0 = written · 2 = identical, nothing written · 1 = failed, target intact
-#   sp_recover_inplace <target>  → replay an interrupted write
+#   sp_recover_inplace <target>  → replay an interrupted, proven generation
 #
 # Crash-safety is preserved WITHOUT a rename over the pad. The staged file is a
-# complete copy on disk; it is promoted to "<target>.ready" (a rename between
-# two TEMP files — the pad is never the destination) and only then copied over
-# the target. If the process dies mid-copy, "<target>.ready" survives with the
-# full intended content and sp_recover_inplace() replays it on the next command.
-# A half-written staging file is never promoted, so it can never be replayed.
+# complete copy on disk; a generation directory containing the content plus an
+# exact owner/checksum manifest is promoted to "<target>.ready" (the pad is never
+# the rename destination) and only then copied over the target. If the process
+# dies mid-copy, the proven generation survives and the next mutation recovers
+# it while holding the same pad lock. A passive command never performs recovery.
 sp_stage() {
   local target="${1:-$PAD_MD}"
   mktemp "$(dirname "$target")/.sp-stage.XXXXXX"
 }
 
+sp_ready_generation_validate() {
+  local ready="$1" target="$2" expected="${3:-}"
+  [ -d "$ready" ] || return 1
+  python3 - "$ready" "$target" "$expected" <<'PY'
+import hashlib, json, os, re, stat, sys
+ready, target, expected = sys.argv[1:]
+try:
+    if not stat.S_ISDIR(os.lstat(ready).st_mode):
+        raise ValueError("generation path is not a real directory")
+    if os.path.islink(target):
+        raise ValueError("target is a symlink")
+    if set(os.listdir(ready)) != {"content", "owner"}:
+        raise ValueError("unexpected generation contents")
+    owner_path = os.path.join(ready, "owner")
+    content = os.path.join(ready, "content")
+    if not stat.S_ISREG(os.lstat(owner_path).st_mode) or not stat.S_ISREG(os.lstat(content).st_mode):
+        raise ValueError("generation files are not regular files")
+    with open(owner_path, encoding="utf-8") as handle:
+        owner = json.load(handle)
+    if set(owner) != {"generation", "pid", "processStart", "command", "target", "size", "sha256"}:
+        raise ValueError("unexpected manifest schema")
+    if owner["target"] != target or not isinstance(owner["pid"], int):
+        raise ValueError("wrong target or pid")
+    if not all(isinstance(owner[k], str) and owner[k] for k in ("generation", "processStart", "command", "sha256")):
+        raise ValueError("incomplete manifest")
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", owner["generation"]):
+        raise ValueError("unsafe generation")
+    if expected and owner["generation"] != expected:
+        raise ValueError("wrong generation")
+    stat = os.stat(content)
+    if stat.st_size != owner["size"]:
+        raise ValueError("wrong size")
+    digest = hashlib.sha256()
+    with open(content, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    if digest.hexdigest() != owner["sha256"]:
+        raise ValueError("wrong digest")
+except Exception:
+    raise SystemExit(1)
+print(owner["generation"])
+PY
+}
+
+sp_ready_owner_is_live() {
+  local ready="$1" pid expected_start expected_command started command
+  pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("pid",""))' "$ready/owner" 2>/dev/null || true)"
+  expected_start="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("processStart",""))' "$ready/owner" 2>/dev/null || true)"
+  expected_command="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("command",""))' "$ready/owner" 2>/dev/null || true)"
+  case "$pid" in ''|*[!0-9]*) return 1;; esac
+  kill -0 "$pid" 2>/dev/null || return 1
+  started="$(sp_process_start "$pid")"
+  command="$(sp_process_command "$pid")"
+  [ -n "$expected_start" ] && [ -n "$expected_command" ] \
+    && [ "$started" = "$expected_start" ] && [ "$command" = "$expected_command" ]
+}
+
+sp_reap_applied_generations() {
+  local target="$1" applied generation
+  for applied in "$target.ready.applied."*; do
+    [ -d "$applied" ] || continue
+    generation="$(sp_ready_generation_validate "$applied" "$target" 2>/dev/null || true)"
+    [ -n "$generation" ] || continue
+    rm -f "$applied/content" "$applied/owner" 2>/dev/null || true
+    rmdir "$applied" 2>/dev/null || true
+  done
+}
+
+sp_apply_ready_generation() {
+  local ready="$1" target="$2" generation="$3" content="$1/content" newsize oldsize applied
+  sp_ready_generation_validate "$ready" "$target" "$generation" >/dev/null || return 1
+  newsize="$(wc -c < "$content" | tr -d ' ')"
+  oldsize="$(wc -c < "$target" 2>/dev/null | tr -d ' ')"; oldsize="${oldsize:-0}"
+  if dd if="$content" of="$target" conv=notrunc bs=65536 2>/dev/null; then
+    if [ "$newsize" -lt "$oldsize" ]; then
+      perl -e 'truncate($ARGV[0], $ARGV[1]) or exit 1' "$target" "$newsize" 2>/dev/null \
+        || return 1
+    fi
+    # Retire the canonical generation atomically before cleanup. A crash before
+    # rename leaves a valid replayable generation; a crash after rename leaves
+    # only non-blocking applied-generation litter, never malformed `.ready`.
+    sp_ready_generation_validate "$ready" "$target" "$generation" >/dev/null || return 1
+    applied="$ready.applied.$generation"
+    [ ! -e "$applied" ] || return 1
+    mv "$ready" "$applied" 2>/dev/null || return 1
+    if [ -n "${STITCHPAD_WRITE_TEST_AFTER_RETIRE_BARRIER:-}" ]; then
+      local retire_barrier="$STITCHPAD_WRITE_TEST_AFTER_RETIRE_BARRIER" retire_i=0
+      printf '%s' ready > "$retire_barrier.ready"
+      while [ ! -f "$retire_barrier.release" ] && [ "$retire_i" -lt 500 ]; do
+        sleep 0.01; retire_i=$((retire_i + 1))
+      done
+      [ -f "$retire_barrier.release" ] || return 1
+    fi
+    rm -f "$applied/content" "$applied/owner" 2>/dev/null || return 1
+    rmdir "$applied" 2>/dev/null || return 1
+    return 0
+  fi
+  return 1
+}
+
 sp_write_inplace() {
-  local staged="$1" target="$2" ready="$2.ready"
+  local staged="$1" target="$2" ready="$2.ready" generation_dir generation owner_tmp
+  if [ "${_SP_LOCK_DIR:-}" != "$PAD_STATE/.lock" ] \
+    || [ -z "${_SP_LOCK_GENERATION:-}" ] \
+    || [ -z "${_SP_LOCK_PID:-}" ] \
+    || ! sp_lock_owner_matches "$_SP_LOCK_DIR" "$_SP_LOCK_GENERATION" "$_SP_LOCK_PID"; then
+    echo "stitchpad: refusing unlocked in-place write of $(basename "$target")" >&2
+    rm -f "$staged" 2>/dev/null || true
+    return 1
+  fi
+  if [ -L "$target" ] || [ -L "$ready" ]; then
+    echo "stitchpad: refusing symlinked in-place write path for $(basename "$target")" >&2
+    rm -f "$staged" 2>/dev/null || true
+    return 1
+  fi
   # Never let a broken awk/sed pipeline truncate a live pad to nothing.
   if [ ! -s "$staged" ]; then
     echo "stitchpad: refusing to write an empty $(basename "$target") — staged write produced no content" >&2
@@ -259,49 +1127,300 @@ sp_write_inplace() {
     rm -f "$staged" 2>/dev/null
     return 2
   fi
-  mv -f "$staged" "$ready" 2>/dev/null || { rm -f "$staged" 2>/dev/null; return 1; }
-  local newsize oldsize
-  newsize="$(wc -c < "$ready" | tr -d ' ')"
-  oldsize="$(wc -c < "$target" 2>/dev/null | tr -d ' ')"; oldsize="${oldsize:-0}"
-  # THE fix: same inode, and no truncation — so no watcher rewinds.
-  if dd if="$ready" of="$target" conv=notrunc bs=65536 2>/dev/null; then
-    if [ "$newsize" -lt "$oldsize" ]; then
-      # genuinely shorter (clear/compact/archive): drop the stale tail bytes.
-      # The cat fallback MUST be guarded: if .ready is gone (a concurrent
-      # recovery consumed it), `cat missing > target` would truncate the pad
-      # to nothing before failing. Stale tail bytes beat a blanked pad.
-      perl -e 'truncate($ARGV[0], $ARGV[1]) or exit 1' "$target" "$newsize" 2>/dev/null \
-        || { [ -s "$ready" ] && cat "$ready" > "$target"; }
+  [ ! -e "$ready" ] || {
+    echo "stitchpad: unresolved write generation already exists for $(basename "$target")" >&2
+    rm -f "$staged" 2>/dev/null || true
+    return 1
+  }
+  generation_dir="$(mktemp -d "$(dirname "$target")/.sp-ready.$(basename "$target").XXXXXX")" || return 1
+  generation="$(basename "$generation_dir").$(date +%s).${_SP_LOCK_PID}.${RANDOM:-0}"
+  mv "$staged" "$generation_dir/content" 2>/dev/null || {
+    rmdir "$generation_dir" 2>/dev/null || true
+    return 1
+  }
+  owner_tmp="$generation_dir/.owner"
+  python3 - "$generation_dir/content" "$owner_tmp" "$generation" "$_SP_LOCK_PID" \
+    "$(sp_process_start "$_SP_LOCK_PID")" "$(sp_process_command "$_SP_LOCK_PID")" "$target" <<'PY' || {
+import hashlib, json, os, sys
+content, output, generation, pid, started, command, target = sys.argv[1:]
+digest = hashlib.sha256()
+with open(content, "rb") as handle:
+    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        digest.update(chunk)
+with open(output, "w", encoding="utf-8") as handle:
+    json.dump({
+        "generation": generation,
+        "pid": int(pid),
+        "processStart": started,
+        "command": command,
+        "target": target,
+        "size": os.stat(content).st_size,
+        "sha256": digest.hexdigest(),
+    }, handle, separators=(",", ":"))
+PY
+    rm -f "$generation_dir/content" "$owner_tmp" 2>/dev/null || true
+    rmdir "$generation_dir" 2>/dev/null || true
+    return 1
+  }
+  if ! mv "$owner_tmp" "$generation_dir/owner"; then
+    rm -f "$generation_dir/content" "$owner_tmp" 2>/dev/null || true
+    rmdir "$generation_dir" 2>/dev/null || true
+    return 1
+  fi
+  mv -n "$generation_dir" "$ready" 2>/dev/null || true
+  if [ -d "$generation_dir" ] \
+    || ! sp_ready_generation_validate "$ready" "$target" "$generation" >/dev/null; then
+    rm -f "$generation_dir/content" "$generation_dir/owner" 2>/dev/null || true
+    rmdir "$generation_dir" 2>/dev/null || true
+    echo "stitchpad: could not promote owned write generation for $(basename "$target")" >&2
+    return 1
+  fi
+  if [ -n "${STITCHPAD_WRITE_TEST_AFTER_PROMOTION_BARRIER:-}" ]; then
+    local barrier="$STITCHPAD_WRITE_TEST_AFTER_PROMOTION_BARRIER" i=0
+    printf '%s' ready > "$barrier.ready"
+    while [ ! -f "$barrier.release" ] && [ "$i" -lt 500 ]; do sleep 0.01; i=$((i+1)); done
+    [ -f "$barrier.release" ] || {
+      echo "stitchpad: write test barrier timed out" >&2
+      return 1
+    }
+  fi
+  if sp_apply_ready_generation "$ready" "$target" "$generation"; then return 0; fi
+  echo "stitchpad: in-place write of $(basename "$target") failed — proven content preserved in $ready" >&2
+  return 1
+}
+
+# ── Roster recovery guard ──────────────────────────────────────────────
+# TASK-9 / F9-1: a .ready generation must not bypass the roster guard. A
+# recovery replay that would drop the roster fence or empty a populated
+# roster is quarantined instead.  Member-dropping (killed-leave recovery)
+# IS allowed through — the guard protects the roster as a structure, not
+# per-member cardinality.
+sp_roster_members_count() {
+  local content="$1"
+  awk '
+    /^```roster/ { inblk=1; next }
+    /^```/ && inblk { inblk=0 }
+    inblk && $0 !~ /^[[:space:]]*#/ && $0 !~ /^[[:space:]]*$/ {
+      n=split($0, f, /[[:space:]]*\|[[:space:]]*/)
+      if (n>=2) { c++ }
+    }
+    END { print c+0 }
+  ' "$content"
+}
+
+sp_roster_has_fence() {
+  grep -q '^```roster[[:space:]]*$' "$1" 2>/dev/null
+}
+
+# Returns 0 if the transition from live → proposed is safe for the roster.
+# Refuses (returns 1) when:
+#  - Live has a roster fence but proposed does not
+#  - Live roster is populated (>0 members) but proposed has 0
+# Member-dropping (live N > proposed M > 0) is ALLOWED.
+sp_roster_transition_guard() {
+  local proposed="$1" live="${2:-$PAD_MD}"
+  [ -f "$proposed" ] || return 0
+  local live_count proposed_count live_fence proposed_fence
+  live_count="$(sp_roster_members_count "$live")"
+  proposed_count="$(sp_roster_members_count "$proposed")"
+  # Populated→EMPTY: refuse
+  if [ "$live_count" -gt 0 ] && [ "$proposed_count" -eq 0 ]; then
+    echo "stitchpad: rewrite would replace $live_count members with an EMPTY roster — refused" >&2
+    return 1
+  fi
+  # Fence-dropping: refuse when live has members (a pad with members must keep its fence)
+  if [ "$live_count" -gt 0 ]; then
+    if sp_roster_has_fence "$live" && ! sp_roster_has_fence "$proposed"; then
+      echo "stitchpad: rewrite would drop the roster fence while $live_count members are present — refused" >&2
+      return 1
     fi
-    rm -f "$ready" 2>/dev/null
+  fi
+  return 0
+}
+
+sp_roster_quarantine() {
+  local ready="$1" generation="$2" quarantine
+  quarantine="${ready}.refused.${generation}"
+  mv "$ready" "$quarantine" 2>/dev/null || return 1
+  echo "stitchpad: roster guard refused generation $generation — quarantined at $(basename "$quarantine")" >&2
+  return 0
+}
+
+# Check for case-insensitive name duplicates in the roster. Returns the
+# duplicate name on stdout if found, empty string otherwise.
+sp_roster_case_duplicate() {
+  local who="$1"
+  local count
+  count="$(sp_roster | awk -F'|' -v w="$who" 'tolower($1)==tolower(w){c++} END{print c+0}')"
+  if [ "$count" -gt 1 ]; then
+    echo "$who"
     return 0
   fi
-  echo "stitchpad: in-place write of $(basename "$target") failed — content preserved in $ready" >&2
   return 1
 }
 
 sp_recover_inplace() {
-  local target="${1:-$PAD_MD}" ready now mt
+  local target="${1:-$PAD_MD}" ready generation
   [ -n "$target" ] || return 0
   ready="$target.ready"
-  [ -s "$ready" ] || { rm -f "$ready" 2>/dev/null; return 0; }
-  # A LIVE writer's .ready exists only for the instant between promotion and
-  # copy — recovery runs in sp_init_paths, OUTSIDE the lock, so replaying (and
-  # deleting) a fresh .ready would race the writer that owns it. Only a .ready
-  # that has sat around (its writer is genuinely dead) is recovered.
-  now="$(date +%s)"
-  mt="$(stat -f %m "$ready" 2>/dev/null || stat -c %Y "$ready" 2>/dev/null || echo 0)"
-  [ $(( now - mt )) -lt 5 ] && return 0
+  [ -e "$ready" ] || return 0
+  if [ "${_SP_LOCK_DIR:-}" != "$PAD_STATE/.lock" ] \
+    || [ -z "${_SP_LOCK_GENERATION:-}" ] \
+    || [ -z "${_SP_LOCK_PID:-}" ] \
+    || ! sp_lock_owner_matches "$_SP_LOCK_DIR" "$_SP_LOCK_GENERATION" "$_SP_LOCK_PID"; then
+    echo "stitchpad: refusing unlocked recovery of $(basename "$target")" >&2
+    return 1
+  fi
+  if [ ! -d "$ready" ]; then
+    echo "stitchpad: unowned legacy recovery file for $(basename "$target") left untouched" >&2
+    return 1
+  fi
+  generation="$(sp_ready_generation_validate "$ready" "$target" 2>/dev/null || true)"
+  [ -n "$generation" ] || {
+    echo "stitchpad: malformed recovery generation for $(basename "$target") left untouched" >&2
+    return 1
+  }
+  if sp_ready_owner_is_live "$ready"; then
+    echo "stitchpad: live writer still owns recovery generation for $(basename "$target")" >&2
+    return 1
+  fi
+  # TASK-9: roster guard before recovery. If the generation would destroy
+  # the roster, quarantine it instead of applying it.
+  if ! sp_roster_transition_guard "$ready/content" "$target"; then
+    sp_roster_quarantine "$ready" "$generation"
+    return 1
+  fi
   echo "stitchpad: recovering interrupted write of $(basename "$target")" >&2
-  cat "$ready" > "$target" && rm -f "$ready" 2>/dev/null
-  return 0
+  sp_apply_ready_generation "$ready" "$target" "$generation"
 }
+
+# Post-condition verification: confirm a durable commit actually landed.
+# Callers snapshot the rev-list count BEFORE the mutation, then call this
+# AFTER sp_commit.  Returns 0 when the commit landed (or PAD_GIT is absent,
+# which the sp_commit gate handles), returns 1 when the expected commit is
+# absent from the tip.  FAILS LOUDLY: success messages must not be printed
+# for mutations that never committed.
+sp_commit_count() {
+  sgit rev-list --count HEAD 2>/dev/null || echo 0
+}
+
+sp_verify_commit_landed() {
+  local pre_count="${1:-0}" post_count
+  [ -d "$PAD_GIT" ] || return 0
+  post_count="$(sp_commit_count)"
+  [ "$post_count" -gt "$pre_count" ] && return 0
+  return 1
+}
+
+# Shared post-condition: commit + verify count advanced. Returns 0 only when
+# the commit landed (or was a verifiable no-op). Callers that claim a durable
+# effect MUST gate on this — printing "✓ done" after an unchecked sp_commit
+# is the false-success class this closes.
+sp_commit_or_fail() {
+  local msg="$1"; shift 2>/dev/null || true
+  local pre_count
+  pre_count="$(sp_commit_count)"
+  sp_commit "$msg" "$@" || return 1
+  sp_verify_commit_landed "$pre_count"
+}
+
+# ── ALL-OR-NOTHING for pad-REWRITING operations (compact / archive) ─────────
+# deepseek F13: both commands rewrote the pad in place and deleted every
+# seen.<name> cursor BEFORE checking that the commit landed, then printed
+#   "stitchpad: compact NOT recorded — pad unchanged, cursors untouched"
+# with BOTH halves of that sentence false. Measured on a throwaway pad with the
+# repo's own STITCHPAD_TEST_COMMIT_FAIL seam: seen.bob went 15 → gone, the pad
+# sha changed, and the NEXT successful `say` committed the rewritten pad — a
+# FAILED operation became durable truth, and every agent's cursor with it.
+#
+# sp_commit_or_fail already tells the truth about the COMMIT; these three give
+# the same all-or-nothing shape to the FILES the operation touched first.
+#
+#   sp_rewrite_begin [extra file ...]  → snapshot dir on stdout
+#   sp_rewrite_rollback <dir>          → 0 restored · 2 pad held back · 1 partial
+#   sp_rewrite_commit <dir>            → success: drop the snapshot
+#
+# The pad is only restored when HEAD is still where it was at begin. That is the
+# same evidence rule the registry journal's rollback uses (faa3229): if another
+# writer's commit landed in between, rewinding the working tree would erase
+# THEIR message, so we hold the pad back and say so rather than trade one lost
+# message for another.
+sp_rewrite_begin() {   # [extra file ...] → prints the snapshot dir
+  local d f i=0
+  [ -n "${PAD_STATE:-}" ] && [ -d "$PAD_STATE" ] && [ ! -L "$PAD_STATE" ] || return 1
+  [ -f "$PAD_MD" ] && [ ! -L "$PAD_MD" ] || return 1
+  d="$(mktemp -d "$PAD_STATE/.rewrite-journal.XXXXXX")" || return 1
+  cp "$PAD_MD" "$d/pad" || { rm -rf "$d"; return 1; }
+  mkdir -p "$d/cursors" || { rm -rf "$d"; return 1; }
+  for f in "$PAD_STATE"/seen.*; do
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    cp "$f" "$d/cursors/${f##*/}" || { rm -rf "$d"; return 1; }
+  done
+  : > "$d/extra-paths" || { rm -rf "$d"; return 1; }
+  for f in "$@"; do
+    [ -n "$f" ] || continue
+    [ -L "$f" ] && { rm -rf "$d"; return 1; }
+    printf '%s\n' "$f" >> "$d/extra-paths"
+    if [ -f "$f" ]; then cp "$f" "$d/extra.$i" || { rm -rf "$d"; return 1; }; fi
+    i=$(( i + 1 ))
+  done
+  sgit rev-parse HEAD > "$d/base-sha" 2>/dev/null || printf 'unborn' > "$d/base-sha"
+  [ -s "$d/base-sha" ] || printf 'unborn' > "$d/base-sha"
+  printf '%s' "$d"
+}
+
+sp_rewrite_rollback() {   # $1 = snapshot dir
+  local d="${1:-}" base now rc=0 f n i=0
+  [ -n "$d" ] && [ -d "$d" ] || return 1
+  base="$(cat "$d/base-sha" 2>/dev/null || echo unborn)"
+  now="$(sgit rev-parse HEAD 2>/dev/null || echo unborn)"
+  [ -n "$now" ] || now="unborn"
+  if [ "$now" = "$base" ]; then
+    cat "$d/pad" > "$PAD_MD" || rc=1
+  else
+    echo "stitchpad: HEAD moved during this operation ($base → $now) — the pad was NOT restored, because that would erase the commit that landed in between. Pre-operation copy kept at $d/pad" >&2
+    rc=2
+  fi
+  # Cursors are restored either way: they are per-seat delivery state, not
+  # shared pad content, so putting them back cannot clobber another writer.
+  for f in "$d"/cursors/*; do
+    [ -f "$f" ] || continue
+    n="${f##*/}"
+    case "$n" in seen.*) ;; *) continue ;; esac
+    cat "$f" > "$PAD_STATE/$n" || rc=1
+  done
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    if [ -f "$d/extra.$i" ]; then
+      cat "$d/extra.$i" > "$f" || rc=1
+    else
+      rm -f "$f" 2>/dev/null || true   # the operation created it; unmake it
+    fi
+    i=$(( i + 1 ))
+  done < "$d/extra-paths"
+  [ "$rc" -eq 0 ] && rm -rf "$d"
+  return "$rc"
+}
+
+sp_rewrite_commit() { [ -n "${1:-}" ] && [ -d "${1:-}" ] && rm -rf "$1"; return 0; }
 
 # Append a small italic system/presence line to the pad (join/leave, etc.).
 # Not a message — no @sender — so it never trips mention detection or the gate.
 sp_system() {
   local msg="$1" ts; ts="$(date '+%I:%M %p')"
   printf '\n*%s · %s*\n' "$msg" "$ts" >> "$PAD_MD"
+}
+
+# Mint a short message id (6 hex chars). Appears in headers as "#m-xxxxxx" —
+# the durable anchor reactions and reply-threads point at. Collision odds at
+# pad scale (~10^3 messages) are negligible; ids only need to be unique-enough
+# to grep, not cryptographic.
+sp_msg_id() {
+  if command -v openssl >/dev/null 2>&1; then
+    printf 'm-%s' "$(openssl rand -hex 3)"
+  else
+    printf 'm-%04x%02x' "$((RANDOM % 65536))" "$((RANDOM % 256))"
+  fi
 }
 
 # Isolated git wrapper: history of just stitchpad.md, separate from project repo.
@@ -322,19 +1441,271 @@ sp_ensure_pad_git_exclude() {
 # sp_commit <msg> [path...]  — paths are relative to the pad dir; defaults to
 # the pad file. Passing paths lets a task-only or archive-only change commit
 # just that file instead of the whole conversation.
+#
+# Returns 0 when the commit landed or there was verifiably nothing to commit,
+# nonzero when a git-backed pad FAILED to record staged changes. Callers that
+# interlock durable state with the commit (session registry / pad header) key
+# rollback off this status — the old `|| true` tail let a failed commit look
+# like success. Pads without a git dir keep the historical no-op success.
+sp_narrate() {
+  local _nr_text="$1" _nr_from _nr_ts _nr_depoch _nr_commit_rc
+  [ -n "$_nr_text" ] || return 0
+  [ -n "${PAD_DIR:-}" ] && [ -f "${PAD_MD:-}" ] || return 0
+  _nr_from="$(sp_me 2>/dev/null)" || _nr_from=""
+  [ -n "$_nr_from" ] || return 0
+  [ "$_nr_from" = "stitchpad" ] && return 0  # Bootstrap commits aren't agent events
+  # Derive the timestamp — consistent with date-divider when available
+  if type sp_date_divider_hhmm >/dev/null 2>&1; then
+    _nr_ts="$(sp_date_divider_hhmm 2>/dev/null)" || _nr_ts="$(date '+%I:%M %p')"
+  else
+    _nr_ts="$(date '+%I:%M %p')"
+  fi
+  # Append the narration line to the pad.  Use a compact format that is
+  # distinguishable from human conversation: `### @name event · HH:MM AM`
+  printf '\n### %s %s · %s\n' "@${_nr_from}" "$_nr_text" "$_nr_ts" >> "$PAD_MD"
+  return 0
+}
+
 sp_commit() {
   local msg="$1"; shift 2>/dev/null || true
   local paths=("$@")
   [ "${#paths[@]}" -eq 0 ] && paths=("$(basename "$PAD_MD")")
-  sgit rev-parse --git-dir >/dev/null 2>&1 || return 0
-  # Never turn a transient outer-repo stash/clean window into a durable pad
-  # deletion. Stage first so a file recreated after an older deletion is not
-  # invisible as "untracked" to `git diff`, then inspect the staged delta.
+  # C4 / H11b: distinguish absent git-dir (benign — no git backing, return 0)
+  # from a git-dir that exists but is broken (fatal — config corruption,
+  # missing objects, return 1).  rev-parse --git-dir itself exits 128 on a
+  # corrupt config, so the original H11b guard returned 0 before cat-file -t
+  # HEAD was ever reached.  Check -d first, then let each failure be honest.
+  if [ ! -d "$PAD_GIT" ]; then
+    return 0  # No git dir at all — benign
+  fi
+  # H11b: git dir exists — verify it's reachable
+  if ! sgit rev-parse --git-dir >/dev/null 2>&1; then
+    echo "stitchpad: git repository is broken (rev-parse failed on $PAD_GIT) — commit refused" >&2
+    return 1
+  fi
+  # C5: check HEAD reachability ONLY if HEAD exists.  An unborn HEAD
+  # (fresh repo before first commit) is benign — skip so the first commit
+  # can proceed.  A repo where HEAD exists but isn't a valid commit is broken.
+  if sgit rev-parse --verify HEAD >/dev/null 2>&1; then
+    if ! sgit cat-file -t HEAD >/dev/null 2>&1; then
+      echo "stitchpad: git repository is broken (HEAD unreachable) — commit refused" >&2
+      return 1
+    fi
+  fi
   [ -f "$PAD_MD" ] || return 0
+  if [ "${STITCHPAD_TEST_MODE:-}" = "1" ] && [ -n "${STITCHPAD_TEST_COMMIT_FAIL:-}" ]; then
+    return 1
+  fi
   sp_ensure_pad_git_exclude
-  sgit add -A -f -- "${paths[@]}" 2>/dev/null || return 0
+  # N2: a SIGKILLed writer (ours or, historically, an external git process)
+  # can leave $PAD_GIT/index.lock behind. Git refuses every future add/commit
+  # while it exists, so with no self-heal this becomes a PERMANENT pad wedge
+  # ("commit failed... message NOT posted" forever, confirmed by fx3 repro).
+  # sgit is not always called under our own sp_lock (watch.sh's periodic
+  # auto-commit runs unlocked by design), so a fresh index.lock COULD be a
+  # genuinely concurrent writer — never remove on sight. Only break it after
+  # an age threshold well beyond any realistic commit duration on this small
+  # pad file, and log loudly so a real double-writer bug is still visible.
+  local _idxlock="$PAD_GIT/index.lock"
+  if [ -f "$_idxlock" ]; then
+    local _lock_age now_ts mtime_ts
+    now_ts="$(date +%s)"
+    mtime_ts="$(stat -f %m "$_idxlock" 2>/dev/null || stat -c %Y "$_idxlock" 2>/dev/null || echo "$now_ts")"
+    _lock_age=$(( now_ts - mtime_ts ))
+    if [ "$_lock_age" -ge 15 ]; then
+      echo "stitchpad: stale git index.lock (age ${_lock_age}s) — breaking to unwedge pad (N2)" >&2
+      rm -f "$_idxlock" 2>/dev/null || true
+    fi
+  fi
+  # V1: auto-register invisible agents on first durable write. An agent
+  # whose STITCHPAD_NAME / session binding resolves to a real name not
+  # yet in the roster is inserted as cli|pull|- before their first commit
+  # lands.  Without this, @km2 shipped 14 commits of central work while
+  # completely invisible to `stitchpad roster`.
+  # SP_LEAVING is the one identity auto-register must NOT resurrect: the seat
+  # whose departure is being committed right now. `leave` drops the roster row
+  # from PAD_MD and then calls sp_commit — and V1, reading the pad it has just
+  # rewritten, saw a resolvable @who with no roster row and helpfully put the
+  # row back inside that same commit. `stitchpad leave dale` run BY dale (the
+  # normal case — a seat retires itself) was therefore a no-op on the roster:
+  # "✓ dale left" printed, dale still a member, dale still on the lanes board.
+  # The two rules only look contradictory: V1 registers an agent that is WORKING
+  # while invisible, and a seat committing its own removal is the exact opposite
+  # of that. The guard is scoped to the leave command's own process (and its
+  # heartbeat --stop child, hence export), so nothing else can be suppressed.
+  local _v1_who=""
+  _v1_who="$(sp_me 2>/dev/null)" || _v1_who=""
+  if [ -n "$_v1_who" ] && [ "$_v1_who" != "stitchpad" ] \
+     && [ "$_v1_who" != "${SP_LEAVING:-}" ]; then
+    if ! sp_user_exists "$_v1_who" 2>/dev/null; then
+      case "$_v1_who" in *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-]*) ;; *)
+        _v1_tmp="$(sp_stage "$PAD_MD")"
+        awk -v line="$_v1_who | cli | pull | -" '
+          /^```roster/ { inblk=1; print; next }
+          inblk && /^```/ { print line; inblk=0; print; next }
+          { print }
+        ' "$PAD_MD" > "$_v1_tmp" && sp_write_inplace "$_v1_tmp" "$PAD_MD"
+        # Ensure PAD_MD is in the staged paths so the roster edit
+        # is included in this commit.
+        local _v1_has_pad=0
+        for _v1_p in "${paths[@]}"; do
+          [ "$_v1_p" = "$(basename "$PAD_MD")" ] && { _v1_has_pad=1; break; }
+        done
+        [ "$_v1_has_pad" -eq 0 ] && paths+=("$(basename "$PAD_MD")")
+        ;;
+      esac
+    fi
+  fi
+  sgit add -A -f -- "${paths[@]}" 2>/dev/null || return 1
   sgit diff --cached --quiet -- "${paths[@]}" 2>/dev/null && return 0
-  sgit commit -q -m "$msg" 2>/dev/null || true
+  # H5b: capture HEAD BEFORE the commit attempt.  Use --verify -q to avoid
+  # rev-parse polluting stdout with "HEAD" on an unborn HEAD.
+  local _head_before=""
+  _head_before="$(sgit rev-parse --verify -q HEAD 2>/dev/null || echo "")"
+  # RP-2: capture staged blob hashes BEFORE commit for post-commit byte
+  # verification.  A hook that keeps the path but replaces content passes
+  # Z1 but commits tampered bytes — we verify exact blob match vs HEAD.
+  # P19: entries are recorded per staged FILE ("<path>:<blobhash>"), never
+  # per pathspec.  A DIRECTORY pathspec (archive) must expand to its files:
+  # comparing a file's blob hash against `ls-tree` of the directory yields
+  # the TREE hash, so every archive commit was falsely reported uncommitted
+  # (pad rewritten + cursors frozen, error text on a durable success).
+  # NOTE: this fix was absorbed at b2c0ba1 and then silently reverted by the
+  # lib.sh restore at 03e68ba (its gate was never baselined, so the release
+  # gate could not see the revert). Re-landed and baselined at 49d97cf+.
+  local _rp2_hashes="" _p _rp2_entries
+  for _p in "${paths[@]}"; do
+    _rp2_entries="$(sgit ls-files --stage -- "$_p" 2>/dev/null \
+      | awk -F'\t' '{ split($1, m, " "); print $2 ":" m[2] }')" || _rp2_entries=""
+    [ -n "$_rp2_entries" ] && _rp2_hashes="${_rp2_hashes}${_rp2_entries}"$'\n'
+  done
+  _rp2_hashes="${_rp2_hashes%$'\n'}"
+  # I1: identity preflight — every commit must carry the agent's declared
+  # identity via inline -c flags. Without this, git falls back to shared repo
+  # config and parallel workers silently overwrite each other's authorship
+  # (pro3's commit was authored "pro7@ocean.local" — observed live).
+  # Resolve via sp_me when available; fall back to "stitchpad" for contexts
+  # where no session binding exists yet (bootstrap, tests, watch.sh).
+  local _commit_who=""
+  _commit_who="$(sp_me 2>/dev/null)" || _commit_who=""
+  [ -z "$_commit_who" ] && _commit_who="stitchpad"
+  # Commit with inline identity — never touch shared git config.
+  if sgit -c "user.name=$_commit_who" -c "user.email=${_commit_who}@ocean.local" \
+       commit -q -m "$msg" >/dev/null 2>/dev/null; then
+    # C3: commit exited 0, but a pre-commit hook that empties the index
+    # makes git produce an EMPTY commit — HEAD advances, index is clean,
+    # but our write bytes are in neither HEAD nor HEAD~1.  Journaled
+    # callers (lifecycle_commit, rollback) treat rc=0 as success and drop
+    # the journal → write permanently lost.
+    local _head_after=""
+    _head_after="$(sgit rev-parse --verify -q HEAD 2>/dev/null || echo "")"
+    # --- Empty-tree guard (success branch) ---
+    if [ -n "$_head_before" ] && [ -n "$_head_after" ] && [ "$_head_before" != "$_head_after" ]; then
+      if [ -z "$(sgit diff-tree --name-only "${_head_before}" "$_head_after" 2>/dev/null)" ]; then
+        echo "stitchpad: commit produced an empty tree (hook may have cleared the index) — write NOT committed" >&2
+        return 1
+      fi
+    fi
+    # C5: unborn HEAD — no prior commit. Compare against empty tree.
+    if [ -z "$_head_before" ] && [ -n "$_head_after" ]; then
+      local _empty_tree=""
+      _empty_tree="$(echo -n | sgit hash-object -t tree --stdin 2>/dev/null)" || _empty_tree=""
+      if [ -n "$_empty_tree" ] && [ -z "$(sgit diff-tree --name-only "${_empty_tree}" "$_head_after" 2>/dev/null)" ]; then
+        echo "stitchpad: first commit produced an empty tree (hook may have cleared the index) — write NOT committed" >&2
+        return 1
+      fi
+    fi
+    # Z1: C3-fix bypass — hook can exclude our staged file while leaving
+    # an unrelated file in HEAD (diff-tree non-empty, passes empty-tree check).
+    # Verify the staged paths specifically appear in HEAD as added/modified.
+    if [ -n "$_head_before" ] && [ -n "$_head_after" ] && [ "$_head_before" != "$_head_after" ]; then
+      if [ -z "$(sgit diff --name-only --diff-filter=AM "${_head_before}" "${_head_after}" -- "${paths[@]}" 2>/dev/null)" ]; then
+        echo "stitchpad: commit succeeded but staged paths NOT in HEAD — write NOT committed (hook may have excluded them)" >&2
+        return 1
+      fi
+    fi
+    if [ -z "$_head_before" ] && [ -n "$_head_after" ]; then
+      if [ -z "$(sgit diff --name-only --diff-filter=AM "${_empty_tree:-$(echo -n | sgit hash-object -t tree --stdin 2>/dev/null)}" "$_head_after" -- "${paths[@]}" 2>/dev/null)" ]; then
+        echo "stitchpad: first commit succeeded but staged paths NOT in HEAD — write NOT committed (hook may have excluded them)" >&2
+        return 1
+      fi
+    fi
+    # RP-2: verify exact bytes in HEAD match what we staged before the
+    # hook ran.  A hook that keeps the path but replaces content leaves
+    # the path in HEAD (Z1 passes) but with tampered content.
+    if [ -n "$_rp2_hashes" ]; then
+      local _rp2_line _rp2_path _rp2_staged _rp2_head_hash _rp2_ok=1
+      while IFS=: read -r _rp2_path _rp2_staged; do
+        [ -n "$_rp2_path" ] && [ -n "$_rp2_staged" ] || continue
+        _rp2_head_hash="$(sgit ls-tree "$_head_after" -- "$_rp2_path" 2>/dev/null | awk '{print $3}')" || _rp2_head_hash=""
+        if [ -n "$_rp2_head_hash" ] && [ "$_rp2_staged" != "$_rp2_head_hash" ]; then
+          echo "stitchpad: commit succeeded but staged bytes differ from HEAD for $_rp2_path (hook may have altered content) — write NOT committed" >&2
+          _rp2_ok=0
+          break
+        fi
+      done <<< "$_rp2_hashes"
+      [ "$_rp2_ok" -eq 1 ] || return 1
+    fi
+    return 0
+  fi
+  # H5b: commit failed (exit != 0). Check HEAD moved AND index is clean.
+  local _head_after=""
+  _head_after="$(sgit rev-parse --verify -q HEAD 2>/dev/null || echo "")"
+  if [ -n "$_head_before" ] && [ -n "$_head_after" ] && [ "$_head_before" != "$_head_after" ]; then
+    if [ -z "$(sgit diff-tree --name-only "${_head_before}" "$_head_after" 2>/dev/null)" ]; then
+      echo "stitchpad: git commit failed but HEAD advanced with an empty tree — write NOT committed" >&2
+      return 1
+    fi
+    # Z1 failure branch: same staged-paths verification
+    if [ -z "$(sgit diff --name-only --diff-filter=AM "${_head_before}" "$_head_after" -- "${paths[@]}" 2>/dev/null)" ]; then
+      echo "stitchpad: git commit failed but staged paths NOT in HEAD — write NOT committed (hook may have excluded them)" >&2
+      return 1
+    fi
+    sgit diff --cached --quiet -- "${paths[@]}" 2>/dev/null && return 0
+  fi
+  # C5 failure branch: unborn HEAD, commit rc != 0 but HEAD advanced.
+  if [ -z "$_head_before" ] && [ -n "$_head_after" ]; then
+    local _empty_tree=""
+    _empty_tree="$(echo -n | sgit hash-object -t tree --stdin 2>/dev/null)" || _empty_tree=""
+    if [ -n "$_empty_tree" ] && [ -z "$(sgit diff-tree --name-only "${_empty_tree}" "$_head_after" 2>/dev/null)" ]; then
+      echo "stitchpad: git commit failed but HEAD advanced with an empty tree (hook on unborn HEAD) — write NOT committed" >&2
+      return 1
+    fi
+    # Z1 failure branch on unborn HEAD
+    if [ -z "$(sgit diff --name-only --diff-filter=AM "${_empty_tree}" "$_head_after" -- "${paths[@]}" 2>/dev/null)" ]; then
+      echo "stitchpad: git commit failed but staged paths NOT in HEAD (hook on unborn HEAD) — write NOT committed" >&2
+      return 1
+    fi
+    sgit diff --cached --quiet -- "${paths[@]}" 2>/dev/null && return 0
+  fi
+  # H5b: HEAD didn't move. One more BENIGN race before declaring failure
+  # (JH4, root-caused with km2's instrumented 30-iteration repro): a
+  # concurrent UNLOCKED committer (watch.sh's periodic auto-commit, which
+  # runs outside sp_lock by design) can sweep our staged bytes into its own
+  # commit BEFORE our _head_before snapshot. Our commit then finds an empty
+  # index, git exits 1 with "nothing to commit", HEAD never moves in our
+  # window, and every H5b/C5 branch above misses it — a spurious refusal of
+  # a write that IS durably committed (JH4 fleet flake).
+  # The honest test is working-tree vs HEAD for OUR paths:
+  #   match  → the desired bytes ARE in HEAD (ours or the race winner's) → 0
+  #   differ → the write is genuinely not committed (hook ate it, C3/RP-2
+  #            tamper class, real git failure) → refuse honestly.
+  if [ -n "$_head_after" ] \
+     && sgit diff --quiet HEAD -- "${paths[@]}" 2>/dev/null; then
+    return 0
+  fi
+  # H5b: HEAD didn't move and our bytes are not in HEAD — real failure.
+  return 1
+  # DEAD CODE REMOVED (deepseek F4). A `sp_narrate "commit: $1"` used to sit here,
+  # below an unconditional `return 1`, under a comment claiming "every durable
+  # commit emits a pad line". It was unreachable on every path — the success
+  # branches all return earlier — so P19 auto-narration never once fired from
+  # sp_commit. Deleting it rather than moving it up: narration IS emitted, but by
+  # the explicit sp_narrate calls at the sites that want it (task new, and the
+  # other P19 call sites), and switching it on for EVERY commit here would change
+  # what lands on the pad and start doubling lines those sites already write.
+  # A comment describing behaviour the code does not have is worse than no
+  # comment; that is what made this look implemented for so long.
 }
 
 # ── Roster parsing (the magic: roster is IN the markdown) ────────────
@@ -393,7 +1764,14 @@ sp_roster_live() {
   local now; now=$(date +%s)
   sp_roster | while IFS='|' read -r name adapter wake target; do
     [ -n "$name" ] || continue
+    # Writer/reader key mismatch, proved by execution: `join --role operator`
+    # writes .state/role.<name>, but this loop only ever read .state/runtime.<name>
+    # — which NOTHING in the tree writes. So the "operators are always kept"
+    # guarantee three lines up was silently false: an operator with no heartbeat
+    # (which is every operator, by design) vanished from the live roster.
+    # runtime.* is still honoured first in case an external runtime writes it.
     local rt; rt="$(cat "$PAD_STATE/runtime.$name" 2>/dev/null || true)"
+    [ -n "$rt" ] || rt="$(cat "$PAD_STATE/role.$name" 2>/dev/null || true)"
     if [ "$rt" = "operator" ] || [ "$rt" = "human" ]; then
       printf '%s|%s|%s|%s\n' "$name" "$adapter" "$wake" "$target"; continue
     fi
@@ -438,6 +1816,22 @@ sp_task_file() {
   return 1
 }
 
+# Detect duplicate task id across both files. Emits a LOUD stderr warning when
+# the same id exists in BOTH stitchpad.md AND tasks.md so the operator knows
+# the two views may differ until they run `stitchpad task migrate`.
+# Returns 0 (duplicate found) / 1 (unique or absent).
+sp_task_detect_duplicate() {
+  local id="$1" found_md=0 found_tasks=0
+  [ -n "$id" ] || return 1
+  [ -f "$PAD_MD" ] && awk -v tid="$id" '$1=="```task" && $2==tid { found=1; exit } END { exit !found }' "$PAD_MD" 2>/dev/null && found_md=1
+  [ -n "${PAD_TASKS:-}" ] && [ -f "$PAD_TASKS" ] && awk -v tid="$id" '$1=="```task" && $2==tid { found=1; exit } END { exit !found }' "$PAD_TASKS" 2>/dev/null && found_tasks=1
+  if [ "$found_md" -eq 1 ] && [ "$found_tasks" -eq 1 ]; then
+    echo "stitchpad: WARNING — task $id exists in BOTH $(basename "$PAD_MD") AND $(basename "$PAD_TASKS"); $(basename "$PAD_TASKS") takes precedence; run 'stitchpad task migrate' to consolidate" >&2
+    return 0
+  fi
+  return 1
+}
+
 sp_tasks() {
   local filter_name="" filter_status=""
   while [ $# -gt 0 ]; do
@@ -448,18 +1842,38 @@ sp_tasks() {
     esac
   done
   local _tf=(); while IFS= read -r _f; do _tf+=("$_f"); done < <(sp_task_files)
-  awk -v fn="$filter_name" -v fs="$filter_status" '
-    BEGIN { id=""; title=""; status=""; priority=""; assignee=""; labels=""; created=""; desc="" }
+  local _sp_tasks_output
+  _sp_tasks_output="$(awk -v fn="$filter_name" -v fs="$filter_status" '
+    BEGIN { id=""; title=""; status=""; priority=""; assignee=""; labels=""; created=""; estimate=""; desc="" }
     # multiple inputs (pad + tasks.md): never let an unterminated block in one
     # file bleed into the next
-    FNR==1                           { inblk=0; meta=0; id="" }
-    /^```task /                      { inblk=1; meta=1; id=$2; gsub(/^ *| *$/,"",id); title=""; status="todo"; priority="none"; assignee=""; labels=""; created=""; desc="" }
+    FNR==1                           { inblk=0; meta=0; id=""; code_fence=0 }
+    /^```task /                      { inblk=1; meta=1; id=$2; gsub(/^ *| *$/,"",id); title=""; status="todo"; priority="none"; assignee=""; labels=""; created=""; estimate=""; desc="" }
+    # E-18: only a TOP-LEVEL ``` (code_fence==0) closes the task block.
+    # Nested ``` pairs inside the body (e.g. a code block in the description)
+    # toggle code_fence and do NOT terminate the task.
+    /^```$/ && inblk && code_fence>0 { code_fence--; next }
     /^```$/ && inblk                 { inblk=0; if (id!="") {
-      # duplicate blocks (compact-carried copies, re-posts): LAST occurrence wins
+      # duplicate blocks: tasks.md is read second via sp_task_files ordering,
+      # so its version naturally wins for cross-file duplicates (LAST wins).
       if (!(id in seen)) { order[++nord]=id; seen[id]=1 }
-      data[id] = id "|" title "|" status "|" priority "|" assignee "|" labels "|" created "|" substr(desc, 1, 240)
+      data[id] = id "|" title "|" status "|" priority "|" assignee "|" labels "|" created "|" estimate "|" desc
       fa[id]=assignee; fst[id]=status; id="" } }
     inblk && /^---/                   { meta=0; next }
+    inblk && !meta && /^```[^t]/ {
+      # a nested code fence inside the task body (e.g. ```python, ```json)
+      code_fence++
+      if (desc != "") desc = desc " / "
+      desc = desc $0
+      next
+    }
+    inblk && !meta && /^```$/ {
+      # closing a nested code fence
+      if (code_fence>0) { code_fence-- }
+      if (desc != "") desc = desc " / "
+      desc = desc $0
+      next
+    }
     inblk && !meta && !/^```/ {
       line=$0; gsub(/^[ \t]+|[ \t]+$/, "", line)
       if (line != "") desc = (desc == "" ? line : desc " / " line)
@@ -472,10 +1886,252 @@ sp_tasks() {
       if (line ~ /^assignee:/) { gsub(/^assignee: */, "", line); assignee=line }
       if (line ~ /^labels:/)   { gsub(/^labels: */, "", line); labels=line }
       if (line ~ /^created:/)  { gsub(/^created: */, "", line); created=line }
+      if (line ~ /^estimate:/) { gsub(/^estimate:[[:space:]]*/, "", line); estimate=line }
     }
     END { for (i=1; i<=nord; i++) { k=order[i]
       if ((fn=="" || fa[k]==fn) && (fs=="" || fst[k]==fs)) print data[k] } }
-  ' "${_tf[@]}"
+  ' "${_tf[@]}")"
+  # Detect cross-file duplicates: when the same task id lives in both
+  # stitchpad.md and tasks.md, WARN so the operator knows the views diverged.
+  if [ -n "${PAD_TASKS:-}" ] && [ -f "$PAD_TASKS" ]; then
+    local _tid
+    while IFS='|' read -r _tid _; do
+      [ -n "$_tid" ] && sp_task_detect_duplicate "$_tid" || true
+    done <<< "$_sp_tasks_output"
+  fi
+  printf '%s\n' "$_sp_tasks_output"
+}
+
+# ── P20+P21: Task Oversight Board + ETA Projection ──────────────────────
+# The board answers questions the operator should never have to ask: "eta?",
+# "hows it going", "u still going?", "why is this card not done?".
+#
+# sp_task_board — enriched `stitchpad task list` with per-card owner liveness,
+#   artifact presence, and staleness flags.  A card whose owner is inactive
+#   past the threshold is flagged on the board without operator action.
+#
+# sp_task_eta — wall-clock projection modelling parallelism (busiest-owner
+#   chain + serialised tail).  An operator budgets agents and tokens without
+#   asking anyone.
+
+TASK_OWNER_STALE_SECONDS="${TASK_OWNER_STALE_SECONDS:-3600}"
+
+# sp_task_board — rich kanban-like view with liveness + artifacts.
+# Reads sp_tasks pipe-delimited output (id|title|status|priority|assignee|labels|created|estimate|desc)
+# and cross-references session registry for owner activity.
+sp_task_board() {
+  local _proj _tasks _now _line _id _title _status _priority _assignee _labels _created _est _desc
+  local _owner_status _owner_age _art_check _artifact_file _present _flag
+  _proj="$(sp_session_registry_project 2>/dev/null || echo '[]')"
+  _tasks="$(sp_tasks "$@")"
+  _now="$(date +%s)"
+
+  printf '%-10s %-12s %-12s %-10s %-12s %-14s %-14s %-10s %s\n' \
+    "TASK" "STATUS" "PRIORITY" "OWNER" "OWNER-LIVE" "ARTIFACT" "AGE" "EST" "TITLE"
+  printf '%-10s %-12s %-12s %-10s %-12s %-14s %-14s %-10s %s\n' \
+    "----------" "------------" "------------" "----------" "------------" "--------------" "--------------" "----------" "-------------------------"
+
+  while IFS='|' read -r _id _title _status _priority _assignee _labels _created _est _desc; do
+    [ -n "$_id" ] || continue
+    # Owner liveness from session registry
+    _owner_status="-"; _owner_age=""
+    _flag=""
+    if [ -n "$_assignee" ]; then
+      _owner_status="$(echo "$_proj" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for s in data:
+    if s.get('name','') == '$_assignee':
+        print(s.get('status',''))
+        sys.exit(0)
+print('unknown')
+" 2>/dev/null)"
+      [ -z "$_owner_status" ] && _owner_status="unknown"
+      _owner_age="$(echo "$_proj" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for s in data:
+    if s.get('name','') == '$_assignee':
+        la = s.get('last_activity',0)
+        if la: print(int($_now) - la)
+        sys.exit(0)
+print('?')
+" 2>/dev/null)"
+      [ -z "$_owner_age" ] && _owner_age="?"
+      # Staleness: owner idle > TASK_OWNER_STALE_SECONDS and card not done
+      if [ "$_status" != "done" ] && [ "$_status" != "in_review" ]; then
+        case "$_owner_status" in
+          terminal|stale) _flag="STALE" ;;
+          idle)
+            if [ "$_owner_age" != "?" ] && [ "$_owner_age" -gt "$TASK_OWNER_STALE_SECONDS" ] 2>/dev/null; then
+              _flag="STALE"
+            fi ;;
+        esac
+      fi
+    fi
+    # Artifact check
+    _artifact_file=""
+    _present="-"
+    if [ -n "$_assignee" ] && [ -f "$PAD_STATE/artifact-expect.$_assignee" ]; then
+      _artifact_file="$(head -1 "$PAD_STATE/artifact-expect.$_assignee")"
+      # Was a duplicated `[ -e ]` test — a second definition of a question that
+      # already had one. Use the shared oracle so this can never drift from
+      # sp_artifact_verify (and so an empty stub reads NO here too).
+      if [ -n "$_artifact_file" ] && sp_artifact_produced "$_artifact_file"; then
+        _present="yes"
+      elif [ -n "$_artifact_file" ]; then
+        _present="NO"
+      fi
+    fi
+    # Truncate long fields for column alignment
+    [ "${#_title}" -gt 40 ] && _title="${_title:0:37}..."
+    [ "${#_artifact_file}" -gt 24 ] && _artifact_file="${_artifact_file:0:21}..."
+    [ "${#_est}" -gt 8 ] && _est="${_est:0:8}"
+
+    local _owner_display="${_assignee:-unassigned}"
+    [ "${#_owner_display}" -gt 10 ] && _owner_display="${_owner_display:0:7}..."
+    local _live_display="${_owner_status}"
+    [ -n "$_owner_age" ] && [ "$_owner_age" != "?" ] && _live_display="${_owner_status} ${_owner_age}s" 2>/dev/null
+    [ "${#_live_display}" -gt 12 ] && _live_display="${_live_display:0:12}"
+
+    printf '%-10s %-12s %-12s %-10s %-12s %-14s %-14s %-10s %s' \
+      "$_id" "$_status" "$_priority" "$_owner_display" "$_live_display" \
+      "${_artifact_file:- -}" "${_present}" "${_est:- -}" "$_title"
+    if [ -n "$_flag" ]; then printf '  ⚠ %s' "$_flag"; fi
+    printf '\n'
+  done <<< "$_tasks"
+}
+
+# sp_task_eta — wall-clock projection modelling parallelism.
+# Model: busiest-owner chain + serialised tail.
+#   per_owner_minutes[owner] = sum of estimate for all non-done cards assigned to owner
+#   busiest = max(per_owner_minutes)  — cards on different owners run in parallel
+#   tail = sum of estimate for unassigned cards  — no owner = no parallel slot
+#   projection = busiest + tail
+# Default estimate: 15 minutes per card (configurable via TASK_DEFAULT_ESTIMATE_MINUTES).
+sp_task_eta() {
+  local _tasks _line _id _title _status _assignee _est _mins
+  local _default_est="${TASK_DEFAULT_ESTIMATE_MINUTES:-15}"
+
+  _tasks="$(sp_tasks)"
+
+  # Shell arrays indexed by owner name
+  local owners="" ow_min="" ow_cards=""
+  local tail_mins=0 tail_count=0 busiest_owner="" busiest_mins=0 total_cards=0 active_cards=0
+  local _proj _now
+  _proj="$(sp_session_registry_project 2>/dev/null || echo '[]')"
+  _now="$(date +%s)"
+
+  while IFS='|' read -r _id _title _status _priority _assignee _labels _created _est _desc; do
+    [ -n "$_id" ] || continue
+    total_cards=$((total_cards + 1))
+    # Only non-done cards count toward ETA
+    case "$_status" in done|in_review) continue ;; esac
+    active_cards=$((active_cards + 1))
+
+    # Parse estimate: "15m" -> 15, "3 hours" -> 180, "1h" -> 60, default to 15
+    mins="$_default_est"
+    if [ -n "$_est" ]; then
+      _clean="$(echo "$_est" | tr -d ' ')"
+
+      # Python expression parser
+      mins="$(echo "$_est" | python3 -c "
+import re, sys
+s = sys.stdin.read().strip().lower()
+# Try simple 'Nm' format
+m = re.match(r'^(\d+(?:\.\d+)?)\s*m(?:in(?:ute)?s?)?$', s)
+if m: print(int(float(m.group(1)))); sys.exit(0)
+# Try 'Nh' format
+m = re.match(r'^(\d+(?:\.\d+)?)\s*h(?:our)?s?$', s)
+if m: print(int(float(m.group(1))*60)); sys.exit(0)
+# Try 'N hours'
+m = re.match(r'^(\d+(?:\.\d+)?)\s*hours?$', s)
+if m: print(int(float(m.group(1))*60)); sys.exit(0)
+print($_default_est)
+" 2>/dev/null || echo "$_default_est")"
+    fi
+    # Ensure integer
+    case "$mins" in ''|*[!0-9]*) mins="$_default_est" ;; esac
+
+    if [ -z "$_assignee" ]; then
+      tail_mins=$((tail_mins + mins))
+      tail_count=$((tail_count + 1))
+    else
+      # Accumulate per-owner
+      local found=0
+      local _ow_idx=1
+      for o in $owners; do
+        if [ "$o" = "$_assignee" ]; then
+          local _prev_min _prev_cards
+          _prev_min=$(echo "$ow_min" | awk -v idx=$_ow_idx '{print $idx}')
+          _prev_cards=$(echo "$ow_cards" | awk -v idx=$_ow_idx '{print $idx}')
+          local _new_min=$((_prev_min + mins))
+          local _new_cards=$((_prev_cards + 1))
+          # Rebuild ow_min and ow_cards with new values at this index
+          ow_min=$(echo "$ow_min" | awk -v idx=$_ow_idx -v v=$_new_min '{
+            for(i=1;i<=NF;i++) printf("%s%s", (i==idx?v:$i), (i==NF?"":" ")); print ""}')
+          ow_cards=$(echo "$ow_cards" | awk -v idx=$_ow_idx -v v=$_new_cards '{
+            for(i=1;i<=NF;i++) printf("%s%s", (i==idx?v:$i), (i==NF?"":" ")); print ""}')
+          found=1; break
+        fi
+        _ow_idx=$((_ow_idx + 1))
+      done
+      if [ "$found" -eq 0 ]; then
+        owners="$owners $_assignee"
+        ow_min="$ow_min $mins"
+        ow_cards="$ow_cards 1"
+      fi
+    fi
+  done <<< "$_tasks"
+
+  # Find busiest owner
+  local _idx=1
+  for o in $owners; do
+    local _m
+    _m=$(echo "$ow_min" | awk -v idx=$_idx '{print $idx}')
+    [ -z "$_m" ] && _m=0
+    if [ "$_m" -gt "$busiest_mins" ] 2>/dev/null; then
+      busiest_mins=$_m
+      busiest_owner="$o"
+    fi
+    _idx=$((_idx + 1))
+  done
+
+  local projection=$((busiest_mins + tail_mins))
+
+  echo ""
+  echo "ETA PROJECTION"
+  echo "=============="
+  echo "  Active cards:     $active_cards (of $total_cards total)"
+  echo "  Busiest owner:    ${busiest_owner:-none} (${busiest_mins}m across chains)"
+  echo "  Unassigned tail:  ${tail_mins}m (${tail_count} cards)"
+  echo "  ─────────────────────────────────────"
+  printf "  Wall-clock est:   %dm (~%.1fh)\n" "$projection" "$(python3 -c "print($projection/60.0)" 2>/dev/null || echo "?")"
+
+  if [ -n "$owners" ]; then
+    echo ""
+    echo "Per-owner breakdown:"
+    local _idx2=1
+    for o in $owners; do
+      local _cm _cc
+      _cm=$(echo "$ow_min" | awk -v idx=$_idx2 '{print $idx}')
+      _cc=$(echo "$ow_cards" | awk -v idx=$_idx2 '{print $idx}')
+      # Check liveness
+      local _live="$(echo "$_proj" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for s in data:
+    if s.get('name','') == '$o':
+        print(s.get('status',''))
+        sys.exit(0)
+print('unknown')
+" 2>/dev/null)"
+      [ -z "$_live" ] && _live="unknown"
+      printf "    %-12s %4s cards, %4sm  (%s)\n" "$o" "${_cc:-0}" "${_cm:-0}" "$_live"
+      _idx2=$((_idx2 + 1))
+    done
+  fi
+  echo ""
 }
 
 # Create tasks.md (with its header) if it does not exist yet. Callers hold the lock.
@@ -578,15 +2234,116 @@ sp_latest_to() {
   ' "$PAD_MD"
 }
 
+# Print one authored message block by its authored-block ordinal.  Delivery
+# state uses this ordinal rather than a byte offset so an append-only pad can be
+# re-read after a watcher/worker restart without persisting untrusted body text
+# in .state.  Anonymous headings do not consume an ordinal, matching
+# sp_engagement.
+sp_message_ordinal() {
+  local want="$1"
+  awk -v want="$want" '
+    /^## / {
+      if (emit) exit
+      if ($2 ~ /^@/) {
+        n++
+        if (n == want) emit=1
+      }
+    }
+    emit { print }
+  ' "$PAD_MD"
+}
+
+# Return the newest currently-unanswered directive for <who> after <since> as:
+#   ordinal|sender|stable-message-id|first-TASK-N-or--
+#
+# Push delivery intentionally coalesces to current work instead of replaying an
+# unbounded FIFO after a worker was offline.  Per-sender reply tracking keeps a
+# reply to Alice from hiding Bob's newer unresolved directive.  Silent acks,
+# fenced/code mentions, self-mentions and handle-boundary rules mirror the
+# engagement gate.  The stable id binds the ordinal to the exact message bytes,
+# so compaction/rewrite drift is rejected before adapter submission.
+sp_current_to_meta() {
+  local who="$1" since="${2:-0}" agents raw ordinal sender block checksum task
+  agents="$(sp_roster 2>/dev/null | cut -d'|' -f1 | tr 'A-Z' 'a-z' | paste -sd, -)"
+  raw="$(awk -v who="$(printf '%s' "$who" | tr 'A-Z' 'a-z')" -v agents="$agents" -v since="$since" '
+    function body_mentions(name,   re) {
+      re="(^|[ \t])@(" name "|all)([^a-z0-9_-]|$)"
+      return (buf ~ re)
+    }
+    function record_replies(   count,tokens,i,t,name) {
+      count=split(buf, tokens, /[ \t\n]+/)
+      for (i=1; i<=count; i++) {
+        t=tolower(tokens[i])
+        if (t ~ /^@[a-z0-9_-]+/) {
+          name=substr(t, 2)
+          sub(/[^a-z0-9_-].*$/, "", name)
+          if (name != "" && name != "all" && name != who) reply[name]=n
+        }
+      }
+    }
+    function flush() {
+      if (author == "") return
+      n++
+      if (author == who) {
+        if (silent || buf ~ /(^|[ \t])@[a-z0-9_-]/) record_replies()
+      } else if (!silent && n > since && body_mentions(who)) {
+        mention[author]=n
+      }
+    }
+    /^## @/ {
+      flush()
+      a=$2; sub(/^@/, "", a); author=tolower(a)
+      buf=""; silent=0; seen_body=0; infence=0
+      next
+    }
+    /^[[:space:]]*```/ { infence=!infence; next }
+    infence { next }
+    !seen_body && /[^[:space:]]/ {
+      seen_body=1
+      b=tolower($0); sub(/^[ \t]*/, "", b)
+      n_at=0; tmp=b
+      while (match(tmp, /@[a-z0-9_-]+/)) { n_at++; tmp=substr(tmp, RSTART+RLENGTH) }
+      sub(/^(@[a-z0-9_-]+[ \t]*)+/, "", b); sub(/[ \t]+$/, "", b)
+      if (n_at < 2) {
+        if (b ~ /^(\.|\[ack\])/) silent=1
+        if (index("," agents ",", "," author ",") > 0 && b ~ /^(ack|read|noted|got it|standing down|standing by|stand by|will do|understood|done here|copy|sounds good)[. !]*$/) silent=1
+      }
+    }
+    { line=tolower($0); gsub(/`[^`]*`/, " ", line); buf=buf " " line }
+    END {
+      flush()
+      best=0; best_sender=""
+      for (s in mention) {
+        if (mention[s] > reply[s] && mention[s] > best) {
+          best=mention[s]; best_sender=s
+        }
+      }
+      if (best > 0) print best "|" best_sender
+    }
+  ' "$PAD_MD")"
+  [ -n "$raw" ] || return 1
+  IFS='|' read -r ordinal sender <<< "$raw"
+  block="$(sp_message_ordinal "$ordinal")"
+  [ -n "$block" ] || return 1
+  checksum="$(printf '%s' "$block" | cksum | awk '{print $1}')"
+  task="$(printf '%s\n' "$block" | grep -oE 'TASK-[0-9]+' | head -1 || true)"
+  [ -n "$task" ] || task="-"
+  printf '%s|%s|m%s-%s|%s\n' "$ordinal" "$sender" "$ordinal" "$checksum" "$task"
+}
+
 # Engagement gate derived from pad CONTENT, not git commit subjects. The watch.sh
 # daemon auto-commits the pad as "update (HH:MM:SS)", which clobbers the authored
 # "<name>: <text>" subject the old gate relied on — so git subjects are unreliable.
 # The markdown is ground truth. Walks "## @author · time" blocks in order:
 #   - a block authored by someone ELSE that @-mentions me  → a mention TO me
 #   - a block authored by ME that @-mentions anyone else   → an addressed reply
-# Prints "<last_mention_ordinal> <last_reply_ordinal>" (0 if none). Blocked iff
-# last_mention > last_reply. Author-skip is built in: my own blocks never count as
-# mentions to me, killing the self-ack loop too.
+# Prints "<first_open_mention_ordinal> <mention_sender> <last_reply_ordinal>
+# <reply_target>" (0 if none). The scan is two-phase: it buffers every block,
+# then returns the first mention after `since` that is NOT answered — a reply
+# suppresses only the mentions from its target sender that predate it, so later
+# mentions from other senders always deliver FIFO (never starved behind an
+# already-answered oldest mention). Author-skip is built in: my own blocks never
+# count as mentions to me, killing the self-ack loop too.
 # Silent-ack convention: a block whose first content line starts with "." or "[ack]"
 # is invisible to the gate — it neither wakes a mentioned target nor counts as an
 # addressed reply. Lets agents post acknowledgements/status without costing anyone a
@@ -594,42 +2351,57 @@ sp_latest_to() {
 sp_engagement() {
   local who="$1"
   local since="${2:-0}"  # skip mentions with ordinal <= since (FIFO cursor)
+  local raw="${3:-}"     # non-empty: old forward-scan semantics — return the
+                         # first mention > since even when an addressed reply
+                         # closed it (reset --redeliver validation needs to
+                         # distinguish "answered" from "not open")
   # roster names, for the implicit-silent word list below: only AGENT authors get
   # their bare "ack"/"noted" posts silenced. A human operator typing "@pi ack"
   # means "wake pi" — guessing it silent made operator pings vanish (the pi bug).
   local agents
   agents="$(sp_roster 2>/dev/null | cut -d'|' -f1 | tr 'A-Z' 'a-z' | paste -sd, -)"
-  awk -v who="$(printf '%s' "$1" | tr 'A-Z' 'a-z')" -v agents="$agents" -v since="$since" '
+  awk -v who="$(printf '%s' "$1" | tr 'A-Z' 'a-z')" -v agents="$agents" -v since="$since" -v raw="$raw" '
     # An ADDRESS is "@name" at line-start or after whitespace — NOT after punctuation
     # like / ` " (), so a quoted/referenced "@name" (e.g. "the @john/@dale discussion")
     # or a backticked `@name` does not count as addressing someone. buf joins lines with
     # a leading space, so (^|[ \t]) covers block-start, every line-start, and mid-sentence.
     function body_mentions(name,   re) { re="(^|[ \t])@(" name "|all)([^a-z0-9_-]|$)"; return (buf ~ re) }
-    function flush() {
+    # flush() buffers per-block metadata (author/silent/body) so the END scan
+    # runs with COMPLETE reply knowledge: a forward-only pass cannot know about
+    # a reply that appears AFTER the mention it answers.
+    function flush(   i, n_tok, t, name, block_target) {
       if (author=="") return
       n++
+      b_auth[n]=author; b_silent[n]=silent; b_buf[n]=buf
       if (author==who) {                                          # my own block:
         if (silent || buf ~ /(^|[ \t])@[a-z0-9_-]/) {           # a silent ack OR a real @-address reply
-          last_reply=n                                           # last reply ordinal
-          # Try to extract the first @-target: the first non-who agent name address.
-          # This is the sender we replied TO, used for same-sender gate narrowing.
-          # PORTABLE: no gawk match()-with-array; uses substr + sub.
-          split(buf, tokens, /[ \t\n]+/)
-          for (i in tokens) {
-            if (i > 20) break
-            t = tolower(tokens[i])
+          last_reply=n                                           # newest reply ordinal
+          # Extract every @target of this reply. PORTABLE: no gawk
+          # match()-with-array; uses substr + sub. ORDINAL loop, NOT `for (i in
+          # tokens)`: hash-order iteration visits token 2 first and the old
+          # `if (i > 20) break` compared STRINGS ("2" > "20" is true), so only
+          # token 2 was ever examined — reply_target stayed empty for any reply
+          # whose @target was not the second word (Defect A). Per-sender map:
+          # reply[target] = newest reply ordinal, so a reply suppresses ONLY
+          # the mentions from that target sender that predate it (Defect B).
+          n_tok=split(buf, tokens, /[ \t\n]+/)
+          for (i=1; i<=n_tok && i<=20; i++) {
+            t=tolower(tokens[i])
             if (t ~ /^@[a-z0-9_-]+/) {
-              name = substr(t, 2)
+              name=substr(t, 2)
               sub(/[^a-z0-9_-].*$/, "", name)
-              if (name != "" && name != "all" && name != who) { reply_target = name; break }
+              if (name != "" && name != "all" && name != who) {
+                reply[name]=n
+                if (block_target == "") block_target=name
+              }
             }
           }
+          # reply_target = first @target of the newest reply block that has one
+          # (old output semantics preserved; the wake gate same-sender check
+          # is now belt-and-suspenders — the END scan only returns open mentions,
+          # so it can never misfire on one).
+          if (block_target != "") reply_target=block_target
         }
-      } else if (!silent && body_mentions(who)) {
-        # FIFO cursor: record the FIRST mention after `since`, never overwrite.
-        # The seen cursor steps one ordinal per delivery; this returns the next
-        # unanswered mention instead of jumping to the newest.
-        if (!last_mention && n > since) { last_mention=n; mention_sender=author }
       }
     }
     /^## @/ {
@@ -642,6 +2414,14 @@ sp_engagement() {
     # fence lines themselves and their contents are excluded from the mention buffer.
     /^[[:space:]]*```/ { infence = !infence; next }
     infence { next }
+    # P19 narration (`### @name event · HH:MM`) is a system-generated progress
+    # marker, not an address. sp_narrate writes the name after "### ", so the
+    # body_mentions regex `(^|[ \t])@name` matched it and every narrated lane
+    # became a PHANTOM MENTION of the agent that had just acted — the Stop hook
+    # then replayed a closed recovery forever (caught by reset-recovery.sh).
+    # sp_system lines are already safe because they open with "*@", and "*" is
+    # not whitespace. Same reasoning as the fence rule above: never wakes anyone.
+    /^###[[:space:]]*@/ { next }
     # first non-empty content line decides silent-ack (leading "." or "[ack]")
     !seen_body && /[^[:space:]]/ {
       seen_body=1
@@ -659,8 +2439,50 @@ sp_engagement() {
     # snippets from counting as an address. Real addresses survive because only the
     # backtick-delimited content is blanked, not the surrounding text.
     { line = tolower($0); gsub(/`[^`]*`/, " ", line); buf = buf " " line }
-    END { flush(); print (last_mention+0) " " (mention_sender) " " (last_reply+0) " " (reply_target) }
+    END {
+      flush()
+      # FIFO scan with complete per-sender reply knowledge. A reply suppresses
+      # ONLY the mentions from its target sender that predate it (reply[sender]
+      # > k). A mention posted AFTER my reply to that sender, and any mention
+      # from a sender I never replied to, stays open — so later mentions from
+      # other senders always deliver instead of starving behind an
+      # already-answered oldest mention (Defect B). raw mode keeps the old
+      # forward-scan contract (first mention > since, answered or not) for
+      # reset --redeliver validation.
+      for (k = 1; k <= n; k++) {
+        if (k <= since) continue
+        if (b_auth[k] == who) continue
+        if (b_silent[k]) continue
+        if (b_buf[k] !~ "(^|[ \t])@(" who "|all)([^a-z0-9_-]|$)") continue
+        if (raw == "" && (b_auth[k] in reply) && (reply[b_auth[k]] > k)) continue
+        last_mention = k; mention_sender = b_auth[k]
+        break
+      }
+      print (last_mention+0) " " (mention_sender) " " (last_reply+0) " " (reply_target)
+    }
   ' "$PAD_MD"
+}
+
+# Return a stable identity for one exact, currently-open mention ordinal.
+# Empty/nonzero means the ordinal is absent, already answered by the same
+# sender, or malformed.  The digest binds reset recovery provenance to the
+# exact authored block rather than merely to a reusable numeric cursor.
+sp_open_mention_identity() {
+  local who="$1" ordinal="$2" engagement open sender last_reply reply_target block digest
+  case "$ordinal" in ''|0|0[0-9]*|*[!0-9]*) return 1;; esac
+  [ "${#ordinal}" -le 9 ] || return 1
+  engagement="$(sp_engagement "$who" "$((ordinal - 1))")"
+  read -r open sender last_reply reply_target <<<"$engagement"
+  [ "${open:-0}" = "$ordinal" ] || return 1
+  if [ "${last_reply:-0}" -gt "$ordinal" ] 2>/dev/null \
+    && [ -n "${sender:-}" ] && [ "${reply_target:-}" = "$sender" ]; then
+    return 1
+  fi
+  block="$(sp_latest_to "$who" "$((ordinal - 1))")"
+  [ -n "$block" ] || return 1
+  digest="$(printf '%s' "$block" | cksum | awk '{print $1 "-" $2}')"
+  [ -n "$digest" ] || return 1
+  printf '%s\n' "$digest"
 }
 
 # ── Terminal-identity locks (machine-global) ─────────────────────────
@@ -675,44 +2497,204 @@ sp_engagement() {
 # migrated machines use ~/.pasture-terminals (stage 2 moves the registry whole);
 # until then the legacy dir remains the single source of truth
 if [ -d "$HOME/.pasture-terminals" ]; then SP_TERMDIR="$HOME/.pasture-terminals"; else SP_TERMDIR="$HOME/.stitchpad-terminals"; fi
-sp_term_surface_of() { printf '%s' "$1"; }   # Herdr terminal ids and Ocean session ids are direct targets
+sp_term_surface_of() { # sanitize: a surface is a FILENAME under $SP_TERMDIR
+  # — refuse anything that could escape it (flash re-attack recommendation;
+  # the mutex mkdir caught "../" only incidentally).
+  case "$1" in ''|.|..|*/*|*".."*) return 1 ;; esac
+  printf '%s' "$1"
+}   # Herdr terminal ids and Ocean session ids are direct targets
 # The terminal id of THIS shell's Herdr pane. Herdr exports a pane id, so
 # resolve it to the stable terminal id used by roster targets and isolation locks.
+# MULTI-PAD (H3): when Herdr can't resolve a surface (non-herdr shell), fall
+# back to a session-env identity so the one-terminal-one-pad guard still has a
+# stable key instead of silently disabling itself. Session ids are already
+# first-class lock targets ("Ocean session ids are direct targets") and are
+# used RAW so the guard intersects with roster-target claims.
 sp_this_surface() {
+  local _s=""
   if [ -n "${HERDR_PANE_ID:-}" ] && command -v herdr >/dev/null 2>&1; then
-    herdr pane get "$HERDR_PANE_ID" 2>/dev/null \
-      | sed -n 's/.*"terminal_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1
+    _s="$(herdr pane get "$HERDR_PANE_ID" 2>/dev/null \
+      | sed -n 's/.*"terminal_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+  fi
+  if [ -z "$_s" ] && [ -n "${HERDR_PANE_ID:-}" ]; then
+    # herdr binary absent/unreachable but the pane id is exported: key on the
+    # pane id directly (rc7's F3 fix direction). Consistent between join and
+    # say inside the same pane; namespaced so it can never alias a term_* id.
+    local _p
+    _p="$(printf '%s' "$HERDR_PANE_ID" | tr -cd 'A-Za-z0-9._:-' | cut -c1-64)"
+    [ -n "$_p" ] && _s="pane-$_p"
+  fi
+  if [ -z "$_s" ]; then
+    local _cand
+    for _cand in "${STITCHPAD_SESSION:-}" "${CLAUDE_CODE_SESSION_ID:-}" "${CODEX_SESSION_ID:-}"; do
+      # path-clean, bounded, never "." / ".." / hidden
+      _cand="$(printf '%s' "$_cand" | tr -cd 'A-Za-z0-9._-' | cut -c1-64)"
+      case "$_cand" in ''|.*) continue ;; esac
+      _s="$_cand"; break   # RAW id: Ocean roster targets ARE session ids —
+                           # claim and say-guard must key identically
+    done
+  fi
+  # GAP 2 terminal-isolation: when STITCHPAD_TERMINAL_NAMESPACE is set,
+  # namespace the surface id so different fixtures with the same inherited
+  # session env vars (STITCHPAD_SESSION, CLAUDE_CODE_SESSION_ID, etc.) get
+  # distinct terminal claim files. Without this, two consecutive test runs
+  # sharing the runner's live session id collide on "REFUSED — terminal
+  # <id> is live as @alice" even when HOME is already fixture-isolated,
+  # because sp_this_surface() returns the LIVE session id in both fixtures.
+  local _ns="${STITCHPAD_TERMINAL_NAMESPACE:-}"
+  [ -n "$_ns" ] && _s="${_ns}:${_s}"
+  printf '%s' "$_s"
+  return 0
+}
+_sp_term_mutex_acquire() { # $1=surface — mkdir mutex for atomic claim (H4)
+  local m="$SP_TERMDIR/.mutex.$1" i mnow mtime
+  for i in $(seq 1 30); do
+    mkdir "$m" 2>/dev/null && return 0
+    mnow="$(date +%s)"; mtime="$(stat -f %m "$m" 2>/dev/null || stat -c %Y "$m" 2>/dev/null || echo 0)"
+    case "$mtime" in ''|*[!0-9]*) mtime=0 ;; esac
+    # stale-break: a claimant that died mid-claim never wedges the surface
+    if [ $((mnow - mtime)) -gt 10 ]; then rm -rf "$m" 2>/dev/null || true; continue; fi
+    python3 -c 'import time; time.sleep(0.1)' 2>/dev/null || sleep 1
+  done
+  return 1
+}
+_sp_term_mutex_release() { rm -rf "$SP_TERMDIR/.mutex.$1" 2>/dev/null || true; }
+# A claim line is "pad|name|epoch[|owner_pid|owner_start]". The 3-field form is
+# the legacy shape; the 5-field form lets a steal attempt distinguish a DEAD
+# owner (heartbeat gap → claim is fair game) from a LIVE one whose heartbeat
+# merely hiccuped (rc7 F4: timestamp-only steal evicts live owners).
+# identity-less posting evidence: prints the owning pad and returns 1 when
+# $1=name holds a LIVE identity-backed claim in a DIFFERENT pad; else 0.
+# Fresh index entries whose surface claim is mid-rotation (missing) also
+# count; stale entries are residue and never block.
+sp_term_byname_check() { # $1=name
+  local bk bf bpad bsurf bts now
+  bk="$(_sp_term_byname_key "$1")" || return 0
+  bf="$SP_TERMDIR/.byname.$bk"
+  [ -f "$bf" ] || return 0
+  IFS='|' read -r bpad bsurf bts < "$bf"
+  [ -n "$bpad" ] && [ -n "$bsurf" ] || return 0
+  [ "$bpad" = "$PAD_DIR" ] && return 0
+  now="$(date +%s)"
+  case "$bts" in ''|*[!0-9]*) bts=0 ;; esac
+  if _sp_term_claim_honored "$(cat "$SP_TERMDIR/$bsurf" 2>/dev/null)"; then
+    printf '%s' "$bpad"
+    return 1
+  fi
+  if [ ! -f "$SP_TERMDIR/$bsurf" ] && [ $((now - bts)) -lt 300 ]; then
+    printf '%s' "$bpad"
+    return 1
   fi
   return 0
 }
-sp_term_lock_claim() { # $1=target/surface $2=name — refuses on a live foreign claim
-  local surface who cur pad name ts now
-  surface="$(sp_term_surface_of "$1")"; who="$2"
+
+_sp_term_claim_honored() { # $1=claim-line → 0 if the claim must still be honored
+  local pad name ts pid pstart now
+  IFS='|' read -r pad name ts pid pstart <<<"$1"
+  now="$(date +%s)"
+  [ $((now - ${ts:-0})) -lt 300 ] && return 0
+  # Stale timestamp: honor the claim anyway when the recorded owner process is
+  # demonstrably alive (kill -0 + start-time match against pid reuse). A claim
+  # with no owner identity (legacy 3-field) falls back to timestamp-only.
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$pid" 2>/dev/null || return 1
+  if [ -n "$pstart" ]; then
+    [ "$(sp_process_start "$pid" 2>/dev/null)" = "$pstart" ] || return 1
+  fi
+  return 0
+}
+# Reverse name index (MP-2 fail-closed evidence): identity-shaped claims also
+# record $SP_TERMDIR/.byname.<name> = "pad|surface|epoch". A shell with NO
+# resolvable identity (env cleared — the trivial MP-2 bypass) consults this
+# index before posting: a LIVE identity-backed claim for the same name in a
+# DIFFERENT pad is positive ghost-post evidence and refuses. Only
+# IDENTITY-SHAPED surfaces index (herdr term_* ids, pane- fallbacks, session
+# ids/uuids) — arbitrary routing labels ("target-123", fixture names) do not,
+# so sequential same-name fixture moves stay legal.
+_sp_term_byname_key() { # $1=name → sanitized key (empty if unusable)
+  local k
+  k="$(printf '%s' "$1" | tr -cd 'A-Za-z0-9._-' | cut -c1-64)"
+  case "$k" in ''|.*) return 1 ;; esac
+  printf '%s' "$k"
+}
+_sp_term_surface_is_identity() { # $1=surface → 0 if identity-shaped
+  case "$1" in
+    term_[0-9a-fA-F]*)           return 0 ;;  # herdr terminal id
+    pane-*)                       return 0 ;;  # pane-id fallback
+    ????????-????-????-????-*)    return 0 ;;  # session-id / uuid roster target
+  esac
+  return 1
+}
+_sp_term_byname_write() { # $1=surface $2=name (best-effort; identity-shaped only)
+  _sp_term_surface_is_identity "$1" || return 0
+  local bk
+  bk="$(_sp_term_byname_key "$2")" || return 0
+  printf '%s|%s|%s' "$PAD_DIR" "$1" "$(date +%s)" > "$SP_TERMDIR/.byname.$bk" 2>/dev/null
+}
+_sp_term_byname_drop() { # $1=name — remove only if the entry is ours
+  local bk bf bpad bsurf bts
+  bk="$(_sp_term_byname_key "$1")" || return 0
+  bf="$SP_TERMDIR/.byname.$bk"
+  if [ -f "$bf" ]; then
+    IFS='|' read -r bpad bsurf bts < "$bf"
+    [ "$bpad" = "$PAD_DIR" ] && rm -f "$bf"
+  fi
+  return 0
+}
+
+sp_term_lock_claim() { # $1=target/surface $2=name [$3=owner_pid] — refuses on a live foreign claim
+  local surface who opid cur pad name ts now
+  surface="$(sp_term_surface_of "$1")"; who="$2"; opid="${3:-}"
   [ -n "$surface" ] && [ "$surface" != "-" ] || return 0
+  case "$opid" in ''|*[!0-9]*) opid="" ;; esac
+  [ -n "$opid" ] && ! kill -0 "$opid" 2>/dev/null && opid=""
   mkdir -p "$SP_TERMDIR"
+  # H4: the check-then-write below is only safe under the per-surface mutex;
+  # without it two pads claiming one surface concurrently both pass the check
+  # and both write (TOCTOU double-claim). Failure to take the mutex fails
+  # CLOSED — a claim that might not be exclusive must never succeed silently.
+  _sp_term_mutex_acquire "$surface" || {
+    echo "stitchpad: REFUSED — could not take the terminal-claim mutex for $surface (contention); retry." >&2
+    return 1
+  }
   cur="$(cat "$SP_TERMDIR/$surface" 2>/dev/null || true)"
   if [ -n "$cur" ]; then
     IFS='|' read -r pad name ts <<<"$cur"
-    now="$(date +%s)"
     if { [ "$pad" != "$PAD_DIR" ] || [ "$name" != "$who" ]; } \
-       && [ $((now - ${ts:-0})) -lt 300 ] && [ "${STITCHPAD_STEAL:-0}" != "1" ]; then
+       && _sp_term_claim_honored "$cur" && [ "${STITCHPAD_STEAL:-0}" != "1" ]; then
+      _sp_term_mutex_release "$surface"
       echo "stitchpad: REFUSED — terminal $surface is live as @$name in $pad. One terminal = one pad. 'stitchpad leave $name' there first, or STITCHPAD_STEAL=1 to take it over." >&2
       return 1
     fi
   fi
-  printf '%s|%s|%s' "$PAD_DIR" "$who" "$(date +%s)" > "$SP_TERMDIR/$surface"
+  if [ -n "$opid" ]; then
+    printf '%s|%s|%s|%s|%s' "$PAD_DIR" "$who" "$(date +%s)" "$opid" \
+      "$(sp_process_start "$opid" 2>/dev/null)" > "$SP_TERMDIR/$surface"
+  else
+    printf '%s|%s|%s' "$PAD_DIR" "$who" "$(date +%s)" > "$SP_TERMDIR/$surface"
+  fi
+  _sp_term_mutex_release "$surface"
+  _sp_term_byname_write "$surface" "$who"
+  return 0
 }
 sp_term_lock_touch() { # heartbeat path: refresh ours / claim vacant — NEVER steal
-  local surface who cur pad name ts
+  local surface who cur pad name ts pid pstart
   surface="$(sp_term_surface_of "$1")"; who="$2"
   [ -n "$surface" ] && [ "$surface" != "-" ] || return 0
   cur="$(cat "$SP_TERMDIR/$surface" 2>/dev/null || true)"
   if [ -n "$cur" ]; then
-    IFS='|' read -r pad name ts <<<"$cur"
+    IFS='|' read -r pad name ts pid pstart <<<"$cur"
     { [ "$pad" = "$PAD_DIR" ] && [ "$name" = "$who" ]; } || return 0
   fi
   mkdir -p "$SP_TERMDIR"
-  printf '%s|%s|%s' "$PAD_DIR" "$who" "$(date +%s)" > "$SP_TERMDIR/$surface"
+  # preserve owner identity across refreshes (never downgrade a 5-field claim)
+  if [ -n "${pid:-}" ]; then
+    printf '%s|%s|%s|%s|%s' "$PAD_DIR" "$who" "$(date +%s)" "$pid" "${pstart:-}" > "$SP_TERMDIR/$surface"
+  else
+    printf '%s|%s|%s' "$PAD_DIR" "$who" "$(date +%s)" > "$SP_TERMDIR/$surface"
+  fi
+  _sp_term_byname_write "$surface" "$who"
+  return 0
 }
 sp_term_lock_release() { # drop every claim this (pad, name) holds
   local who="$1" f pad name ts
@@ -721,6 +2703,7 @@ sp_term_lock_release() { # drop every claim this (pad, name) holds
     IFS='|' read -r pad name ts < "$f"
     [ "$pad" = "$PAD_DIR" ] && [ "$name" = "$who" ] && rm -f "$f"
   done
+  _sp_term_byname_drop "$who"
   return 0
 }
 sp_term_lock_check() { # $1=target $2=name → 0 ok; 1 = LIVE claim by someone else (prints holder)
@@ -728,9 +2711,28 @@ sp_term_lock_check() { # $1=target $2=name → 0 ok; 1 = LIVE claim by someone e
   surface="$(sp_term_surface_of "$1")"; who="$2"
   [ -n "$surface" ] && [ "$surface" != "-" ] || return 0
   cur="$(cat "$SP_TERMDIR/$surface" 2>/dev/null || true)"; [ -n "$cur" ] || return 0
-  IFS='|' read -r pad name ts <<<"$cur"; now="$(date +%s)"
-  [ $((now - ${ts:-0})) -ge 300 ] && return 0
-  if [ "$pad" != "$PAD_DIR" ] || [ "$name" != "$who" ]; then printf '%s' "$cur"; return 1; fi
+  IFS='|' read -r pad name ts <<<"$cur"
+  # honored = fresh timestamp OR live owner process (rc7 F4); neither → expired
+  _sp_term_claim_honored "$cur" || return 0
+  # A DIFFERENT PAD is the ghost-post this guard exists to kill: one terminal =
+  # one pad, always.
+  if [ "$pad" != "$PAD_DIR" ]; then printf '%s' "$cur"; return 1; fi
+  # Same pad, different name: that is a DELEGATED AGENT, not a resolver
+  # accident. A sub-agent (codex exec, a spawned helper, a CI runner) inherits
+  # its parent's terminal env, so the terminal is claimed by the LEAD while the
+  # helper legitimately posts as itself. Refusing it forced every delegated
+  # seat to hand its reports to the lead to re-post — for an entire build, in
+  # the case that produced this fix, which is also how a seat's findings can
+  # arrive late or not at all. Allow it when the name is genuinely on THIS
+  # pad's roster; anything else still refuses.
+  if [ "$name" != "$who" ]; then
+    if sp_roster 2>/dev/null | awk -F'|' -v w="$who" '
+         { n=$1; gsub(/^[ \t]+|[ \t]+$/, "", n); if (n == w) found=1 }
+         END { exit found ? 0 : 1 }'; then
+      return 0
+    fi
+    printf '%s' "$cur"; return 1
+  fi
   return 0
 }
 
@@ -779,9 +2781,48 @@ sp_any_alive() {
 # self-healing (roster/sp_any_alive skip stale mtime); this just reclaims disk.
 # Safe to call any time — it only removes things proven dead. Called on join
 # and on supervisor exit.
+sp_watch_stage_reap() {
+  [ -n "${PAD_STATE:-}" ] && [ -d "$PAD_STATE" ] && [ ! -L "$PAD_STATE" ] || return 0
+  local now stale f base pid mtime size age observed_mtime observed_size
+  now="$(date +%s)"
+  stale="$STITCHPAD_WATCH_STAGE_STALE_SECONDS"
+  case "$stale" in ''|*[!0-9]*) return 1 ;; esac
+  # Publication stages are never runtime authority.  Remove only an exact,
+  # bounded regular-file shape whose named publisher PID is dead and whose age
+  # exceeds the configured grace.  Symlinks, directories and richer names are
+  # preserved as evidence.
+  for f in "$PAD_STATE"/.watch-generation.* "$PAD_STATE"/.watch-launcher.* \
+           "$PAD_STATE"/.watch-launcher-transfer.* "$PAD_STATE"/.watch-owner.*; do
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    base="${f##*/}"
+    printf '%s\n' "$base" | grep -Eq \
+      '^\.watch-(generation|launcher|launcher-transfer|owner)\.[0-9]+\.[0-9]+$' \
+      || continue
+    pid="$(printf '%s\n' "$base" | sed -E \
+      's/^\.watch-(generation|launcher|launcher-transfer|owner)\.([0-9]+)\.[0-9]+$/\2/')"
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    kill -0 "$pid" 2>/dev/null && continue
+    mtime="$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || echo "$now")"
+    size="$(stat -f %z "$f" 2>/dev/null || stat -c %s "$f" 2>/dev/null || echo 999999)"
+    case "$mtime:$size" in *[!0-9:]*) continue ;; esac
+    [ "$size" -le 4096 ] || continue
+    age=$((now - mtime))
+    [ "$age" -ge "$stale" ] || continue
+    # Re-prove the leaf immediately before unlinking its name.
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    observed_mtime="$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || echo -1)"
+    observed_size="$(stat -f %z "$f" 2>/dev/null || stat -c %s "$f" 2>/dev/null || echo -1)"
+    [ "$observed_mtime" = "$mtime" ] && [ "$observed_size" = "$size" ] || continue
+    rm -f "$f" 2>/dev/null || return 1
+  done
+  return 0
+}
+
 sp_reap_dead() {
   [ -n "${PAD_STATE:-}" ] || return 0
   local now; now=$(date +%s)
+  sp_watch_stage_reap || true
   # 1. leftover atomic-write tmp files (.alive.<who>.<pid>) whose rename never
   #    completed — never read by anything, pure litter.
   for f in "$PAD_STATE"/.alive.*; do
@@ -804,7 +2845,9 @@ sp_reap_dead() {
     [ $(( now - ts )) -lt 90 ] && continue
     local pid; pid=$(grep -o '"pid":[0-9]*' "$f" 2>/dev/null | head -1 | cut -d: -f2)
     [ -z "$pid" ] || [ "$pid" = "0" ] && continue   # unknown/operator → keep
-    kill -0 "$pid" 2>/dev/null || rm -rf "$f" "$PAD_STATE/heartbeat.${f##*/alive.}.lock" 2>/dev/null
+    # Presence metadata is disposable; a ticker lock is not. Its generation
+    # protocol alone decides whether an owner/publisher may be stopped.
+    kill -0 "$pid" 2>/dev/null || rm -f "$f" 2>/dev/null
   done
   # 3. file-claims whose holder pid is gone (holder line: "<name> <ts> <path>";
   #    no pid recorded, so fall back to staleness — claims older than 1h are dead).
@@ -817,82 +2860,770 @@ sp_reap_dead() {
 }
 
 # Is the watcher running? (lock dir exists AND PID alive)
-sp_watcher_alive() {
-  local watch_lock="$PAD_STATE/watch.lock.d"
+# Diagnostic callers use this non-mutating probe. The operational sibling below
+# deliberately reclaims stale locks, so it must never back `status`/`health`.
+sp_watcher_alive_readonly() {
+  local watch_lock="$PAD_STATE/watch.lock.d" p
+  [ ! -L "$PAD_STATE" ] || return 1
+  [ ! -L "$watch_lock" ] || return 1
   [ -d "$watch_lock" ] || return 1
-  local ts now age
-  ts=$(cat "$watch_lock/ts" 2>/dev/null)
-  [ -n "$ts" ] && ts=$(date -ju -f '%Y-%m-%dT%H:%M:%SZ' "$ts" +%s 2>/dev/null || echo 0)
-  [ "$ts" = "0" ] && ts=$(stat -f %m "$watch_lock" 2>/dev/null || stat -c %Y "$watch_lock" 2>/dev/null || echo 0)
-  now=$(date +%s)
-  age=$(( now - ts ))
-  # Grace period (< 5s): trust the lock even if PID not registered yet.
-  # The watcher writes its real PID within 100ms of startup.
-  [ "$age" -lt 5 ] && return 0
-  # Older lock: check PID liveness.
-  local p; p="$(cat "$watch_lock/pid" 2>/dev/null)"
-  [ -n "$p" ] && kill -0 "$p" 2>/dev/null && return 0
-  # Dead or stale — clean so we can re-acquire.
-  rm -rf "$watch_lock" 2>/dev/null || true
+  [ ! -L "$watch_lock/pid" ] || return 1
+  p="$(cat "$watch_lock/pid" 2>/dev/null || true)"
+  case "$p" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$p" -gt 0 ] 2>/dev/null || return 1
+  kill -0 "$p" 2>/dev/null
+}
+
+sp_watch_owner_claim() {
+  local lock="$1" generation="$2" pid="$3" started command tmp
+  started="$(sp_process_start "$pid")"
+  command="$(sp_process_command "$pid")"
+  [ -n "$generation" ] && [ -n "$started" ] && [ -n "$command" ] || return 1
+  tmp="$PAD_STATE/.watch-owner.$pid.$RANDOM"
+  python3 - "$generation" "$pid" "$started" "$command" "$PAD_MD" > "$tmp" <<'PY'
+import json, sys
+generation, pid, started, command, pad = sys.argv[1:]
+print(json.dumps({
+    "generation": generation,
+    "pid": int(pid),
+    "processStart": started,
+    "command": command,
+    "pad": pad,
+}, separators=(",", ":")))
+PY
+  # Hard-link publication is atomic and non-overwriting. A contender can never
+  # replace a live owner's manifest between validation and fswatch startup.
+  [ -d "$lock" ] && [ "$(cat "$lock/generation" 2>/dev/null || true)" = "$generation" ] \
+    && [ -s "$tmp" ] && ln "$tmp" "$lock/owner" 2>/dev/null || {
+      rm -f "$tmp" 2>/dev/null || true
+      return 1
+    }
+  rm -f "$tmp" 2>/dev/null || true
+  sp_watch_owner_matches "$lock" "$generation" "$pid"
+}
+
+sp_watch_generation_write() {
+  local lock="$1" generation="$2" tmp="$PAD_STATE/.watch-generation.$$.$RANDOM"
+  sp_generation_is_safe "$generation" || return 1
+  printf '%s' "$generation" > "$tmp" || return 1
+  [ -d "$lock" ] && [ ! -e "$lock/generation" ] && [ ! -L "$lock/generation" ] \
+    && ln "$tmp" "$lock/generation" 2>/dev/null || {
+      rm -f "$tmp" 2>/dev/null || true
+      return 1
+    }
+  rm -f "$tmp" 2>/dev/null || true
+}
+
+sp_watch_launcher_write() {
+  local lock="$1" generation="$2" tmp="$PAD_STATE/.watch-launcher.$$.$RANDOM"
+  python3 - "$generation" "$PAD_MD" > "$tmp" <<'PY'
+import json, os, subprocess, sys
+generation, pad = sys.argv[1:]
+pid = os.getppid()
+def ps(field):
+    return subprocess.check_output(
+        ["ps", "-p", str(pid), "-o", field + "="], text=True
+    ).strip()
+print(json.dumps({
+    "generation": generation,
+    "pid": pid,
+    "processStart": ps("lstart"),
+    "command": ps("command"),
+    "pad": pad,
+}, separators=(",", ":")))
+PY
+  [ -d "$lock" ] && [ "$(cat "$lock/generation" 2>/dev/null || true)" = "$generation" ] \
+    && [ -s "$tmp" ] && ln "$tmp" "$lock/launcher" 2>/dev/null || {
+      rm -f "$tmp" 2>/dev/null || true
+      return 1
+    }
+  rm -f "$tmp" 2>/dev/null || true
+}
+
+sp_watch_launcher_is_valid() {
+  local lock="$1" generation="$2"
+  [ -f "$lock/launcher" ] || return 1
+  python3 - "$lock/launcher" "$generation" "$PAD_MD" <<'PY'
+import json, sys
+path, generation, pad = sys.argv[1:]
+try:
+    with open(path, encoding="utf-8") as handle:
+        owner = json.load(handle)
+    assert set(owner) == {"generation", "pid", "processStart", "command", "pad"}
+    assert owner["generation"] == generation and owner["pad"] == pad
+    assert isinstance(owner["pid"], int) and owner["pid"] > 0
+    assert all(isinstance(owner[k], str) and owner[k]
+               for k in ("processStart", "command"))
+except Exception:
+    raise SystemExit(1)
+PY
+}
+
+sp_watch_launcher_is_live() {
+  local lock="$1" pid started command
+  sp_watch_launcher_is_valid "$lock" "$(cat "$lock/generation" 2>/dev/null || true)" || return 1
+  pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$lock/launcher" 2>/dev/null || true)"
+  started="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["processStart"])' "$lock/launcher" 2>/dev/null || true)"
+  command="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["command"])' "$lock/launcher" 2>/dev/null || true)"
+  sp_process_identity_matches "$pid" "$started" "$command"
+}
+
+sp_watch_launcher_transfer_to_pid() {
+  local lock="$1" generation="$2" pid="$3" started command tmp
+  sp_watch_launcher_is_valid "$lock" "$generation" || return 1
+  # Only the exact process recorded as the current launcher may transfer its
+  # lease to the just-spawned supervisor.
+  python3 - "$lock/launcher" <<'PY' || return 1
+import json, os, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    owner = json.load(handle)
+raise SystemExit(0 if owner.get("pid") == os.getppid() else 1)
+PY
+  started="$(sp_process_start "$pid")"
+  command="$(sp_process_command "$pid")"
+  [ -n "$started" ] && [ -n "$command" ] || return 1
+  tmp="$PAD_STATE/.watch-launcher-transfer.$$.$RANDOM"
+  python3 - "$generation" "$pid" "$started" "$command" "$PAD_MD" > "$tmp" <<'PY'
+import json, sys
+generation, pid, started, command, pad = sys.argv[1:]
+print(json.dumps({
+    "generation": generation,
+    "pid": int(pid),
+    "processStart": started,
+    "command": command,
+    "pad": pad,
+}, separators=(",", ":")))
+PY
+  [ -d "$lock" ] && [ "$(cat "$lock/generation" 2>/dev/null || true)" = "$generation" ] \
+    && mv "$tmp" "$lock/launcher" || {
+      rm -f "$tmp" 2>/dev/null || true
+      return 1
+    }
+}
+
+sp_watch_owner_matches() {
+  local lock="$1" generation="$2" pid="$3" started command
+  [ -f "$lock/owner" ] || return 1
+  [ "$(cat "$lock/generation" 2>/dev/null || true)" = "$generation" ] || return 1
+  started="$(sp_process_start "$pid")"
+  command="$(sp_process_command "$pid")"
+  [ -n "$started" ] && [ -n "$command" ] || return 1
+  python3 - "$lock/owner" "$generation" "$pid" "$started" "$command" "$PAD_MD" <<'PY'
+import json, sys
+path, generation, pid, started, command, pad = sys.argv[1:]
+try:
+    with open(path, encoding="utf-8") as handle:
+        owner = json.load(handle)
+except Exception:
+    raise SystemExit(1)
+expected = {
+    "generation": generation,
+    "pid": int(pid),
+    "processStart": started,
+    "command": command,
+    "pad": pad,
+}
+raise SystemExit(0 if owner == expected else 1)
+PY
+}
+
+sp_watch_owner_is_valid() {
+  local lock="$1" generation="$2"
+  [ -f "$lock/owner" ] || return 1
+  [ "$(cat "$lock/generation" 2>/dev/null || true)" = "$generation" ] || return 1
+  python3 - "$lock/owner" "$generation" "$PAD_MD" <<'PY'
+import json, sys
+path, generation, pad = sys.argv[1:]
+try:
+    with open(path, encoding="utf-8") as handle:
+        owner = json.load(handle)
+    assert set(owner) == {"generation", "pid", "processStart", "command", "pad"}
+    assert owner["generation"] == generation and owner["pad"] == pad
+    assert isinstance(owner["pid"], int) and owner["pid"] > 0
+    assert all(isinstance(owner[k], str) and owner[k]
+               for k in ("processStart", "command"))
+except Exception:
+    raise SystemExit(1)
+PY
+}
+
+sp_watch_lock_remove_generation() {
+  local lock="$1" generation="$2" retired
+  retired="$(sp_watch_lock_retire_generation "$lock" "$generation")" || return 1
+  sp_watch_retired_cleanup "$retired"
+}
+
+sp_watch_lock_retire_generation() {
+  local lock="$1" generation="$2" retired="$1.retired.$2"
+  sp_generation_is_safe "$generation" \
+    && [ "$(cat "$lock/generation" 2>/dev/null || true)" = "$generation" ] || return 1
+  [ ! -e "$retired" ] || return 1
+  mv "$lock" "$retired" 2>/dev/null || return 1
+  printf '%s\n' "$retired"
+}
+
+sp_watch_retired_cleanup() {
+  local retired="$1"
+  rm -f "$retired/owner" "$retired/launcher" "$retired/pid" "$retired/ts" \
+    "$retired/heartbeat" "$retired/cancel" "$retired/generation" 2>/dev/null || true
+  rmdir "$retired" 2>/dev/null
+}
+
+sp_watch_cancel_generation() {
+  local lock="$1" generation="$2" tmp="$PAD_STATE/.watch-cancel.$$.$RANDOM"
+  sp_generation_is_safe "$generation" \
+    && [ "$(cat "$lock/generation" 2>/dev/null || true)" = "$generation" ] || return 1
+  if [ -f "$lock/cancel" ]; then
+    [ "$(cat "$lock/cancel" 2>/dev/null || true)" = "$generation" ]
+    return
+  fi
+  printf '%s' "$generation" > "$tmp" || return 1
+  [ "$(cat "$lock/generation" 2>/dev/null || true)" = "$generation" ] \
+    && ln "$tmp" "$lock/cancel" 2>/dev/null || {
+      rm -f "$tmp" 2>/dev/null || true
+      [ "$(cat "$lock/cancel" 2>/dev/null || true)" = "$generation" ]
+      return
+    }
+  rm -f "$tmp" 2>/dev/null || true
+}
+
+sp_watch_generation_cleanup() {
+  local lock="$1" generation="$2"
+  sp_generation_is_safe "$generation" \
+    && [ "$(cat "$lock/generation" 2>/dev/null || true)" = "$generation" ] || return 1
+  rm -f "$lock/owner" "$lock/launcher" "$lock/pid" "$lock/ts" "$lock/heartbeat" \
+    "$lock/cancel" "$lock/generation" 2>/dev/null || true
+  rmdir "$lock" 2>/dev/null
+}
+
+sp_watch_launcher_matches_pid() {
+  local lock="$1" generation="$2" pid="$3" recorded
+  sp_watch_launcher_is_valid "$lock" "$generation" || return 1
+  recorded="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$lock/launcher" 2>/dev/null || true)"
+  [ "$recorded" = "$pid" ] && sp_watch_launcher_is_live "$lock"
+}
+
+sp_watch_launcher_lease_is_fresh() {
+  local lock="$1" generation="$2" stamp now age
+  sp_watch_launcher_is_valid "$lock" "$generation" \
+    && sp_watch_launcher_is_live "$lock" || return 1
+  stamp="$(cat "$lock/heartbeat" 2>/dev/null || true)"
+  case "$stamp" in ''|*[!0-9]*)
+    stamp="$(stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || echo 0)"
+    ;;
+  esac
+  now="$(date +%s)"; age=$((now - stamp))
+  [ "$age" -ge 0 ] && [ "$age" -lt "${STITCHPAD_WATCH_RESTART_GRACE:-5}" ]
+}
+
+# OPEN #1 (watcher-races under load): a LIVE supervisor must never be scored
+# dead on ONE stale wall-clock observation. In the daemon's ownerless restart
+# gap the supervisor stamps $lock/heartbeat, sleeps 2s, and re-proves its own
+# ownership three times (each check forks python3) before stamping again — on
+# a busy machine that stretches past the restart grace while the process is
+# alive and merely descheduled, and the cost of the wrong verdict is a
+# CANCELLED LIVE GENERATION. Process-liveness (exact manifest + kill -0) is
+# load-robust and decides WHO holds the lock; the lease decides only whether
+# it is MAKING PROGRESS — and "no progress" needs two observations a full
+# grace apart with the SAME heartbeat stamp before it means dead. A single
+# slow moment can no longer cancel a live supervisor; a genuinely wedged one
+# is still reclaimed, one grace later than before.
+# Returns 0: treat the live launcher as ALIVE (first stale observation, or the
+#            stamp advanced since the last one — it is making progress).
+# Returns 1: launcher not live, or provably not progressing across a grace.
+sp_watch_live_launcher_stale_verdict() {
+  local lock="$1" generation="$2" strike="$PAD_STATE/.watch-stale-strike"
+  local stamp now prev prev_gen prev_rest prev_stamp prev_seen
+  sp_watch_launcher_is_live "$lock" || return 1
+  stamp="$(cat "$lock/heartbeat" 2>/dev/null || true)"
+  now="$(date +%s)"
+  prev="$(cat "$strike" 2>/dev/null || true)"
+  prev_gen="${prev%%|*}"; prev_rest="${prev#*|}"
+  prev_stamp="${prev_rest%%|*}"; prev_seen="${prev_rest#*|}"
+  if [ -n "$prev" ] && [ "$prev_gen" = "$generation" ] && [ "$prev_stamp" = "$stamp" ]; then
+    case "$prev_seen" in ''|*[!0-9]*) prev_seen="$now" ;; esac
+    if [ $((now - prev_seen)) -ge "${STITCHPAD_WATCH_RESTART_GRACE:-5}" ]; then
+      rm -f "$strike" 2>/dev/null || true
+      return 1
+    fi
+    return 0
+  fi
+  printf '%s|%s|%s' "$generation" "$stamp" "$now" > "$strike.tmp.$$" 2>/dev/null \
+    && mv "$strike.tmp.$$" "$strike" 2>/dev/null \
+    || rm -f "$strike.tmp.$$" 2>/dev/null || true
+  return 0
+}
+
+sp_watch_test_barrier_wait() {
+  local barrier="$1" label="$2" i=0 limit="${STITCHPAD_WATCH_TEST_BARRIER_TICKS:-500}"
+  case "$limit" in ''|*[!0-9]*) limit=500 ;; esac
+  printf '%s' ready > "$barrier.ready" || return 1
+  while [ ! -f "$barrier.release" ] && [ "$i" -lt "$limit" ]; do
+    sleep 0.01
+    i=$((i + 1))
+  done
+  [ -f "$barrier.release" ] && return 0
+  echo "stitchpad: $label test barrier timed out" >&2
   return 1
 }
 
-sp_watch_processes_for_pad() {
+sp_watch_empty_lock_reclaim() {
+  local lock="$1" now mtime age entries lock_pid
+  [ -d "$lock" ] || return 1
+  now="$(date +%s)"
+  mtime="$(stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || echo "$now")"
+  age=$((now - mtime))
+  [ "$age" -ge "$STITCHPAD_WATCH_START_GRACE" ] || return 1
+
+  # Case 1: a genuinely empty lock directory.
+  if [ -z "$(find "$lock" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
+    rmdir "$lock" 2>/dev/null
+    return $?
+  fi
+
+  # Case 2: THE WEDGE. Found live on the operator's fleet: a watcher lock holding
+  # `pid` and `ts` but no `generation`. The emptiness test above ran FIRST, so a
+  # non-empty lock returned 1 no matter how old it was or whether its pid was
+  # dead — and `watch start` then refused with "fresh or unknown ownerless
+  # watcher lock left untouched" forever. Measured on a real pad: pid 14088 dead,
+  # lock 39136 seconds (nearly 11 hours) old, every push seat on that pad deaf
+  # the entire time while `lanes` reported them WORKING. Nothing self-heals it;
+  # the only cure was deleting the directory by hand, which no operator knows to
+  # do because the message calls an 11-hour-old lock "fresh".
+  # Reclaim ONLY this exact known shape, and only when the recorded pid is gone.
+  # An unrecognised lock layout still fails closed — its contents are not
+  # ownership proof and guessing is how a live watcher gets killed.
+  # ABSOLUTE FLOOR, and it is load-bearing. The empty-lock case above is gated on
+  # STITCHPAD_WATCH_START_GRACE, which suites routinely set to 0 for speed — and
+  # `pid` + `ts` with no `generation` is ALSO the shape a watcher has for the
+  # instant between claiming its lock and publishing ownership. With grace at 0
+  # this branch would reclaim a watcher that was legitimately starting, which is
+  # precisely the churn W1-W4 exist to prevent. It turned watcher-races.sh red
+  # intermittently the first time I wrote it, and standalone runs looked clean.
+  # A real wedged lock in production is HOURS old (measured: 39136s and 40357s),
+  # so refusing to touch anything younger than a minute costs nothing and closes
+  # the startup window. Overridable only so a gate can exercise the path.
+  [ "$age" -ge "${STITCHPAD_WATCH_STALE_MIN:-60}" ] || return 1
+  entries="$(find "$lock" -mindepth 1 -maxdepth 1 -exec basename {} \; 2>/dev/null | sort | tr '\n' ' ')"
+  case "$entries" in
+    'pid '|'pid ts ') ;;
+    *) return 1 ;;
+  esac
+  lock_pid=""
+  read -r lock_pid < "$lock/pid" 2>/dev/null
+  case "$lock_pid" in ''|*[!0-9]*) return 1 ;; esac
+  # Still running -> never reclaim. (A pid we cannot signal is not ours, so it is
+  # not our watcher either; same reasoning as the pad lock's claim marker.)
+  kill -0 "$lock_pid" 2>/dev/null && return 1
+  rm -f "$lock/pid" "$lock/ts" 2>/dev/null || true
+  rmdir "$lock" 2>/dev/null
+}
+
+# Reclaim only the exact crash shape left after singleton acquisition published
+# its generation but died before publishing launcher authority.  Richer or
+# malformed lock directories remain fail-closed.  Retirement is generation-CAS
+# by directory rename, so a resumed stale publisher cannot attach to a newer
+# generation and no PID is ever signalled from this ownerless evidence.
+sp_watch_generation_only_lock_reclaim() {
+  local lock="$1" generation now mtime age only
+  [ "$lock" = "$PAD_STATE/watch.lock.d" ] || return 1
+  [ ! -L "$PAD_STATE" ] && [ ! -L "$lock" ] || return 1
+  [ -d "$lock" ] && [ -f "$lock/generation" ] && [ ! -L "$lock/generation" ] || return 1
+  generation="$(cat "$lock/generation" 2>/dev/null || true)"
+  sp_generation_is_safe "$generation" || return 1
+  only="$(find "$lock" -mindepth 1 -maxdepth 1 -print 2>/dev/null || true)"
+  [ "$only" = "$lock/generation" ] || return 1
+  now="$(date +%s)"
+  mtime="$(stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || echo "$now")"
+  age=$((now - mtime))
+  [ "$age" -ge "$STITCHPAD_WATCH_START_GRACE" ] || return 2
+  [ "$(cat "$lock/generation" 2>/dev/null || true)" = "$generation" ] || return 1
+  sp_watch_lock_remove_generation "$lock" "$generation"
+}
+
+sp_watcher_alive() {
+  local watch_lock="$PAD_STATE/watch.lock.d"
+  sp_watch_stage_reap || true
+  [ -d "$watch_lock" ] || return 1
+  local generation pid observed reclaim_rc
+  generation="$(cat "$watch_lock/generation" 2>/dev/null || true)"
+  if [ -z "$generation" ]; then
+    sp_watch_empty_lock_reclaim "$watch_lock" 2>/dev/null || true
+    return 1
+  fi
+  if ! sp_watch_launcher_is_valid "$watch_lock" "$generation"; then
+    sp_watch_generation_only_lock_reclaim "$watch_lock" 2>/dev/null
+    reclaim_rc=$?
+    [ "$reclaim_rc" -eq 0 ] && return 1
+    if [ "$reclaim_rc" -eq 2 ]; then
+      echo "stitchpad: watcher admission is still within startup grace" >&2
+    else
+      echo "stitchpad: malformed or unknown watcher lock left untouched" >&2
+    fi
+    return 1
+  fi
+  if [ -f "$watch_lock/owner" ]; then
+    if ! sp_watch_owner_is_valid "$watch_lock" "$generation"; then
+      echo "stitchpad: malformed watcher owner left untouched" >&2
+      return 1
+    fi
+    pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$watch_lock/owner" 2>/dev/null || true)"
+    if sp_watch_owner_matches "$watch_lock" "$generation" "$pid"; then return 0; fi
+    # A daemon's exact live launcher may be between child generations. Remove
+    # only the stale child proof and preserve that fresh supervisor lease.
+    if sp_watch_launcher_lease_is_fresh "$watch_lock" "$generation"; then
+      observed="$(cat "$watch_lock/owner" 2>/dev/null || true)"
+      [ -n "$observed" ] && [ "$(cat "$watch_lock/owner" 2>/dev/null || true)" = "$observed" ] \
+        && rm -f "$watch_lock/owner" "$watch_lock/pid" "$watch_lock/ts" 2>/dev/null || true
+      return 0
+    fi
+    # Stale lease but the launcher itself is verifiably LIVE: defer the death
+    # verdict until no-progress is proven across a full grace (OPEN #1). No
+    # mutation here — fresh evidence or a matured strike decides the next call.
+    if sp_watch_live_launcher_stale_verdict "$watch_lock" "$generation"; then
+      return 0
+    fi
+    sp_watch_lock_remove_generation "$watch_lock" "$generation" 2>/dev/null || true
+    return 1
+  fi
+  # A valid launcher owns the bounded pre-owner startup or daemon restart gap.
+  if sp_watch_launcher_lease_is_fresh "$watch_lock" "$generation"; then return 0; fi
+  if ! sp_watch_launcher_is_live "$watch_lock"; then
+    sp_watch_lock_remove_generation "$watch_lock" "$generation" 2>/dev/null || true
+    return 1
+  fi
+  # Live launcher, stale lease: one slow moment is not death (OPEN #1).
+  if sp_watch_live_launcher_stale_verdict "$watch_lock" "$generation"; then
+    return 0
+  fi
+  echo "stitchpad: live launcher has not published a watcher owner" >&2
+  return 1
+}
+
+sp_watch_pairs_for_pad() {
   [ -n "${PAD_MD:-}" ] || return 0
-  ps -axo pid=,ppid=,command= | awk -v pad="$PAD_MD" '
-    index($0, "fswatch -0 " pad) && $0 !~ /awk/ {
-      print $1
-      print $2
-    }
-  ' | sort -nu
+  local pid parent comm command exe args parent_command parent_exe parent_args proven_parent
+  # Filter by the kernel-reported executable name first, then require the full
+  # command to be exactly `fswatch -0 $PAD_MD`. A process merely containing
+  # that text in another argv can never enter the signal candidate set.
+  ps -axo pid=,ppid=,comm= | while read -r pid parent comm; do
+    [ "${comm##*/}" = "fswatch" ] || continue
+    command="$(sp_process_command "$pid")"
+    exe="${command%% *}"; args="${command#"$exe"}"; args="${args# }"
+    [ "${exe##*/}" = "fswatch" ] && [ "$args" = "-0 $PAD_MD" ] || continue
+    proven_parent=0
+    if [ "$parent" -gt 1 ] 2>/dev/null; then
+      parent_command="$(sp_process_command "$parent")"
+      parent_exe="${parent_command%% *}"
+      parent_args="${parent_command#"$parent_exe"}"; parent_args="${parent_args# }"
+      # Signal a non-PID1 parent only when it is this checkout's exact watch.sh
+      # invocation. An unrelated parent never inherits the child's authority.
+      if [ "${parent_exe##*/}" = "bash" ] \
+        && [ "$parent_args" = "$STITCHPAD_HOME/bin/watch.sh" ]; then
+        proven_parent="$parent"
+      fi
+    fi
+    printf '%s %s\n' "$pid" "$proven_parent"
+  done
+}
+
+sp_watch_processes_for_pad() {
+  local child parent
+  while read -r child parent; do
+    [ -n "$child" ] && printf '%s\n' "$child"
+    [ "${parent:-0}" -gt 1 ] 2>/dev/null && printf '%s\n' "$parent"
+  done < <(sp_watch_pairs_for_pad)
+}
+
+sp_watcher_identity_sha256() {
+  local pid="$1" command="$2" exe args comm artifact
+  exe="${command%% *}"; args="${command#"$exe"}"; args="${args# }"
+  if [ "${exe##*/}" = "fswatch" ] && [ "$args" = "-0 $PAD_MD" ]; then
+    comm="$(ps -p "$pid" -o comm= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    case "$comm" in /*) artifact="$comm" ;; *) artifact="$(command -v "$exe" 2>/dev/null || true)" ;; esac
+  elif [ "${exe##*/}" = "bash" ] && [ "$args" = "$STITCHPAD_HOME/bin/watch.sh" ]; then
+    artifact="$STITCHPAD_HOME/bin/watch.sh"
+  elif [ "${exe##*/}" = "bash" ] && [ "$args" = "$STITCHPAD_HOME/bin/daemon.sh start" ]; then
+    artifact="$STITCHPAD_HOME/bin/daemon.sh"
+  else
+    return 1
+  fi
+  [ -f "$artifact" ] || return 1
+  python3 - "$artifact" <<'PY'
+import hashlib, sys
+digest = hashlib.sha256()
+with open(sys.argv[1], "rb") as handle:
+    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        digest.update(chunk)
+print(digest.hexdigest())
+PY
+}
+
+sp_watcher_identity_matches() {
+  local pid="$1" expected_start="$2" expected_command="$3" expected_sha="$4" current_sha
+  sp_process_identity_matches "$pid" "$expected_start" "$expected_command" || return 1
+  current_sha="$(sp_watcher_identity_sha256 "$pid" "$expected_command" 2>/dev/null || true)"
+  [ -n "$expected_sha" ] && [ "$current_sha" = "$expected_sha" ]
 }
 
 sp_watch_fswatch_parents_for_pad() {
-  [ -n "${PAD_MD:-}" ] || return 0
-  ps -axo pid=,ppid=,command= | awk -v pad="$PAD_MD" '
-    index($0, "fswatch -0 " pad) && $0 !~ /awk/ {
-      print $2
-    }
-  ' | sort -nu
+  local child parent
+  while read -r child parent; do
+    [ "${parent:-0}" -gt 1 ] 2>/dev/null && printf '%s\n' "$parent"
+  done < <(sp_watch_pairs_for_pad)
+}
+
+sp_stop_delivery_worker() {
+  local name="$1" lock="$PAD_STATE/delivery.$1.worker.lock.d" pid token owner command
+  local owner_start owner_token owner_pad owner_name live_start born age tries=0
+  [ -d "$lock" ] || return 0
+  token="$(cat "$lock/token" 2>/dev/null || true)"
+  # Mark intent first. A launcher that has created the lock but not yet spawned
+  # must observe this and abort; an already-starting worker checks it before and
+  # during atomic owner publication.
+  : > "$lock/stop-requested" 2>/dev/null || true
+  while :; do
+    [ -d "$lock" ] || return 0
+    owner="$(cat "$lock/owner" 2>/dev/null || true)"
+    IFS='|' read -r pid owner_start owner_token owner_pad owner_name <<< "$owner"
+    if [ -z "$owner_name" ] && [ "$owner_token" = "$PAD_DIR" ] && [ "$owner_pad" = "$name" ]; then
+      # Rolling-upgrade compatibility with pid|token|pad|name owners.
+      owner_name="$name"; owner_pad="$PAD_DIR"; owner_token="$owner_start"
+      owner_start="$(ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)"
+    fi
+    if [ -n "$pid" ] && [ -n "$owner_start" ] && [ "$owner_token" = "$token" ] \
+       && [ "$owner_pad" = "$PAD_DIR" ] && [ "$owner_name" = "$name" ]; then
+      break
+    fi
+    born="$(cat "$lock/born" 2>/dev/null || stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || echo 0)"
+    age=$(( $(date +%s) - ${born:-0} ))
+    tries=$((tries + 1))
+    [ "$tries" -lt 200 ] && [ "$age" -lt 5 ] || { pid=""; break; }
+    sleep 0.01
+  done
+  live_start="$(ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)"
+  command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && [ "$live_start" = "$owner_start" ] \
+     && [[ "$command" == *"--delivery-worker $name $token"* ]]; then
+    kill "$pid" 2>/dev/null || true
+    # The worker's TERM trap may spend up to five seconds completing one bounded
+    # Ocean cancellation request. Let that exact cleanup finish before KILL.
+    for _ in $(seq 1 120); do kill -0 "$pid" 2>/dev/null || break; sleep 0.05; done
+    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+  fi
+  [ "$(cat "$lock/token" 2>/dev/null || true)" = "$token" ] && rm -rf "$lock"
+}
+
+sp_delivery_ocean_unresolved_after_stop() {
+  local name="$1" state pending_adapter submit generation turn_file turn_id result
+  state="$(sed -n 's/^state=//p' "$PAD_STATE/delivery.$name.state" 2>/dev/null | tail -1)"
+  case "$state" in acceptance_unknown|cancel_pending) return 0;; esac
+  # A delivery whose OWN state file already records a terminal outcome is
+  # resolved, full stop. Without this, the loop below demanded a
+  # `delivery.<name>.cancel.<turn_id>/result` file — which only ever exists when
+  # somebody issued a CANCEL. A turn that simply ERRORED never produces one, so
+  # `result` came back empty, the loop returned "unresolved", and `leave` and
+  # `rename` refused that seat FOREVER:
+  #     stitchpad: refusing to remove @codex — Ocean acceptance/cancellation
+  #     outcome is unresolved
+  # Hit live on the operator's fleet with delivery.codex.state already saying
+  # state=errored / turn_status=errored. A seat whose session is broken is
+  # exactly the seat you most need to be able to remove, and it was the one seat
+  # you could not. Terminal is terminal, however it was reached.
+  case "$state" in errored|completed|canceled|cancelled|delivered) return 1;; esac
+  pending_adapter="$(cut -d'|' -f6 "$PAD_STATE/delivery.$name.pending" 2>/dev/null || true)"
+  [ "$pending_adapter" = ocean ] || return 1
+  for submit in "$PAD_STATE"/delivery."$name".submit.*; do
+    [ -f "$submit" ] || continue
+    generation="${submit##*.submit.}"
+    [ -s "$PAD_STATE/delivery.$name.turn.$generation" ] || return 0
+  done
+  for turn_file in "$PAD_STATE"/delivery."$name".turn.*; do
+    [ -s "$turn_file" ] || continue
+    turn_id="$(cat "$turn_file" 2>/dev/null || true)"
+    result="$(cat "$PAD_STATE/delivery.$name.cancel.$turn_id/result" 2>/dev/null || true)"
+    case "$result" in canceled|completed|errored|cancelled) ;;
+      *) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+sp_stop_delivery_workers() {
+  local lock name
+  for lock in "$PAD_STATE"/delivery.*.worker.lock.d; do
+    [ -d "$lock" ] || continue
+    name="${lock##*/delivery.}"; name="${name%.worker.lock.d}"
+    sp_stop_delivery_worker "$name"
+  done
 }
 
 sp_stop_watchers_for_pad() {
   [ -n "${PAD_STATE:-}" ] || return 0
   local watch_lock="$PAD_STATE/watch.lock.d"
-  local p pids=()
-  p="$(cat "$watch_lock/pid" 2>/dev/null || true)"
-  [ -n "$p" ] && pids+=( "$p" )
+  # A scalar list avoids macOS Bash 3.2 treating an empty declared array as an
+  # unbound variable under `set -u`.
+  local p pids="" records="" started command sha start64 command64 remaining i=0 generation owner_pid launcher_pid reclaim_rc
+  sp_watch_stage_reap || true
+  # Do not trust a bare PID file: the PID may have been reused. The exact
+  # fswatch command path below proves both the fixture child and its live
+  # parent relationship before either PID enters the signal list.
   while IFS= read -r p; do
-    [ -n "$p" ] && pids+=( "$p" )
+    [ -n "$p" ] && pids="$pids $p"
   done < <(sp_watch_processes_for_pad)
+  generation="$(cat "$watch_lock/generation" 2>/dev/null || true)"
+  if [ -d "$watch_lock" ] && [ -z "$generation" ]; then
+    sp_watch_empty_lock_reclaim "$watch_lock" 2>/dev/null && return 0
+    # Say WHICH it is and how old, and name the cure. "fresh or unknown" on an
+    # 11-hour-old lock sent the operator looking for a live watcher that had been
+    # dead all night.
+    _wl_age="unknown"
+    _wl_mt="$(stat -f %m "$watch_lock" 2>/dev/null || stat -c %Y "$watch_lock" 2>/dev/null || true)"
+    [ -n "$_wl_mt" ] && _wl_age="$(( $(date +%s) - _wl_mt ))s"
+    echo "stitchpad: watcher lock for $PAD_MD is ${_wl_age} old, carries no ownership generation, and its contents are not a shape this version can verify — left untouched. Push seats on this pad receive NOTHING until it is resolved. Inspect: ls -la $watch_lock" >&2
+    return 1
+  fi
+  if [ -d "$watch_lock" ] && ! sp_watch_launcher_is_valid "$watch_lock" "$generation"; then
+    sp_watch_generation_only_lock_reclaim "$watch_lock" 2>/dev/null
+    reclaim_rc=$?
+    [ "$reclaim_rc" -eq 0 ] && return 0
+    if [ "$reclaim_rc" -eq 2 ]; then
+      echo "stitchpad: watcher admission is still within startup grace for $PAD_MD" >&2
+    else
+      echo "stitchpad: malformed or unknown watcher lock left untouched for $PAD_MD" >&2
+    fi
+    return 1
+  fi
+  if [ -f "$watch_lock/owner" ]; then
+    if ! sp_watch_owner_is_valid "$watch_lock" "$generation"; then
+      echo "stitchpad: malformed watcher ownership left untouched for $PAD_MD" >&2
+      return 1
+    fi
+    owner_pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$watch_lock/owner" 2>/dev/null || true)"
+    if sp_watch_owner_matches "$watch_lock" "$generation" "$owner_pid"; then
+      pids="$pids $owner_pid"
+    else
+      # Valid manifest + identity mismatch proves the recorded watcher is gone.
+      # Reclaim its generation below without signaling the reused PID.
+      :
+    fi
+  fi
+  if [ -d "$watch_lock" ]; then
+    launcher_pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$watch_lock/launcher" 2>/dev/null || true)"
+    sp_watch_launcher_is_live "$watch_lock" && pids="$pids $launcher_pid"
+  fi
 
-  rm -rf "$watch_lock" 2>/dev/null || true
-  for p in "${pids[@]}"; do
-    kill "$p" 2>/dev/null || true
+  # Snapshot a full process identity while the exact fswatch child/parent
+  # relationship is observable. Numeric PIDs alone are never retained as
+  # signal authority across the TERM→KILL window.
+  for p in $pids; do
+    started="$(sp_process_start "$p")"
+    command="$(sp_process_command "$p")"
+    sha="$(sp_watcher_identity_sha256 "$p" "$command" 2>/dev/null || true)"
+    start64="$(sp_b64_encode "$started")"
+    command64="$(sp_b64_encode "$command")"
+    [ -n "$started" ] && [ -n "$command" ] && [ -n "$sha" ] \
+      && records="${records}${p}|${sha}|${start64}|${command64}"$'\n'
   done
+
+  if [ -n "$generation" ]; then
+    # Keep canonical occupied until every exact old-generation process is dead;
+    # otherwise a delayed owner link can land in a successor generation.
+    sp_watch_cancel_generation "$watch_lock" "$generation" || return 1
+  else
+    # P39. This was a bare `rmdir` with NO grace and NO ownership check, and an
+    # independent probe (k3) caught it red-handed. Its log, one failing run:
+    #     won-mkdir       49290
+    #     stop-rmdir-late 49291   <- 49291 deletes the lock 49290 just won
+    #     won-mkdir       49291   <- so 49291 wins it too
+    #     genwrite-fail   49290   <- 49290's generation write fails, lock gone
+    # Totals for that run: 16 won-mkdir, 12 genwrite-fail, 9 stop-rmdir-late,
+    # only 4 spawned. Six "winners" of ONE atomic mkdir is the signature.
+    # The guard further up only returns early when the lock ALREADY EXISTS at
+    # that instant; a caller that evaluated it a moment before the real winner's
+    # mkdir falls through to here and deletes a brand-new, legitimately-owned
+    # lock. The owner's generation write then fails with ENOENT, it tears down
+    # silently, and the next caller repeats — so no watcher is ever spawned and
+    # watch.log is never even created.
+    # sp_watch_empty_lock_reclaim does the same job but honours
+    # STITCHPAD_WATCH_START_GRACE, so a lock younger than the grace is left to
+    # its acquirer. A genuinely abandoned empty lock is still reclaimed once it
+    # ages past the grace, so crash recovery (watcher-races) is unchanged.
+    sp_watch_empty_lock_reclaim "$watch_lock" 2>/dev/null || true
+  fi
+  while IFS='|' read -r p sha start64 command64; do
+    [ -n "$p" ] || continue
+    started="$(sp_b64_decode "$start64" 2>/dev/null || true)"
+    command="$(sp_b64_decode "$command64" 2>/dev/null || true)"
+    sp_watcher_identity_matches "$p" "$started" "$command" "$sha" \
+      && kill "$p" 2>/dev/null || true
+  done <<< "$records"
   sleep 0.2
-  for p in "${pids[@]}"; do
-    kill -0 "$p" 2>/dev/null && kill -KILL "$p" 2>/dev/null || true
+  while IFS='|' read -r p sha start64 command64; do
+    [ -n "$p" ] || continue
+    started="$(sp_b64_decode "$start64" 2>/dev/null || true)"
+    command="$(sp_b64_decode "$command64" 2>/dev/null || true)"
+    sp_watcher_identity_matches "$p" "$started" "$command" "$sha" \
+      && kill -KILL "$p" 2>/dev/null || true
+  done <<< "$records"
+  # Do not report teardown complete while an exact fixture process is still
+  # visible. This also lets init reap a just-killed fswatch child before tests
+  # assert zero process residue.
+  while [ "$i" -lt 20 ]; do
+    remaining="$(sp_watch_processes_for_pad)"
+    [ -z "$remaining" ] && break
+    sleep 0.05
+    i=$((i + 1))
   done
+  if [ -n "$generation" ]; then
+    sp_watch_generation_cleanup "$watch_lock" "$generation" 2>/dev/null || true
+  else
+    # P39, the DOMINANT deleter — k3's probe labelled this one "stop-rmdir-late"
+    # and caught 9 hits in a single failing run against only 4 spawns.
+    # Its window is far wider than the earlier site: we reach here AFTER the
+    # process-wait loop above, which can spin for a full second. A caller that
+    # entered with no lock ($generation empty) can sit in that second while a
+    # DIFFERENT caller legitimately wins mkdir — and then this bare rmdir deletes
+    # that brand-new, owned lock. The owner's generation write fails with ENOENT,
+    # it tears down silently, the next caller wins mkdir, and the cascade repeats
+    # until nobody spawns at all and watch.log is never created.
+    # Only remove a lock we can PROVE is abandoned: the graced reclaim refuses
+    # anything younger than STITCHPAD_WATCH_START_GRACE and only removes an empty
+    # one, so a live acquirer keeps its lock while a genuinely orphaned lock is
+    # still reclaimed once it ages out.
+    sp_watch_empty_lock_reclaim "$watch_lock" 2>/dev/null || true
+  fi
+  # Teardown is "complete" only if nothing is left. If a live acquirer now owns a
+  # fresh lock that is honestly NOT complete, and the explicit stop path reports
+  # it rather than claiming success.
+  [ -z "${remaining:-}" ] && [ ! -d "$watch_lock" ]
 }
 
 sp_reap_duplicate_watchers_for_pad() {
   [ -n "${PAD_STATE:-}" ] || return 0
   local watch_lock="$PAD_STATE/watch.lock.d"
-  local keep parent parents=()
-  keep="$(cat "$watch_lock/pid" 2>/dev/null || true)"
-  if [ -z "$keep" ] || ! kill -0 "$keep" 2>/dev/null; then
-    sp_stop_watchers_for_pad
-    return 1
+  local generation keep="" child parent only_parent="" count=0
+  generation="$(cat "$watch_lock/generation" 2>/dev/null || true)"
+  if [ -f "$watch_lock/owner" ] && sp_watch_owner_is_valid "$watch_lock" "$generation"; then
+    keep="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$watch_lock/owner" 2>/dev/null || true)"
+    sp_watch_owner_matches "$watch_lock" "$generation" "$keep" || keep=""
   fi
-
-  while IFS= read -r parent; do
-    [ -n "$parent" ] && parents+=( "$parent" )
-  done < <(sp_watch_fswatch_parents_for_pad)
-
-  if [ "${#parents[@]}" -eq 1 ] && [ "${parents[0]}" = "$keep" ]; then
-    return 0
-  fi
+  # Count exact fswatch children, not merely their proven watch.sh parents.
+  # A watch.sh SIGKILL can leave an exact orphan (reported as parent 0); that
+  # child is still a duplicate and must force exact teardown/restart.
+  while read -r child parent; do
+    [ -n "$child" ] || continue
+    only_parent="${parent:-0}"; count=$((count + 1))
+  done < <(sp_watch_pairs_for_pad)
+  [ "$count" -eq 1 ] && [ -n "$keep" ] && [ "$only_parent" = "$keep" ] && return 0
+  # No fswatch during the bounded startup/restart phase is healthy when the
+  # exact supervisor lease is fresh; do not cancel it based on a missing pid.
+  [ "$count" -eq 0 ] && sp_watch_launcher_lease_is_fresh "$watch_lock" "$generation" && return 0
+  # Same judgment under load (OPEN #1): a stale lease on a verifiably LIVE
+  # launcher is not death until no-progress is proven across a full grace —
+  # this reap runs right after sp_watcher_alive said yes, and cancelling here
+  # would undo that verdict on the same slow moment.
+  [ "$count" -eq 0 ] && sp_watch_live_launcher_stale_verdict "$watch_lock" "$generation" && return 0
 
   sp_stop_watchers_for_pad
   return 1
@@ -901,7 +3632,8 @@ sp_reap_duplicate_watchers_for_pad() {
 ensure_watcher() {
   [ -n "${PAD_DIR:-}" ] || sp_init_paths || return 0
   local watch_lock="$PAD_STATE/watch.lock.d"
-  local watch_log="$PAD_STATE/watch.log"
+  local watch_log="$PAD_STATE/watch.log" watch_generation
+  sp_watch_stage_reap || true
   # Only spawn if someone is alive and listening
   sp_any_alive || return 0
   # Already running? Nothing to do.
@@ -917,16 +3649,577 @@ ensure_watcher() {
     # Lost the race. Brief sleep lets winner write its PID, then re-check.
     sleep 0.3
     sp_watcher_alive && return 0
-    # Stale lock. Clean and retry once.
-    rm -rf "$watch_lock" 2>/dev/null || true
-    mkdir "$watch_lock" 2>/dev/null || return 0
+    # Unknown/ownerless contention fails closed; a later ensure can retry after
+    # the exact stop path reconciles it.
+    return 0
   fi
-  # Spawn the watcher. No trap — the watcher removes the lock on exit.
-  ( STITCHPAD_PAD_DIR="$PAD_DIR" bash "$STITCHPAD_HOME/bin/watch.sh" >>"$watch_log" 2>&1 ) &
-  # Placeholder PID+ts so concurrent callers see a fresh lock during the grace
-  # period. The watcher overwrites both with its real PID on startup.
-  echo $$ > "$watch_lock/pid"
+  if [ -n "${STITCHPAD_WATCH_TEST_AFTER_MKDIR_BARRIER:-}" ]; then
+    local watch_mkdir_barrier="$STITCHPAD_WATCH_TEST_AFTER_MKDIR_BARRIER"
+    printf '%s' ready > "$watch_mkdir_barrier.ready"
+    while [ ! -f "$watch_mkdir_barrier.release" ]; do sleep 0.01; done
+  fi
+  watch_generation="$(date +%s).$$.${RANDOM:-0}"
+  sp_watch_generation_write "$watch_lock" "$watch_generation" || {
+    rmdir "$watch_lock" 2>/dev/null || true
+    return 0
+  }
+  if [ -n "${STITCHPAD_WATCH_TEST_AFTER_GENERATION_BARRIER:-}" ]; then
+    local watch_generation_barrier="$STITCHPAD_WATCH_TEST_AFTER_GENERATION_BARRIER"
+    sp_watch_test_barrier_wait "$watch_generation_barrier" "watch generation" || {
+      sp_watch_lock_remove_generation "$watch_lock" "$watch_generation" 2>/dev/null || true
+      return 1
+    }
+  fi
+  sp_watch_launcher_write "$watch_lock" "$watch_generation" || {
+    sp_watch_lock_remove_generation "$watch_lock" "$watch_generation" 2>/dev/null || true
+    return 0
+  }
   date -u +%Y-%m-%dT%H:%M:%SZ > "$watch_lock/ts"
+  # Spawn the watcher. No trap — the watcher removes the lock on exit.
+  ( STITCHPAD_PAD_DIR="$PAD_DIR" STITCHPAD_WATCH_GENERATION="$watch_generation" \
+      bash "$STITCHPAD_HOME/bin/watch.sh" >>"$watch_log" 2>&1 ) &
+  # The watcher atomically claims owner and publishes its own PID. Until then,
+  # ts supplies only a brief startup grace—never signal authority.
   disown %-
   return 0
 }
+
+# TASK-7 per-model telemetry (best-effort; never fails a primary operation).
+# Must load LAST so every consumer (stitchpad, watch.sh, daemon.sh,
+# seat-keeper.sh, tui.sh) gets it without any dependency ordering.
+# Self-derive BIN_DIR when a consumer sources lib.sh directly (tests do this
+# without exporting BIN_DIR) — telemetry must never break that contract.
+_TEL_BIN="${BIN_DIR:-$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+
+# ── P3 Artifact Contract ─────────────────────────────────────────────────
+# A dispatched lane declares its expected artifact. A turn that ends without
+# producing that artifact is a FAILED turn, visible on the board — never silent.
+# This closes the most expensive defect of the build: a seat that produces
+# nothing is indistinguishable from one that is working.
+
+# sp_artifact_declare <name> <path> [path...]
+# Write expected artifact paths for a seat.  Each path is a file or directory
+# that must exist when the turn terminates.  Call on dispatch; the lanes board
+# checks these against reality.
+sp_artifact_declare() {
+  local name="${1:?usage: sp_artifact_declare <name> <path>...}" artifact
+  shift
+  [ $# -gt 0 ] || { echo "stitchpad: artifact_declare requires at least one path" >&2; return 1; }
+  local claim_file="$PAD_STATE/artifact-expect.$name"
+  printf '' > "$claim_file.tmp.$$" || return 1
+  for artifact in "$@"; do
+    printf '%s\n' "$artifact" >> "$claim_file.tmp.$$"
+  done
+  mv "$claim_file.tmp.$$" "$claim_file" || return 1
+  return 0
+}
+
+# sp_artifact_verify <name>
+# Check every artifact declared for <name> exists on disk.  Returns 0 if all
+# present (or none declared), 1 if any missing (prints missing paths to stderr).
+# sp_artifact_produced <path>
+# THE oracle for "did this artifact actually get produced". Existence is NOT
+# sufficiency, proved live: a dispatched seat returned rc=0 having written only
+# the stub header it was told to create first, and the board scored it present.
+# An empty file and no file are the same amount of work. A directory with no
+# entries likewise.
+sp_artifact_produced() {
+  local path="${1:-}"
+  [ -n "$path" ] || return 1
+  if [ -d "$path" ]; then
+    [ -n "$(ls -A "$path" 2>/dev/null)" ] || return 1
+    return 0
+  fi
+  [ -s "$path" ]
+}
+
+sp_artifact_verify() {
+  local name="${1:?usage: sp_artifact_verify <name>}" claim_file path missing=0
+  claim_file="$PAD_STATE/artifact-expect.$name"
+  [ -f "$claim_file" ] || return 0  # no claim = nothing to verify
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    if ! sp_artifact_produced "$path"; then
+      if [ -e "$path" ]; then echo "  empty: $path" >&2
+      else echo "  missing: $path" >&2; fi
+      missing=1
+    fi
+  done < "$claim_file"
+  return "$missing"
+}
+
+# sp_artifact_expected <name>
+# Print the expected artifact paths for <name>, one per line.  Empty if none.
+sp_artifact_expected() {
+  local name="${1:-}" claim_file
+  [ -n "$name" ] || return 0
+  claim_file="$PAD_STATE/artifact-expect.$name"
+  [ -f "$claim_file" ] && cat "$claim_file" || true
+}
+
+# sp_artifact_clear <name>
+# Remove the artifact claim for <name> (turn complete, artifacts verified).
+sp_artifact_clear() {
+  local name="${1:?usage: sp_artifact_clear <name>}"
+  rm -f "$PAD_STATE/artifact-expect.$name"
+}
+
+# ── Per-seat state, in one place ─────────────────────────────────────────
+# SP_SEAT_STATE_PREFIXES — every simple name-keyed file under .state/ that the
+# tool owns, as `<prefix>.<name>`. It was born inside the `rename` arm, where an
+# omission was never cosmetic: .state/ocean-session.<old> once survived a rename
+# and seat-keeper logged "SEAT NOT ON ROSTER" forever for a name that no longer
+# existed. It lives here now because `leave` needs the SAME answer to the same
+# question — what belongs to exactly one seat — and two lists would rot apart in
+# opposite directions: rename stranding state, leave orphaning it.
+SP_SEAT_STATE_PREFIXES="seen seen.relay count alive role level runtime forcewake dnd
+  delivered_no_reply ocean-session seat-model resolved-model model
+  keeper-strike keeper-obs keeper-last supervise-strikes
+  artifact-expect authority scope scope-cleared scope-violation
+  operator-grant pending departed"
+
+# SP_SEAT_STATE_KEEP_ON_LEAVE — the deliberate exceptions to the purge below.
+#   scope-violation.<name>  the seat overstepped its scope; scope-authority.sh
+#                           calls that record "sticky" on purpose and `scope
+#                           --violations` reports it across the pad's life. It
+#                           is an incident record, not a lane, and a departure
+#                           is not an acquittal.
+#   departed.<name>         written BY the purge as its own receipt (see below).
+SP_SEAT_STATE_KEEP_ON_LEAVE="scope-violation departed"
+
+# sp_leave_purge_seat_state <name>
+# Retire everything the lanes board, the watchdog and seat-keeper still believe
+# about a seat that has formally left.
+#
+# THE FAILURE THIS ENDS: `leave` used to drop the roster row and stop there, so
+# .state/artifact-expect.<name> stayed behind — and the lanes board is built from
+# roster ∪ session-registry ∪ artifact-expect.*. A seat that left hours ago kept
+# its row, permanently reading `ARTIFACT: NO  VERDICT: FAILED`, because the
+# contract it could no longer possibly fulfil was still on disk. Two dead seats
+# sat on the board as FAILED for a whole night. The repo has paid for this shape
+# before (test/bridge-heartbeat-interval.sh: doctor flagged a healthy bridge as
+# stale on every check) and the lesson was the same — a board that always shows
+# a failure teaches everyone to stop reading the board.
+#
+# Only files keyed to THIS seat are touched. Shared state (the pad, the session
+# registry, watch/lock directories, claims held by others) is never in scope.
+# Caller must hold the pad lock: these are the same .state writes every other
+# mutation serialises on.
+sp_leave_purge_seat_state() {
+  local who="${1:?usage: sp_leave_purge_seat_state <name>}" pfx keep k f leftover=""
+  [ -n "${PAD_STATE:-}" ] || return 0
+  for pfx in $SP_SEAT_STATE_PREFIXES; do
+    keep=0
+    for k in $SP_SEAT_STATE_KEEP_ON_LEAVE; do [ "$pfx" = "$k" ] && { keep=1; break; }; done
+    [ "$keep" -eq 1 ] && continue
+    rm -f "$PAD_STATE/$pfx.$who" 2>/dev/null || true
+  done
+  # Compound keys the prefix loop cannot express. Each is still one seat's:
+  #   authority.<name>.seal      the HMAC over that seat's authority level
+  #   pending.<name>.reset       that seat's pending-reset marker
+  #   operator-grant.<name>.<op> per-operation grants; a departed seat keeps no
+  #                              standing authorisation — a returning @name must
+  #                              be granted again, never inherit silently
+  #   spawn.<name>.{parent,brief,at}  its lineage row. `spawn --tree` exists to
+  #                              show WHO asked for a seat that is now silent; a
+  #                              seat that announced its departure is not silent,
+  #                              and the brief itself was posted to the pad, so
+  #                              the durable copy is in git either way.
+  #   seen.relay.<padkey>.<name> per-relay read cursor (name is the LAST field)
+  rm -f "$PAD_STATE/authority.$who.seal" "$PAD_STATE/pending.$who.reset" 2>/dev/null || true
+  rm -f "$PAD_STATE"/operator-grant."$who".* 2>/dev/null || true
+  rm -f "$PAD_STATE"/spawn."$who".* 2>/dev/null || true
+  rm -f "$PAD_STATE"/seen.relay.*."$who" 2>/dev/null || true
+  # DELIBERATELY LEFT ALONE, and none of it is a lane source:
+  #   session-registry.jsonl + session-{start,end,activity}.<sid>, sessions/<sid>
+  #     the append-only lifecycle audit trail and its identity bindings. `leave`
+  #     WRITES to it (the seat's `terminal` event); deleting the record of a
+  #     departure to hide a departure is not a fix.
+  #   heartbeat.<name>.lock/  the ticker owns that directory and `heartbeat
+  #     --stop` is its owner-checked teardown. Racing it from here orphans a
+  #     live ticker — `rename` declines to move it for the same reason.
+  #   .watchdog-*.<name>, .busy-ack*.<name>.*  post-mortem breadcrumbs an
+  #     operator reads AFTER a seat dies. Hidden files; no surface derives a
+  #     verdict from them.
+  #
+  # POST-CONDITION, in rename's spirit: an allow-list is guaranteed to rot, so
+  # rather than trust it, look for what it was meant to eliminate. Anything left
+  # keyed to this name that we did not deliberately keep is reported — loud, not
+  # silent, and not deleted on a guess.
+  for f in "$PAD_STATE"/*."$who"; do
+    [ -e "$f" ] || continue
+    pfx="$(basename "$f")"; pfx="${pfx%".$who"}"; keep=0
+    for k in $SP_SEAT_STATE_KEEP_ON_LEAVE; do [ "$pfx" = "$k" ] && { keep=1; break; }; done
+    [ "$keep" -eq 1 ] && continue
+    leftover="${leftover:+$leftover }$(basename "$f")"
+  done
+  if [ -n "$leftover" ]; then
+    echo "stitchpad: note — state still keyed to the departed @$who: $leftover" >&2
+    echo "  it will keep answering for a seat that is gone. Add the prefix to" >&2
+    echo "  SP_SEAT_STATE_PREFIXES (or to SP_SEAT_STATE_KEEP_ON_LEAVE, with a reason)." >&2
+  fi
+  # The receipt, written LAST so the purge above cannot eat it. This is the only
+  # positive evidence anywhere on disk that @who left on purpose rather than
+  # vanished mid-turn, and the lanes board needs exactly that distinction: a
+  # crashed seat must keep its row and its verdict, a departed one must not.
+  printf '%s\n' "$(date +%s)" > "$PAD_STATE/departed.$who" 2>/dev/null || true
+}
+
+# sp_wake_mode_for <name> — the roster's wake column for a seat: pull|push|"".
+# Roster rows are `name | adapter | wake | target`.
+sp_wake_mode_for() {
+  local name="${1:-}" row
+  [ -n "$name" ] || return 0
+  # deepseek F6: this took the FIRST matching row and stopped. The roster is
+  # hand-editable and bridge-writable, and nothing downstream rejects a repeated
+  # name, so a seat with rows `dale|cli|pull|-` and `dale|cli|push|sess-999`
+  # answered "pull" here while the watcher (which iterates ALL rows) dispatched
+  # the push one. Every consumer of this helper then reasoned about a seat that
+  # was not the one being delivered to.
+  # Fail CLOSED on the ambiguity: if ANY row for this name says push, the seat is
+  # push. Push is the answer with consequences — it is the mode whose delivery
+  # belongs to the watcher and must never be consumed by a caller's terminal.
+  row="$(sp_roster 2>/dev/null | awk -F'|' -v n="$name" '
+    { gsub(/^[ \t]+|[ \t]+$/, "", $1); gsub(/^[ \t]+|[ \t]+$/, "", $3)
+      if (tolower($1) == tolower(n)) { if ($3 == "push") { print "push"; hit=1; exit } if (first == "") first = $3 } }
+    END { if (!hit && first != "") print first }')"
+  printf '%s' "$row"
+}
+
+# deepseek F6: names carrying more than one roster row. A duplicate is never
+# legitimate — `join` refuses one (case-insensitively, and rejects the unicode
+# homoglyphs that used to slip past) — so any duplicate arrived by hand edit,
+# bridge write or merge, and every consumer that disagrees about which row is
+# real is a delivery bug waiting to happen. Prints the lowercased names.
+sp_roster_dupes() {
+  sp_roster 2>/dev/null | cut -d'|' -f1 | tr 'A-Z' 'a-z' | sort | uniq -d
+}
+
+# ── P46 Contract supervision ─────────────────────────────────────────────
+# A dispatched turn does the first concrete thing it is told and stops. Measured
+# five times across k3 and deepseek-v4-flash: every seat returned rc=0 having
+# written only its stub header, and one given four SPECIFIC claims to verify
+# still produced a scaffold. So the limit is not prompt breadth — a wake turn
+# executes a short explicit sequence and does not sustain open-ended work.
+#
+# What is ours to fix is that dispatch is ONE SHOT WITH NO FEEDBACK LOOP: the
+# turn ends, nobody checks the contract, and nobody tells the agent it is not
+# finished. Under P45 the orchestrator cannot even read what the agent said, so
+# the silence is total.
+#
+# Supervision closes that loop with the pieces that already exist:
+# sp_artifact_produced answers "did anything actually get made", and the pad's
+# mention path is the delivery mechanism that provably works. Deliberately NOT
+# in the watcher: that is live delivery machinery, and this is an additive
+# bookkeeping layer that must not be able to destabilise it.
+
+sp_supervise_strikes() {   # $1=name -> current strike count (0 if none)
+  local name="${1:?}" f
+  [ -n "${PAD_STATE:-}" ] || { printf '0'; return 0; }
+  f="$PAD_STATE/supervise-strikes.$name"
+  if [ -f "$f" ]; then printf '%s' "$(cat "$f" 2>/dev/null || echo 0)"; else printf '0'; fi
+}
+sp_supervise_strike_add() {
+  local name="${1:?}" n
+  n=$(( $(sp_supervise_strikes "$name") + 1 ))
+  printf '%s' "$n" > "$PAD_STATE/supervise-strikes.$name" || return 1
+  printf '%s' "$n"
+}
+sp_supervise_clear() {
+  local name="${1:?}"
+  rm -f "$PAD_STATE/supervise-strikes.$name" 2>/dev/null || true
+}
+
+# ── P42 Delegation Contract — sub-agent spawning ─────────────────────────
+# EC: "they also need the ability to spawn their own sub-agents if they need to,
+# all within this context ... and it should always be following the orchestrator's
+# request."
+#
+# Two halves, and the second is the one that matters. Spawning is easy; the hard
+# part is that a sub-agent three levels down still answers to the orchestrator and
+# is still SCORED. So delegation here is a contract, not a fork():
+#   · every spawn declares an artifact (P3) — an unscoreable seat cannot be created
+#   · every spawn inherits the orchestrator's standing directive VERBATIM, down
+#     the whole chain, so depth cannot dilute the original request
+#   · lineage is durable, so `lanes` can attribute a silent seat to whoever spawned it
+#   · depth and fan-out are bounded, because an agent that can spawn agents can
+#     spawn a fork bomb, and this fleet runs on the operator's laptop
+#
+# State lives in $PAD_STATE/spawn.<child>.{parent,brief,at}; the directive is one
+# pad-wide file. All plain text — readable with `cat` when something goes wrong,
+# which is the standard the rest of this tool holds itself to.
+
+STITCHPAD_SPAWN_MAX_DEPTH="${STITCHPAD_SPAWN_MAX_DEPTH:-3}"
+STITCHPAD_SPAWN_MAX_CHILDREN="${STITCHPAD_SPAWN_MAX_CHILDREN:-5}"
+
+# sp_directive_set <text>   — record the orchestrator's standing directive.
+# sp_directive              — print it (empty if never set).
+# This is what "always follow the orchestrator's request" is MADE of: the text is
+# copied into every spawn brief at every depth, so a sub-sub-agent reads the
+# operator's actual words, not its parent's paraphrase of them.
+sp_directive_set() {
+  local text="${1:?usage: sp_directive_set <text>}"
+  printf '%s\n' "$text" > "$PAD_STATE/orchestrator-directive.tmp.$$" || return 1
+  mv "$PAD_STATE/orchestrator-directive.tmp.$$" "$PAD_STATE/orchestrator-directive"
+}
+sp_directive() {
+  [ -f "$PAD_STATE/orchestrator-directive" ] && cat "$PAD_STATE/orchestrator-directive" || true
+}
+
+# sp_spawn_record <child> <parent> <brief>
+sp_spawn_record() {
+  local child="${1:?}" parent="${2:?}" brief="${3:-}"
+  printf '%s\n' "$parent" > "$PAD_STATE/spawn.$child.parent" || return 1
+  printf '%s\n' "$brief"  > "$PAD_STATE/spawn.$child.brief"  || return 1
+  date -u +%Y-%m-%dT%H:%M:%SZ > "$PAD_STATE/spawn.$child.at"  || return 1
+  return 0
+}
+
+# sp_spawn_parent <child> — print the spawning agent, empty if root/unspawned.
+sp_spawn_parent() {
+  local child="${1:-}"
+  [ -n "$child" ] || return 0
+  [ -n "${PAD_STATE:-}" ] || return 0
+  [ -f "$PAD_STATE/spawn.$child.parent" ] && head -1 "$PAD_STATE/spawn.$child.parent" || true
+}
+
+# sp_spawn_depth <name> — 0 for a seat nobody spawned, 1 for its children, etc.
+# Cycle-safe by construction: the walk is capped at 64 hops, so a corrupted or
+# hand-edited state directory degrades to a refusal instead of hanging the caller.
+sp_spawn_depth() {
+  local name="${1:-}" depth=0 hops=0 parent
+  while [ "$hops" -lt 64 ]; do
+    parent="$(sp_spawn_parent "$name")"
+    [ -n "$parent" ] || break
+    depth=$((depth + 1)); hops=$((hops + 1)); name="$parent"
+  done
+  printf '%s' "$depth"
+}
+
+# sp_spawn_is_ancestor <maybe_ancestor> <name> — rc 0 when the first argument
+# appears anywhere up the second's parent chain. Guards against `a` spawning `b`
+# spawning `a`, which would make depth accounting meaningless.
+sp_spawn_is_ancestor() {
+  local anc="${1:-}" name="${2:-}" hops=0 parent
+  [ -n "$anc" ] || return 1
+  while [ "$hops" -lt 64 ]; do
+    parent="$(sp_spawn_parent "$name")"
+    [ -n "$parent" ] || return 1
+    [ "$parent" = "$anc" ] && return 0
+    name="$parent"; hops=$((hops + 1))
+  done
+  return 1
+}
+
+# sp_spawn_children <name> — direct children, one per line.
+sp_spawn_children() {
+  local name="${1:-}" f child
+  [ -n "$name" ] || return 0
+  [ -n "${PAD_STATE:-}" ] || return 0
+  for f in "$PAD_STATE"/spawn.*.parent; do
+    [ -f "$f" ] || continue
+    [ "$(head -1 "$f")" = "$name" ] || continue
+    child="${f##*/spawn.}"; child="${child%.parent}"
+    printf '%s\n' "$child"
+  done
+}
+
+# sp_spawn_tree [root] — indented lineage with each seat's artifact contract.
+# Printed by `stitchpad spawn --tree`; this is how an operator sees WHO asked for
+# a seat that is now silent, which was previously unrecoverable.
+sp_spawn_tree() {
+  local root="${1:-}" indent="${2:-}" child kids seat
+  if [ -z "$root" ]; then
+    for seat in $(sp_roster 2>/dev/null | cut -d'|' -f1 | tr -d ' '); do
+      [ -n "$seat" ] || continue
+      [ -n "$(sp_spawn_parent "$seat")" ] && continue   # not a root
+      sp_spawn_tree "$seat" ""
+    done
+    return 0
+  fi
+  local art; art="$(sp_artifact_expected "$root" | tr '\n' ' ')"
+  if [ -n "$art" ]; then printf '%s@%s → %s\n' "$indent" "$root" "$art"
+  else printf '%s@%s\n' "$indent" "$root"; fi
+  kids="$(sp_spawn_children "$root")"
+  for child in $kids; do sp_spawn_tree "$child" "$indent  "; done
+}
+
+# sp_lanes_display — produce a pipe-delimited lanes table.
+# Columns: name|session_status|last_age_s|artifact_expected|artifact_present|verdict
+# Verdicts: WORKING (artifact present), FAILED (artifact missing after terminal),
+#           PENDING (active/idle, no artifact yet), UNKNOWN (no session data).
+# This is the board the operator uses to see every seat's real output.
+# Every lane the board knows about: session registry ∪ artifact claims ∪ roster.
+# Extracted so `lanes` and `lanes --json` cannot disagree about who exists —
+# --json used to list ONLY seats with an artifact claim, so a quarantined seat
+# without one was invisible to every dashboard and cron that reads it (k3 F0).
+sp_lanes_names() {
+  local proj names roster_names claim cn rn rest n
+  proj="${1:-$(sp_session_registry_project 2>/dev/null || echo '[]')}"
+  names="$(echo "$proj" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    data = []
+for s in data:
+    n = s.get('name','')
+    if n: print(n)
+" 2>/dev/null)"
+  for claim in "$PAD_STATE"/artifact-expect.*; do
+    [ -f "$claim" ] || continue
+    cn="${claim##*/artifact-expect.}"
+    echo "$names" | grep -qxF "$cn" 2>/dev/null || names="$names"$'\n'"$cn"
+  done
+  roster_names=""
+  while IFS='|' read -r rn rest; do
+    rn="$(printf '%s' "$rn" | tr -d '[:space:]')"
+    [ -n "$rn" ] || continue
+    roster_names="$roster_names$rn"$'\n'
+    echo "$names" | grep -qxF "$rn" 2>/dev/null || names="$names"$'\n'"$rn"
+  done <<< "$(sp_roster 2>/dev/null || true)"
+  # A seat that formally LEFT is not a lane. `leave` purges its per-seat state,
+  # but it also appends that seat's `terminal` lifecycle event to the session
+  # registry — one of the three sources unioned above — so a departed seat kept
+  # its row on the strength of the very record saying it was gone, and aged
+  # from WORKING into a permanent FAILED/STALE nobody could clear.
+  # The filter is POSITIVE evidence only, all three at once: the departure
+  # receipt on disk, AND no roster row, AND no outstanding artifact contract.
+  # Rejoin, or take a new contract, and the lane comes straight back. Nothing is
+  # hidden by inference — a roster we merely failed to READ must never be able
+  # to blank the board, which is exactly what "not in the roster" alone would do.
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    if [ -f "$PAD_STATE/departed.$n" ] \
+      && ! printf '%s' "$roster_names" | grep -qxF "$n" 2>/dev/null \
+      && [ ! -f "$PAD_STATE/artifact-expect.$n" ]; then
+      continue
+    fi
+    printf '%s\n' "$n"
+  done <<< "$(echo "$names" | sort -u | sed '/^$/d')"
+}
+
+sp_lanes_display() {
+  local proj name status age_s claim_file present verdict art_display
+  proj="$(sp_session_registry_project 2>/dev/null || echo '[]')"
+  # ONE definition of "who has a lane", shared with `lanes --json`. This block
+  # used to be a hand-copied duplicate of sp_lanes_names — same three sources,
+  # same sort — which is precisely how the two surfaces drifted apart the last
+  # time (--json listed only seats with an artifact claim). A rule the board
+  # applies to who exists has to live in one function or it will diverge again.
+  local names=""
+  names="$(sp_lanes_names "$proj")"
+  [ -z "$names" ] && { echo "no lanes — no roster members and no artifact claims"; return 0; }
+  printf '%-12s %-12s %6s %-20s %-12s %-16s\n' "LANE" "STATUS" "AGE" "ARTIFACT" "PRESENT" "VERDICT"
+  printf '%-12s %-12s %6s %-20s %-12s %-16s\n' "------------" "------------" "------" "--------------------" "------------" "----------------"
+  local _now; _now="$(date +%s)"
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    # Get session status from registry projection
+    status="$(echo "$proj" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for s in data:
+    if s.get('name','') == '$name':
+        print(s.get('status',''))
+        sys.exit(0)
+print('unknown')
+" 2>/dev/null)"
+    [ -z "$status" ] && status="unknown"
+    # A seat with no OCEAN SESSION is not necessarily absent. `lanes` derived
+    # status purely from the session registry, so a freshly joined cli/pull seat
+    # — heartbeating, on the roster, demonstrably alive — read "unknown/UNKNOWN"
+    # on the board. That is the first thing a new operator sees after `join`, and
+    # it flatly contradicts `roster` and the watcher, both of which consider that
+    # seat alive. Fall back to the SAME liveness rule the rest of the tool uses
+    # (sp_any_alive, watch.sh react): a heartbeat file whose mtime is under 90s
+    # counts as alive, whether or not it carries a pid.
+    if [ "$status" = "unknown" ] && [ -f "$PAD_STATE/alive.$name" ]; then
+      _lane_hb="$(stat -f %m "$PAD_STATE/alive.$name" 2>/dev/null || stat -c %Y "$PAD_STATE/alive.$name" 2>/dev/null || echo 0)"
+      _lane_age=$(( $(date +%s) - _lane_hb ))
+      [ "$_lane_age" -lt 90 ] && status="alive"
+    fi
+    # Age since last activity
+    age_s="$(echo "$proj" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for s in data:
+    if s.get('name','') == '$name':
+        la = s.get('last_activity', 0)
+        if la:
+            import time
+            print(int(time.time()) - la)
+        else:
+            print('?')
+        sys.exit(0)
+print('?')
+" 2>/dev/null)"
+    [ -z "$age_s" ] && age_s="?"
+    # Age from the heartbeat when the session registry has none. Must run AFTER
+    # age_s is computed above, or it is simply overwritten.
+    if [ "$age_s" = "?" ] && [ "$status" = "alive" ] && [ -f "$PAD_STATE/alive.$name" ]; then
+      _lane_hb2="$(stat -f %m "$PAD_STATE/alive.$name" 2>/dev/null || stat -c %Y "$PAD_STATE/alive.$name" 2>/dev/null || echo 0)"
+      age_s=$(( $(date +%s) - _lane_hb2 ))
+    fi
+    # Artifact check
+    art_display=""
+    if [ -f "$PAD_STATE/artifact-expect.$name" ]; then
+      art_display="$(head -1 "$PAD_STATE/artifact-expect.$name")"
+      if sp_artifact_verify "$name" 2>/dev/null; then
+        present="YES"
+      else
+        present="NO"
+      fi
+    else
+      art_display="-"
+      present="-"
+    fi
+    # Truncate artifact display
+    if [ "${#art_display}" -gt 20 ]; then
+      art_display="${art_display:0:17}..."
+    fi
+    # Verdict
+    verdict=""
+    case "$status" in
+      terminal)
+        if [ "$present" = "NO" ]; then verdict="FAILED"
+        elif [ "$present" = "YES" ]; then verdict="COMPLETE"
+        else verdict="TERMINAL"; fi ;;
+      stale)  verdict="STALE" ;;
+      idle)   verdict="IDLE" ;;
+      active) verdict="WORKING" ;;
+      alive)
+        # Heartbeating, but no Ocean session — a cli/pull seat. Its artifact
+        # contract still decides the verdict; absent one it is simply WORKING.
+        if [ "$present" = "NO" ]; then verdict="FAILED"
+        elif [ "$present" = "YES" ]; then verdict="DONE"
+        else verdict="WORKING"; fi ;;
+      unknown)
+        if [ "$present" = "NO" ]; then verdict="FAILED"
+        elif [ "$present" = "YES" ]; then verdict="DONE"
+        else verdict="UNKNOWN"; fi ;;
+    esac
+    # k3 F0: the watchdog can GIVE UP on a seat — three consecutive wakes that
+    # left the same mention unanswered quarantines it and seat-keeper stops
+    # waking it "until someone looks". `lanes` is the board the operator looks
+    # AT, and it did not know this state existed: a quarantined seat with a live
+    # heartbeat rendered WORKING. The one surface that should have said "this
+    # seat has been abandoned" was the one saying everything was fine.
+    # A verdict is a claim about a seat; it cannot ignore the component whose
+    # entire job is deciding that seat is not answering.
+    _lane_strikes="$(cat "$PAD_STATE/keeper-strike.$name" 2>/dev/null || echo 0)"
+    case "$_lane_strikes" in ''|*[!0-9]*) _lane_strikes=0 ;; esac
+    if [ "$_lane_strikes" -ge "${SEAT_KEEPER_MAX_STRIKES:-3}" ]; then
+      verdict="QUARANTINED"
+    elif [ "$_lane_strikes" -gt 0 ]; then
+      verdict="$verdict!$_lane_strikes"      # strikes accruing, not yet given up on
+    fi
+    printf '%-12s %-12s %6s %-20s %-12s %-16s\n' \
+      "$name" "$status" "${age_s}s" "$art_display" "$present" "$verdict"
+  done <<< "$names"
+}
+if [ -f "$_TEL_BIN/telemetry.sh" ]; then
+  # shellcheck disable=SC1091
+  source "$_TEL_BIN/telemetry.sh"
+fi
+unset _TEL_BIN
