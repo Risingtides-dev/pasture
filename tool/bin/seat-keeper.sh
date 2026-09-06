@@ -1,0 +1,602 @@
+#!/usr/bin/env bash
+# seat-keeper v2 — anti-starvation watchdog for pasture/stitchpad Ocean seats.
+#
+# WHY v1 EXISTED: wakes are mention-driven. A seat with no NEW @mentions but an
+# unfinished task queue idles forever (this killed deepseek overnight on
+# rust-parity, 2026-08-01).
+#
+# WHY v2 EXISTS: v1 read `count.<seat>` as a backlog depth. It is neither a
+# backlog nor maintained. It is the CUMULATIVE count of pad lines addressing
+# @seat or @all (lib.sh sp_count_to), written ONCE at watcher startup
+# (watch.sh:45) and never touched again by the react loop — vestigial. So
+# `gate > 0` means "has ever been mentioned", not "has unread mentions". On
+# rust-parity that misreading woke codex and glm every 10 minutes for two days
+# (~570 paid turns) against a pad that mentions neither, while deepseek — the
+# seat v1 was written to save — sat untouched because its counter read 0.
+#
+# v2 asks the oracle the WATCHER asks: `stitchpad wake <name> --peek-ordinal`,
+# an unanswered mention resolved against that seat's own seen.<name> cursor.
+#
+# Three properties are carried over from Daniel Coulbourne's crux (MIT), which
+# solves this same class of problem:
+#
+#   1. FAIL CLOSED WITH A VOICE (crux lib/failover.js). A probe has three
+#      outcomes, not two: up, down, and unknown. v1 collapsed unknown into
+#      "skip", so an unreachable or reshaped daemon silently stopped the entire
+#      watchdog with no log line at all. Here unknown never moves a seat AND
+#      never passes in silence.
+#
+#   2. A CURSOR BELONGS TO THE CONSUMER (crux lib/cursor.js). Position is read
+#      relative to what THIS seat has consumed, never as a shared level.
+#
+#   3. A SUPERVISOR THAT CANNOT SEE ITS WORKER SAYS SO (crux 0.5.1). A wake that
+#      leaves the SAME mention unanswered is recorded as a strike; MAX_STRIKES
+#      consecutive no-ops quarantine the seat and log loudly instead of retrying
+#      forever. v1 could not tell a working wake from a wasted one.
+#
+# Pads watched: one repo path per line in ~/.pasture/keeper.conf
+# Kill switch:  touch ~/.pasture/keeper.off
+# Log:          ~/.pasture/keeper.log
+# Un-quarantine: rm <repo>/.stitchpad/.state/keeper-strike.<seat>
+#
+# Flags: --dry-run  decide and log, wake nothing
+#        --report   dry-run plus a per-seat table (what `crux leads` is for)
+set -uo pipefail
+
+# Overridable so the positive path can be exercised against a throwaway pad
+# without touching the live fleet's conf. A refusal you cannot test is a refusal
+# that rots (crux's phrasing, and it applies to the wake path just as much).
+CONF="${SEAT_KEEPER_CONF:-$HOME/.pasture/keeper.conf}"
+LOG="${SEAT_KEEPER_LOG:-$HOME/.pasture/keeper.log}"
+# HB/SP/DAEMON were hardcoded to the INSTALL, which is right in production and
+# is also why this keeper had no gate: a suite cannot point it at a throwaway
+# tree. Same treatment as CONF/LOG above — overridable, identical defaults.
+# Resolve the heartbeat binary: explicit override, then PATH, then the dev
+# build path as a last resort.
+#
+# PATH USED TO BE MISSING FROM THAT LIST, and it cost the whole watchdog. The
+# default pointed only at a cargo RELEASE BUILD inside a checkout
+# ($HOME/dev/ocean-os/target/release/ocean-heartbeat). On a machine where
+# ocean-heartbeat is INSTALLED — ~/.local/bin/ocean-heartbeat, on PATH, working —
+# but not built from source in that directory, this resolved to a nonexistent
+# file, the guard below exited 1 on every run, and the keeper did nothing at all.
+# Every seat it was meant to watch went unattended while the binary it needed sat
+# on PATH the entire time. The failure is silent by design (rate-limited log,
+# exit 1), so from the outside the keeper simply appeared dead — and six pasture
+# LaunchAgents were disabled in one sweep on 2026-08-28, plausibly for exactly
+# this reason.
+#
+# A tool should look where its dependency is actually installed before declaring
+# the fleet unattended.
+HB="${OCEAN_HEARTBEAT_BIN:-$(command -v ocean-heartbeat 2>/dev/null || echo "$HOME/dev/ocean-os/target/release/ocean-heartbeat")}"
+SP="${SEAT_KEEPER_SP:-$HOME/.stitchpad/bin/stitchpad}"   # the mention oracle {@see seat_pending}
+DAEMON="${OCEAN_DAEMON_URL:-http://127.0.0.1:4780}"
+
+# Model-pin telemetry helpers live in lib.sh. Resolved the same way every other
+# bin/ script does, through the symlink, so the keeper records which model a wake
+# ACTUALLY resolved to rather than only which one was requested.
+_sk_src="${BASH_SOURCE[0]}"; while [ -h "$_sk_src" ]; do
+  _sk_dir="$(cd -P "$(dirname "$_sk_src")" && pwd)"; _sk_src="$(readlink "$_sk_src")"
+  [ "${_sk_src#/}" = "$_sk_src" ] && _sk_src="$_sk_dir/$_sk_src"
+done
+SK_BIN_DIR="$(cd -P "$(dirname "$_sk_src")" && pwd)"
+[ -f "$SK_BIN_DIR/lib.sh" ] && . "$SK_BIN_DIR/lib.sh" 2>/dev/null || true
+# Overridable for the same reason CONF/LOG/HB are: a rate limit you cannot lower
+# is a rate limit no suite can exercise. Defaults unchanged.
+DRAIN_MIN_S="${SEAT_KEEPER_DRAIN_MIN_S:-${STITCHPAD_KEEPER_MIN_SECONDS:-600}}"
+QUEUE_MIN_S="${SEAT_KEEPER_QUEUE_MIN_S:-${STITCHPAD_KEEPER_MIN_SECONDS:-900}}"
+MAX_STRIKES=3         # consecutive no-effect wakes before quarantine
+# Overridable like the rest: the rate limit is right in production (do not spam
+# the log every 2 minutes) and is precisely what stops a suite from ever
+# observing the alert, since the stamp file outlives the run.
+RELOG_S="${SEAT_KEEPER_RELOG_S:-3600}"   # re-log a quarantined/unknown seat at most this often
+
+DRY=0; REPORT=0
+for a in "$@"; do
+  case "$a" in
+    --dry-run) DRY=1 ;;
+    --report)  DRY=1; REPORT=1 ;;
+    *) echo "seat-keeper: unknown flag $a" >&2; exit 2 ;;
+  esac
+done
+
+[ -f "$HOME/.pasture/keeper.off" ] && exit 0
+[ -f "$CONF" ] || exit 0
+log() {
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"
+  [ "$REPORT" -eq 1 ] && printf '  %s\n' "$*"
+  return 0
+}
+
+# Rate-limited log: writes only if the named stamp file is older than RELOG_S.
+log_rl() {
+  local stamp="$1"; shift
+  local now last
+  now=$(date +%s); last=$(cat "$stamp" 2>/dev/null || echo 0)
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  [ $(( now - last )) -lt "$RELOG_S" ] && return 0
+  echo "$now" > "$stamp" 2>/dev/null
+  log "$@"
+}
+
+# MISSING HEARTBEAT BINARY (k3 F8). This check used to sit ABOVE log(), so all it
+# could do was `echo ... >&2; exit 0` — and under launchd stderr goes nowhere a
+# person looks. The watchdog for the entire fleet therefore switched itself off
+# and reported success, with keeper.log — the one file an operator opens —
+# completely empty. Moved below the log helpers so the failure lands where it
+# will be READ, and the exit code now says what happened. Rate-limited, because
+# this runs every 120 seconds and an unbounded log is its own outage.
+if [ ! -x "$HB" ]; then
+  log_rl "$(dirname "$LOG")/.keeper-no-hb" \
+    "FLEET UNATTENDED: no heartbeat binary at $HB — seat-keeper cannot wake any seat and is doing nothing. Set OCEAN_HEARTBEAT_BIN or build ocean-heartbeat."
+  exit 1
+fi
+
+# keep the log bounded
+if [ -f "$LOG" ] && [ "$(wc -l < "$LOG")" -gt 2000 ]; then
+  tail -n 500 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+fi
+
+# --- daemon reachability, answered ONCE per run -----------------------------
+# v1 probed per seat and, on failure, silently skipped every seat — a watchdog
+# that had stopped watching and said nothing about it. Being unable to reach the
+# daemon is the single most important thing this script can report.
+if ! curl -sf -m 3 "$DAEMON/health" >/dev/null 2>&1; then
+  # Stamp lives beside the LOG, not beside the script. It was pinned to
+  # $HOME/.pasture/, so a suite pointing SEAT_KEEPER_LOG at a throwaway dir still
+  # wrote into the live install — and thereby suppressed the real fleet's
+  # daemon-unreachable alert for an hour. Caught by this gate doing exactly that.
+  # Production is unchanged: LOG defaults to ~/.pasture/keeper.log, so the stamp
+  # still lands in ~/.pasture.
+  log_rl "$(dirname "$LOG")/.keeper-daemon-unreachable" \
+    "DAEMON UNREACHABLE at $DAEMON — no seat can be woken. The fleet is unattended until this clears."
+  exit 0
+fi
+
+# --- probe one session: busy | idle | unknown:<reason> ----------------------
+probe_session() {
+  local sid="$1" body
+  body=$(curl -sf -m 4 "$DAEMON/v1/agent/sessions/$sid" 2>/dev/null) || { echo "unknown:http-fail"; return; }
+  [ -z "$body" ] && { echo "unknown:empty-body"; return; }
+  printf '%s' "$body" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("unknown:unparseable"); raise SystemExit(0)
+s = d.get("session")
+if not isinstance(s, dict):
+    print("unknown:no-session-object"); raise SystemExit(0)
+print("busy" if s.get("active_turn") else "idle")
+' 2>/dev/null || echo "unknown:probe-crashed"
+}
+
+# --- turn count for one session: <int> | "" ---------------------------------
+# NOTE THE ENDPOINT, it is not the one probe_session uses and that is the whole
+# point. /v1/agent/sessions/<sid> returns {active_turn, client_type, created_at,
+# cwd, id, title, updated_at} — it can say whether a turn is IN FLIGHT but it
+# does not carry a turn COUNT. The count lives on /v1/sessions/<sid> as `turns`.
+#
+# The first version of this function reused probe_session's URL because the two
+# reads looked interchangeable. They are not: `turns` was simply absent, so this
+# returned empty on every call and cap_watch returned early on every seat. The
+# feature was inert and silent — and the unit proof did not catch it because it
+# STUBBED this function and exercised only the threshold arithmetic. Testing the
+# half you wrote while faking the half that supplies its data proves the
+# thresholds and nothing about the feature.
+session_turns() {
+  local sid="$1" body
+  body=$(curl -sf -m 4 "$DAEMON/v1/sessions/$sid" 2>/dev/null) || return 0
+  printf '%s' "$body" | python3 -c '
+import json, sys
+try:
+    s = json.load(sys.stdin).get("session") or {}
+    t = s.get("turns")
+    print(int(t) if isinstance(t, int) else "")
+except Exception:
+    print("")
+' 2>/dev/null
+}
+
+# --- cap watch: ask a seat to hand off BEFORE the runtime cuts it off -------
+#
+# An Ocean session ends near TURN_CAP. That is a property of the runtime, not a
+# judgement about the work — but left unmanaged it decides where work STOPS. On
+# one fleet night thirteen sessions died at the cap and every cold respawn threw
+# away whatever the seat had not written down; three lost real findings that had
+# to be reconstructed from worktrees afterwards.
+#
+# A seat cannot see its own turn count, so it cannot plan around the cap. The
+# keeper can: it already polls every seat every two minutes. So it posts ONE
+# nudge as the seat approaches, asking for a structured handoff while the seat
+# still has turns left to write it.
+#
+# Posted ONCE per session (marker file keyed by session id), because a seat
+# nagged every two minutes for its last twenty turns would spend them replying.
+TURN_CAP="${SEAT_TURN_CAP:-200}"
+CAP_WARN_AT="${SEAT_CAP_WARN_AT:-175}"
+
+cap_watch() {
+  local repo="$1" name="$2" sid="$3" turns marker
+  [ -n "$sid" ] || return 0
+
+  # ONLY LIVE SEATS. A handoff request is addressed to somebody who can still
+  # act on it, so a seat that is not on the roster must never receive one.
+  #
+  # Without this the first live run fired at deepseek.exhausted,
+  # deepseek.exhausted-186turns, deepseek.exhausted-199turns,
+  # kimi.exhausted-200turns and codex.exhausted — ARCHIVED bindings for seats
+  # that were already dead, several on pads nobody is working. They are exactly
+  # the rows the keeper separately reports as "SEAT NOT ON ROSTER", and asking a
+  # retired seat to write a handoff is noise that buries the one case that
+  # matters. Worse, at fleet scale it is the nag problem this feature was built
+  # to avoid, arriving from the other direction.
+  #
+  # The roster is the same oracle seat_pending uses to decide whether a mention
+  # can reach a seat at all: if no mention can reach it, no handoff request can
+  # either.
+  # NOTE: no `tr -d '[:space:]'` here. It strips NEWLINES as well as spaces,
+  # collapsing every roster name onto one line so `grep -qxF` can never match —
+  # which silently skips every seat, live ones included, and turns the whole
+  # feature off while looking like a safety check. Same form seat_pending uses.
+  (cd "$repo" 2>/dev/null && "$SP" roster 2>/dev/null) \
+    | cut -d'|' -f1 | grep -qxF "$name" || return 0
+  turns="$(session_turns "$sid")"
+  case "$turns" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$turns" -ge "$CAP_WARN_AT" ] || return 0
+
+  marker="$repo/.stitchpad/.state/cap-warned.$sid"
+  [ -f "$marker" ] && return 0
+
+  (cd "$repo" 2>/dev/null && STITCHPAD_NAME=keeper "$SP" say \
+"@$name HANDOFF NOW — you are at turn $turns of roughly $TURN_CAP. Your session will end soon; that is the runtime, not your work, and it must not decide where your work stops.
+
+Post this before you lose the chance, then keep working until the session ends:
+
+  DONE:      what is finished AND committed, with SHAs
+  IN FLIGHT: what you are mid-way through, and exactly where you got to
+  NEXT:      the next concrete step, specific enough to act on without re-deriving it
+  DEAD ENDS: what you already ruled out, so your successor does not repeat it
+
+DEAD ENDS is the line people skip and the one that saves the most time. Commit anything committable first — an uncommitted finding dies with the session." >/dev/null 2>&1) \
+    && { mkdir -p "$(dirname "$marker")"; : > "$marker"; \
+         log "cap-watch: asked $name for a handoff at turn $turns/$TURN_CAP"; }
+}
+
+# --- pending mention for a seat: <ordinal> | "" | unknown:<reason> ----------
+# ASK THE SAME ORACLE THE WATCHER ASKS. watch.sh fires on
+# `stitchpad wake <name> --peek` — an UNANSWERED mention, i.e. an @name newer
+# than that seat's last @-reply, resolved against seen.<name>. That is the
+# fleet's real engagement gate.
+#
+# v1 instead read count.<seat>, which is written ONCE at watcher startup
+# (watch.sh:45) and never maintained in the react loop. It is vestigial. Keying
+# wake decisions off a field nothing maintains is how codex and glm came to be
+# woken every 10 minutes for two days over a counter frozen since Aug 3.
+#
+# `--peek-ordinal` is used rather than `--peek` because it is the STABLE IDENTITY
+# of the pending mention, which is what lets the effect check below distinguish
+# "the same mention is still unanswered" (a wasted wake) from "a new mention
+# arrived" (progress). Neither peek form advances any cursor — verified.
+seat_pending() {
+  local repo="$1" name="$2" out rc
+
+  # A name that is not on the roster peeks EMPTY with rc=0 — the same answer as
+  # "nothing is pending". A seat bound to an Ocean session but missing from the
+  # roster would therefore read as permanently idle and never be woken again:
+  # silent starvation, the exact failure this watchdog exists to prevent, wearing
+  # the healthy answer's clothes. It is a bound seat, so its absence is a fault.
+  if ! (cd "$repo" 2>/dev/null && "$SP" roster 2>/dev/null) | cut -d'|' -f1 | grep -qxF "$name"; then
+    echo "unknown:not-in-roster"; return
+  fi
+
+  out=$(cd "$repo" 2>/dev/null && "$SP" wake "$name" --peek-ordinal 2>/dev/null); rc=$?
+  [ "$rc" -ne 0 ] && { echo "unknown:peek-rc-$rc"; return; }
+  out="$(printf '%s' "$out" | head -1 | tr -cd '0-9')"
+  echo "$out"
+}
+
+# --- open pad tasks assigned to a seat --------------------------------------
+# Counts open cards for a seat across EVERY file a card can live in.
+# It used to take a single file and the caller passed stitchpad.md — the legacy
+# inline location. `stitchpad task new` writes .stitchpad/tasks.md (PAD_TASKS);
+# the pad file keeps only a pointer block, which carries no status:/assignee:
+# and so counts as zero. The result: "idle with N open pad task(s)" could not
+# fire for any card created since the tasks.md split, and the anti-starvation
+# watchdog silently stopped doing its primary job — a seat with open work idles
+# forever and the keeper logs nothing at all. Producer/consumer mismatch, the
+# same shape as the count.* bug v2 was written to fix.
+# Both locations are summed rather than one being chosen: `task migrate` moves
+# legacy inline blocks into tasks.md, so a pad can be mid-migration, and a card
+# exists in exactly one of the two — summing cannot double-count it.
+seat_tasks() {
+  local who="$1"; shift
+  local f total=0 n
+  for f in "$@"; do
+    [ -f "$f" ] || continue
+    n="$(awk -v who="$who" '
+      /^```task/ {in_t=1; st=""; as=""; next}
+      in_t && /^status:/   {st=$2}
+      in_t && /^assignee:/ {as=$2}
+      in_t && /^```/ {in_t=0; if ((st=="todo" || st=="in_progress") && as==who) n++}
+      END {print n+0}' "$f" 2>/dev/null || echo 0)"
+    case "$n" in ''|*[!0-9]*) n=0 ;; esac
+    total=$(( total + n ))
+  done
+  echo "$total"
+}
+
+[ "$REPORT" -eq 1 ] && printf '%-12s %-8s %-20s %-8s %s\n' SEAT STATE PENDING STRIKES DECISION
+
+while IFS= read -r repo; do
+  [ -z "$repo" ] && continue
+  case "$repo" in \#*) continue ;; esac
+  ST="$repo/.stitchpad/.state"
+  PADFILE="$repo/.stitchpad/stitchpad.md"
+  TASKFILE="$repo/.stitchpad/tasks.md"     # where `task new` actually writes
+  [ -d "$ST" ] || continue
+
+  # Discovery self-heal: the keeper finds seats via ocean-session.<name> files,
+  # but a seat joined with `stitchpad join <name> ocean push <sid>` records its
+  # session id in the ROSTER's target field, not necessarily as that file — so
+  # an ocean seat could be live on the pad yet invisible to the keeper and never
+  # re-woken (the exact stall this watchdog exists to prevent). Reconcile from
+  # the roster: for every `name | ocean | push | <sid>` row, ensure
+  # ocean-session.<name> exists. Never overwrite a present file (an explicit
+  # binding wins); only fill the gap.
+  if [ -f "$PADFILE" ] && [ ! -L "$PADFILE" ]; then
+    while IFS='|' read -r _rn _ra _rw _rt; do
+      _rn="$(printf '%s' "$_rn" | tr -d '[:space:]')"
+      _ra="$(printf '%s' "$_ra" | tr -d '[:space:]')"
+      _rt="$(printf '%s' "$_rt" | tr -d '[:space:]')"
+      [ "$_ra" = "ocean" ] || continue
+      [ -n "$_rn" ] && [ -n "$_rt" ] && [ "$_rt" != "-" ] || continue
+      case "$_rn" in ''|*[!a-zA-Z0-9_-]*) continue ;; esac
+      if [ -e "$ST/ocean-session.$_rn" ]; then
+        # "Never overwrite a present file" is right — an explicit binding must
+        # win — but it silently created a SECOND source of truth that drifts.
+        # A respawn rebinds the ROSTER (set-wake) and cannot touch this file,
+        # so from then on mentions wake the new session and the keeper wakes
+        # the old one, forever, and every surface looks healthy.
+        #
+        # Measured on the tides-distro fleet: three of six seats had diverged.
+        # The keeper had been faithfully waking sessions that were capped hours
+        # earlier — which is also why those dead sessions kept getting fresh
+        # updated_at stamps, making them look like the LIVE ones.
+        #
+        # Still never overwrite. Just stop being silent about it.
+        _cur="$(cat "$ST/ocean-session.$_rn" 2>/dev/null | tr -d '[:space:]')"
+        if [ -n "$_cur" ] && [ "$_cur" != "$_rt" ]; then
+          log_rl "$ST/.diverged-$_rn" \
+            "SESSION BINDING DIVERGED for @$_rn ($repo): the roster says $_rt but .state/ocean-session.$_rn says $_cur. Mentions wake the roster's session and this keeper wakes the file's — they are different agents. Whichever is live, make them agree: printf '%s' <live-sid> > $ST/ocean-session.$_rn && stitchpad set-wake $_rn push <live-sid> ocean"
+        fi
+      else
+        printf '%s' "$_rt" > "$ST/ocean-session.$_rn" 2>/dev/null || true
+      fi
+    done < <(awk '/^```roster/{r=1;next} /^```/{r=0} r && /\|/ && $0 !~ /^#/' "$PADFILE")
+  fi
+
+  # --- the OTHER half of reachability -------------------------------------
+  #
+  # The keeper already reports SEAT NOT ON ROSTER: a seat bound to an Ocean
+  # session with no roster line, so nothing can address it. This is the mirror
+  # image, and it had no check at all: a roster row that EXISTS but whose push
+  # target is not a session id. The row looks healthy in `stitchpad roster`,
+  # `@name` resolves and posts without error, and the mention reaches nobody.
+  #
+  # Observed cost: three triage seats were joined with placeholder targets
+  # ("pending", "self", "-") and left that way. They ran 150-178 turns each in
+  # total isolation — the lead could not reach them, the keeper could not wake
+  # them, and nothing anywhere said so. Both directions of the conversation were
+  # broken and every surface reported fine.
+  #
+  # A push row whose target is not a plausible session id is a LIE about
+  # reachability, and the watchdog should say so as loudly as it says the
+  # inverse.
+  if [ -f "$PADFILE" ] && [ ! -L "$PADFILE" ]; then
+    while IFS='|' read -r _un _ua _uw _ut; do
+      _un="$(printf '%s' "$_un" | tr -d '[:space:]')"
+      _ua="$(printf '%s' "$_ua" | tr -d '[:space:]')"
+      _uw="$(printf '%s' "$_uw" | tr -d '[:space:]')"
+      _ut="$(printf '%s' "$_ut" | tr -d '[:space:]')"
+      [ "$_ua" = "ocean" ] && [ "$_uw" = "push" ] || continue
+      [ -n "$_un" ] || continue
+      # A session id is a UUID. Anything else — a placeholder, a dash, an empty
+      # field — cannot be woken and cannot receive a mention.
+      case "$_ut" in
+        [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-*) continue ;;
+      esac
+      log_rl "$ST/.unreachable-$_un" \
+        "UNREACHABLE PUSH SEAT: @$_un ($repo) is on the roster with wake=push but target='${_ut:-<empty>}', which is not a session id. Mentions to @$_un post successfully and reach nobody, and the keeper cannot wake it. Bind it with: stitchpad set-wake $_un push <session-id> ocean"
+    done < <(awk '/^```roster/{r=1;next} /^```/{r=0} r && /\|/ && $0 !~ /^#/' "$PADFILE")
+  fi
+
+  for f in "$ST"/ocean-session.*; do
+    [ -f "$f" ] || continue
+    name="${f##*/ocean-session.}"
+    # stitchpad-seat-health archives a rotated seat's old id ALONGSIDE the live
+    # one, as ocean-session.<name>.exhausted-<N>turns. Those are records, not
+    # seats. Treating them as seats produced permanent, unfixable noise — a
+    # SEAT NOT ON ROSTER line every run for @kimi.stale-reuse.exhausted-archived
+    # and an UNKNOWN-state line for @kimi.exhausted-144turns, neither of which
+    # anyone can act on because adding an archive to the roster would be wrong.
+    # A watchdog that cries about something nobody should fix trains its reader
+    # to skip its output, which costs far more than the noise itself.
+    case "$name" in *.exhausted-*) continue ;; esac
+    sid="$(cat "$f" 2>/dev/null)"
+    [ -z "$sid" ] && continue
+    model="$(cat "$ST/seat-model.$name" 2>/dev/null || echo '')"
+    # Per-seat worktree cwd (opt-in), mirroring the ocean adapter: a build seat
+    # runs in its own git worktree, not the pad's checkout. Without this the
+    # keeper would wake it rooted at $repo (main checkout) — clobbering the
+    # worktree the operator assigned and colliding with other seats. Same
+    # contract as the adapter's .state/seat-cwd.<name>: an existing dir wins,
+    # anything else falls back to $repo. No file (chat pads) = unchanged.
+    wake_cwd="$repo"
+    _sc_file="$ST/seat-cwd.$name"
+    if [ -f "$_sc_file" ] && [ ! -L "$_sc_file" ]; then
+      _sc="$(head -c 4096 "$_sc_file" 2>/dev/null | tr -d '[:space:]')"
+      if [ -n "$_sc" ] && [ -d "$_sc" ]; then
+        wake_cwd="$_sc"
+      fi
+    fi
+
+    STRIKE="$ST/keeper-strike.$name"
+    OBS="$ST/keeper-obs.$name"
+    LASTF="$ST/keeper-last.$name"
+
+    state="$(probe_session "$sid")"
+    pending="$(seat_pending "$repo" "$name")"
+
+    # Ask for a handoff before the runtime cuts this seat off. Runs regardless
+    # of busy/idle and regardless of whether anything is pending — a seat about
+    # to hit the cap needs to write down what it knows whether or not it has
+    # been mentioned. Fires once per session; see cap_watch.
+    cap_watch "$repo" "$name" "$sid"
+    strikes="$(cat "$STRIKE" 2>/dev/null || echo 0)"
+    case "$strikes" in ''|*[!0-9]*) strikes=0 ;; esac
+
+    decision=""
+
+    case "$state" in
+      busy)
+        # Working. Never needs the keeper, and progress clears its record.
+        rm -f "$OBS" "$STRIKE" 2>/dev/null
+        strikes=0
+        decision="busy — no action"
+        ;;
+      unknown:*)
+        # crux's `unknown`: nothing moves, and it is said out loud.
+        log_rl "$ST/.keeper-unknown.$name" \
+          "UNKNOWN state for $name ($repo): ${state#unknown:} — cannot tell whether it is alive; not waking."
+        decision="unknown (${state#unknown:}) — not waking"
+        ;;
+      idle)
+        now=$(date +%s)
+        last=$(cat "$LASTF" 2>/dev/null || echo 0)
+        case "$last" in ''|*[!0-9]*) last=0 ;; esac
+        since=$(( now - last ))
+
+        # EFFECT CHECK — evaluated only when a repeat wake is actually DUE.
+        # Counting once per keeper pass instead counts COOLDOWN passes as
+        # failures: at a 2-minute cron against a 10-minute drain interval that
+        # quarantines a seat in ~6 minutes, before the first repeat wake has even
+        # been sent. A strike must mean "I woke it again about the SAME mention
+        # and nothing moved".
+        # Once QUARANTINED, stop counting. A quarantined seat is never woken, so it
+        # never refreshes keeper-last, so "since" stays over the threshold and every
+        # subsequent pass would increment again — reporting "23 repeat wakes" when
+        # there were 3 wakes and 20 idle passes. A number in an alert that is not the
+        # thing it names is worse than no number.
+        if [ "$since" -ge "$DRAIN_MIN_S" ] && [ "$strikes" -lt "$MAX_STRIKES" ]; then
+          if [ -f "$OBS" ] && [ -n "$pending" ] && [ "$(cat "$OBS" 2>/dev/null)" = "$pending" ]; then
+            strikes=$(( strikes + 1 )); echo "$strikes" > "$STRIKE" 2>/dev/null
+          elif [ -f "$OBS" ]; then
+            strikes=0; rm -f "$OBS" "$STRIKE" 2>/dev/null
+          fi
+        fi
+
+        if [ "$strikes" -ge "$MAX_STRIKES" ]; then
+          log_rl "$ST/.keeper-quarantine.$name" \
+            "QUARANTINED $name ($repo): $strikes repeat wakes left mention #$pending unanswered — the wake is not landing. Not waking again until someone looks. Clear with: rm $STRIKE"
+          decision="QUARANTINED after $strikes repeat wakes"
+        else
+
+          reason=""; prompt=""
+          case "$pending" in
+            unknown:not-in-roster)
+              # Bound to a session but absent from the roster: it can never be
+              # mentioned, so it can never be woken. Naming the remedy matters —
+              # this one is fixed on the pad, not in the daemon.
+              log_rl "$ST/.keeper-peek-unknown.$name" \
+                "SEAT NOT ON ROSTER: $name ($repo) is bound to an Ocean session but has no roster line, so no mention can ever reach it and it will never be woken. Add it to the pad's \`\`\`roster block (name | adapter | wake | target), or remove .state/ocean-session.$name if the seat is retired."
+              ;;
+            unknown:*)
+              # The oracle could not answer. Nothing moves, and it is said.
+              log_rl "$ST/.keeper-peek-unknown.$name" \
+                "MENTION ORACLE UNAVAILABLE for $name ($repo): ${pending#unknown:} — mention wakes are disabled for this seat until \`stitchpad wake $name --peek-ordinal\` answers again."
+              ;;
+            '') ;;   # nothing unanswered — the overwhelmingly common case
+            *)
+              if [ "$since" -ge "$DRAIN_MIN_S" ]; then
+                reason="unanswered mention #$pending"
+                prompt="stitchpad keeper: you have an unanswered @${name} mention. cd $repo && ~/.stitchpad/bin/pasture read --new, handle it per the loop prompt, then continue your task queue."
+              fi
+              ;;
+          esac
+
+          if [ -z "$reason" ] && [ "$since" -ge "$QUEUE_MIN_S" ]; then
+            open=$(seat_tasks "$name" "$TASKFILE" "$PADFILE")
+            if [ "${open:-0}" -gt 0 ]; then
+              reason="idle with $open open pad task(s)"
+              prompt="stitchpad keeper: you are idle but have $open open task(s) assigned on the pad. cd $repo && ~/.stitchpad/bin/pasture read --new to refresh context, then continue your task queue per the loop prompt. Post .status when resumed."
+            fi
+          fi
+
+          if [ -z "$reason" ]; then
+            decision="idle, nothing due"
+          elif [ "$DRY" -eq 1 ]; then
+            decision="WOULD WAKE — $reason"
+          else
+            out=$("$HB" wake --session-id "$sid" --cwd "$wake_cwd" --client-type stitchpad \
+              ${model:+--model "$model"} --no-wait --prompt "$prompt" 2>&1)
+            if echo "$out" | grep -q '"ok": *true'; then
+              # RESOLVED-MODEL TELEMETRY (ported from the task-parser keeper this
+              # replaced): ask the daemon what the session actually resolved to and
+              # record it against the requested pin, so a silent provider swap is
+              # visible instead of being discovered days later. Best-effort — an
+              # unreachable daemon leaves the previous resolved record untouched,
+              # and nothing here can change the wake outcome.
+              if command -v sp_model_pin_record_resolved >/dev/null 2>&1; then
+                _cfg="$(curl -sf -m 3 "$DAEMON/v1/agent/sessions/$sid/config" 2>/dev/null || true)"
+                if [ -n "$_cfg" ]; then
+                  _rm="$(printf '%s' "$_cfg" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("model") or "")
+except Exception: print("")' 2>/dev/null)"
+                  _rp="$(printf '%s' "$_cfg" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("provider") or "")
+except Exception: print("")' 2>/dev/null)"
+                  _rs="$(printf '%s' "$_cfg" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("model_source") or "")
+except Exception: print("")' 2>/dev/null)"
+                  # Same false-mismatch bug as the ocean adapter (fixed there
+                  # first): the config RPC reports the SESSION model, whose
+                  # model_source is "global" whenever no session-level pin
+                  # exists — a per-turn --model wake is invisible to it. When
+                  # THIS wake carried a pin and the RPC is only echoing the
+                  # global default, the pin IS the effective model; recording
+                  # the global here stamped a mismatch after every keeper
+                  # wake, and under policy=refuse that deadlocks the seat
+                  # (every corrective wake is itself refused).
+                  if [ "$_rs" = "global" ] && [ -n "$model" ]; then
+                    sp_model_pin_record_resolved "$ST" "$name" "$model" "" \
+                      "keeper-wake-model-arg" "$sid" || true
+                    sp_model_pin_check "$ST" "$name" || true
+                  elif [ -n "$_rm" ]; then
+                    sp_model_pin_record_resolved "$ST" "$name" "$_rm" "$_rp" \
+                      "keeper-wake-config-rpc" "$sid" || true
+                    sp_model_pin_check "$ST" "$name" || true
+                  fi
+                fi
+              fi
+              date +%s > "$LASTF"
+              # Remember WHICH mention we woke it about, so the next pass can tell
+              # whether the wake accomplished anything.
+              echo "$pending" > "$OBS" 2>/dev/null
+              log "woke $name ($repo): $reason"
+              decision="woke — $reason"
+            else
+              log "WAKE FAILED for $name ($repo): $reason — $(echo "$out" | tail -1)"
+              decision="WAKE FAILED — $reason"
+            fi
+          fi
+        fi
+        ;;
+    esac
+
+    [ "$REPORT" -eq 1 ] && printf '%-12s %-8s %-20s %-8s %s\n' \
+      "$name" "${state%%:*}" "${pending:-none}" "$strikes" "$decision"
+  done
+done < "$CONF"
+
+exit 0

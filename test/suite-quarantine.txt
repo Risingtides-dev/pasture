@@ -1,0 +1,7 @@
+# suite-quarantine.txt — suites excluded from automated tripwire enforcement.
+# Format: <suite-name> <one-line reason>
+# Quarantined suites are SKIPPED with a loud warning. They still appear in
+# the tripwire report so reviewers know they exist. A quarantine is NOT
+# a free pass — it documents a measurement gap that must be justified.
+# Additions to this file require a commit message explaining WHY the suite
+# cannot be reliably measured.

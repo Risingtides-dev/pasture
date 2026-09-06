@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Fixtures must not inherit the caller's ambient session identity: sp_this_surface()
+# falls back to $CLAUDE_CODE_SESSION_ID/$CODEX_SESSION_ID, which makes every simulated
+# agent in this suite share ONE surface and trip "one terminal = one (pad,name)".
+unset CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID 2>/dev/null || true
 # Regression test: identity-survival-under-join
 #
 # Verifies that when agent A joins, agent B joins, then agent A posts again,
@@ -23,21 +27,36 @@ NC='\033[0m' # No Color
 
 PASS=0
 FAIL=0
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SP="$ROOT/tool/bin/stitchpad"
+owns_fixture=0
 
 if [ -n "${STITCHPAD_CWD:-}" ]; then
   pad_dir="$STITCHPAD_CWD"
 else
   pad_dir="$(mktemp -d)"
-  trap 'rm -rf "$pad_dir"' EXIT
+  owns_fixture=1
+  mkdir -p "$pad_dir/home"
+  export HOME="$pad_dir/home"
+  unset HERDR_PANE_ID HERDR_TAB_ID HERDR_ENV HERDR_SOCKET_PATH HERDR_WORKSPACE_ID 2>/dev/null || true
   cd "$pad_dir"
-  "$HOME/.stitchpad/bin/stitchpad" init --name identity-regtest >/dev/null
+  "$SP" init --name identity-regtest >/dev/null
 fi
 PAD="${pad_dir}/.stitchpad/stitchpad.md"
+
+cleanup() {
+  for name in regtest-alpha regtest-bravo; do
+    STITCHPAD_PAD_DIR="$pad_dir/.stitchpad" "$SP" heartbeat --stop "$name" >/dev/null 2>&1 || true
+  done
+  STITCHPAD_PAD_DIR="$pad_dir/.stitchpad" "$SP" daemon stop >/dev/null 2>&1 || true
+  [ "$owns_fixture" -eq 0 ] || rm -rf "$pad_dir"
+}
+trap cleanup EXIT
 
 # ── helpers ────────────────────────────────────────────────────────────
 
 stitchpad_cli() {
-  STITCHPAD_CWD="$pad_dir" "$HOME/.stitchpad/bin/stitchpad" "$@"
+  STITCHPAD_CWD="$pad_dir" "$SP" "$@"
 }
 
 stitchpad_say_as() {
@@ -77,8 +96,8 @@ echo "=== identity-survival-under-join ==="
 echo "Pad: $PAD"
 echo ""
 
-if ! command -v "$HOME/.stitchpad/bin/stitchpad" &>/dev/null; then
-  echo -e "${RED}FATAL: stitchpad CLI not found at ~/.stitchpad/bin/stitchpad${NC}"
+if [ ! -x "$SP" ]; then
+  echo -e "${RED}FATAL: checkout stitchpad CLI not executable at $SP${NC}"
   exit 1
 fi
 

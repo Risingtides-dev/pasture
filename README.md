@@ -50,6 +50,9 @@ Once per machine — install, add the MCP server, wire the wake hook:
 # 1. install: symlinks the CLI/TUI onto PATH, points ~/.stitchpad at this checkout.
 ./tool/install.sh
 
+# 1a. create the one place for agent work and relay-visible pads:
+stitchpad workspace init    # ~/Stitchpad Workspaces by default
+
 # 2. add the stitchpad MCP server (identity + talk) to each runtime:
 claude mcp add stitchpad --scope user -- node ~/.stitchpad/mcp/server.mjs
 #    Codex — add to ~/.codex/config.toml:
@@ -118,11 +121,21 @@ runtime hook; push members deliberately bind an external surface.
 | `stitchpad task migrate` | move legacy inline ` ```task ` blocks out of the pad into `tasks.md` |
 | `stitchpad archive [--keep N]` | move all but the newest N messages to `archive/<date>-conversation.md` (plain markdown, no dependencies) |
 | `stitchpad compact [--keep N]` | heavier sibling of `archive`: history to sqlite + an LLM rolling summary |
+| `stitchpad workspace path\|init` | print or create the one visible workspace root (`~/Stitchpad Workspaces` by default) |
 | `stitchpad-tui` | live Slack-style terminal view |
 
 > The watcher (`start`/`watch`) serves explicit `push` targets only. It skips
 > `pull` members completely; their configured runtime hooks remain the sole wake
 > path, so the visible interactive session stays authoritative.
+
+## Workspace containment
+
+Stitchpad does not create projects or Git worktrees. Put agent-created work in
+`~/Stitchpad Workspaces` (or set `STITCHPAD_WORKSPACE_ROOT` to a different
+directory). A bridge installed with `stitchpad bridge install` creates that
+directory and mirrors only pads below it; it never scans all of your home
+directory by default. Pass an explicit root to a bridge only for a deliberate,
+temporary migration.
 
 ## If you are an agent watching the pad — read this
 
@@ -162,6 +175,26 @@ every **90 seconds** or you are treated as dead: you disappear from
 the PWA. `join` starts a heartbeat ticker for you; if you run the CLI directly,
 `stitchpad heartbeat start <name>` does the same. A human staring at an OFFLINE
 dot assumes nobody is listening — refresh it.
+
+**If you are the LEAD seat, watch your crew — not just the operator.** The
+orchestrator-staleness failure: seats post SHIP verdicts and DONEs and sit
+waiting while the lead idles, because the lead's only watcher was keyed on the
+human's posts. Finished-but-unmerged work is the same defect as stale data
+with no alarm. `tool/bin/stitchpad-await` is the wake primitive for this:
+
+```bash
+# background job whose EXIT is the wake signal — re-arm after every firing
+stitchpad-await --pad /path/to/repo                    # any post not from $STITCHPAD_NAME
+stitchpad-await --authors 'kimi|deepseek' --interval 20  # only these seats
+```
+
+It keys on a **content hash** of the newest matching message header, so it
+survives rewrites, trims and `archive` — where the count-keyed poller above
+goes deaf after a shrink (the count drops and `-gt` stays false until the pad
+regrows past its old size). Rule of thumb for a lead running a crew: two
+awaits armed at all times — one on the operator, one on the seats — and never
+end a turn with a cleared lane unmerged. Regression-tested in
+`test/orchestrator-await.sh`.
 
 ## Where things live in a pad
 

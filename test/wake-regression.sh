@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Fixtures must not inherit the caller's ambient session identity: sp_this_surface()
+# falls back to $CLAUDE_CODE_SESSION_ID/$CODEX_SESSION_ID, which makes every simulated
+# agent in this suite share ONE surface and trip "one terminal = one (pad,name)".
+unset CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID 2>/dev/null || true
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SP="$ROOT/tool/bin/stitchpad"
 export STITCHPAD_STEAL=1   # allow each case to claim the TTY from the prior case
+export STITCHPAD_HEARTBEAT_AUTOSTART=0
 # Unset herdr context: in a managed pane, sp_this_surface returns a terminal id
 # that activates the one-terminal-one-pad lock, which blocks multi-sender test
 # scenarios. The test suite doesn't run inside herdr, but manual runs might.
@@ -23,20 +28,201 @@ contains() {
 
 stop_watcher() {
   local d="$1"
-  "$SP" daemon stop >/dev/null 2>&1 || true
-  pkill -9 -f "fswatch.*$d" 2>/dev/null || true
-  for _pidfile in "$d"/.stitchpad/.state/alive-ticker.*.pid "$d"/.stitchpad/.state/heartbeat.*.lock/pid; do
+  # Stop heartbeat tickers cleanly before the daemon. A live ticker calls
+  # ensure-watcher and can otherwise recreate the watcher in the narrow gap
+  # after an initial daemon stop, making the test race its own background copy.
+  for _lock in "$d"/.stitchpad/.state/heartbeat.*.lock; do
+    [ -d "$_lock" ] || continue
+    _name="$(basename "$_lock")"
+    _name="${_name#heartbeat.}"; _name="${_name%.lock}"
+    "$SP" heartbeat stop "$_name" >/dev/null 2>&1 || true
+  done
+  for _pidfile in "$d"/.stitchpad/.state/alive-ticker.*.pid; do
     [ -f "$_pidfile" ] || continue
-    _pid="$(timeout 2 cat "$_pidfile" 2>/dev/null || true)"
+    _pid="$(cat "$_pidfile" 2>/dev/null || true)"   # macOS has no `timeout`
     [ -n "$_pid" ] && kill -9 "$_pid" 2>/dev/null || true
   done
+  "$SP" daemon stop >/dev/null 2>&1 || true
+  pkill -9 -f "fswatch.*$d" 2>/dev/null || true
   sleep 0.2
 }
 
-tmp="$(mktemp -d /tmp/stitchpad-wake-regression.XXXXXX)"
-trap 'rm -rf "$tmp"' EXIT
+wait_for_fswatch() {
+  local d="$1"
+  d="$(cd -P "$d" && pwd)"
+  for _ in $(seq 1 100); do
+    pgrep -f "fswatch -0 $d/.stitchpad/stitchpad.md" >/dev/null 2>&1 && return 0
+    sleep 0.05
+  done
+  sed -n '1,120p' "$d/watcher.out" >&2 || true
+  find "$d/.stitchpad/.state" -maxdepth 2 -type f -print -exec sh -c \
+    'printf "  "; sed -n "1,12p" "$1"; printf "\n"' _ {} \; >&2 || true
+  fail "watcher fswatch did not become ready for $d"
+}
+
+HOST_HOME="$HOME"
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/stitchpad-wake-regression.XXXXXX")"
+mkdir -p "$tmp/home"
+export HOME="$tmp/home"
+
+cleanup_fixture_registry() {
+  local registry claim value
+  for registry in "$HOST_HOME/.stitchpad-terminals" "$HOST_HOME/.pasture-terminals"; do
+    [ -d "$registry" ] || continue
+    for claim in "$registry"/*; do
+      [ -f "$claim" ] || continue
+      value="$(cat "$claim" 2>/dev/null || true)"
+      case "$value" in "$tmp"/*) rm -f "$claim" ;; esac
+    done
+  done
+}
+
+fixture_registry_is_clean() {
+  local registry claim value
+  for registry in "$HOST_HOME/.stitchpad-terminals" "$HOST_HOME/.pasture-terminals"; do
+    [ -d "$registry" ] || continue
+    for claim in "$registry"/*; do
+      [ -f "$claim" ] || continue
+      value="$(cat "$claim" 2>/dev/null || true)"
+      case "$value" in "$tmp"/*) return 1 ;; esac
+    done
+  done
+  return 0
+}
+
+fixture_watchers_are_clean() {
+  local case_dir found
+  for case_dir in "$tmp"/*; do
+    [ -d "$case_dir/.stitchpad" ] || continue
+    found="$(
+      STITCHPAD_PAD_DIR="$case_dir/.stitchpad" bash -c \
+        'BIN_DIR="$1/tool/bin"; source "$BIN_DIR/lib.sh"; sp_init_paths >/dev/null 2>&1; sp_watch_processes_for_pad' \
+        _ "$ROOT" 2>/dev/null || true
+    )"
+    if [ -n "$found" ]; then
+      echo "fixture watcher leak under $case_dir: $found" >&2
+      return 1
+    fi
+  done
+  return 0
+}
+
+stop_all_fixture_runtime() {
+  local lock name case_dir
+  for lock in "$tmp"/*/.stitchpad/.state/heartbeat.*.lock; do
+    [ -d "$lock" ] || continue
+    name="$(basename "$lock")"; name="${name#heartbeat.}"; name="${name%.lock}"
+    STITCHPAD_PAD_DIR="$(dirname "$(dirname "$lock")")" "$SP" heartbeat --stop "$name" >/dev/null 2>&1 || true
+  done
+  for case_dir in "$tmp"/*; do
+    [ -d "$case_dir/.stitchpad" ] || continue
+    STITCHPAD_PAD_DIR="$case_dir/.stitchpad" "$SP" daemon stop >/dev/null 2>&1 || true
+  done
+}
+
+cleanup() {
+  cleanup_rc=$?
+  set +e
+  # Stop only fixture-owned watcher parents, heartbeat PIDs, and fswatch children.
+  stop_all_fixture_runtime
+  fixture_watchers_are_clean || cleanup_rc=1
+  # A nested runtime may restore the host HOME and claim any fixture surface,
+  # not only ocean-session. Remove every exact claim whose pad is under this
+  # fixture root, then prove none remains before deleting the fixture itself.
+  cleanup_fixture_registry
+  fixture_registry_is_clean || cleanup_rc=1
+  rm -rf "$tmp"
+  trap - EXIT
+  exit "$cleanup_rc"
+}
+trap cleanup EXIT
 
 export STITCHPAD_HOME="$ROOT/tool"
+
+# TASK-6 evidence label: stamp environment facts + immutable candidate (SHA/
+# tree) into the suite log so a green/red result is bound to the exact
+# environment and commit that produced it. Value-free for ambient session vars.
+if [ -x "$STITCHPAD_HOME/bin/evidence-stamp" ]; then
+  STITCHPAD_EVIDENCE_COMMAND="wake-regression.sh" \
+    "$STITCHPAD_HOME/bin/evidence-stamp" 2>/dev/null || true
+fi
+
+# Startup/stop race: pause a foreground watcher after exact owner publication
+# but before fswatch. Stop must remove that generation, make the signal handler
+# exit (not continue), and leave neither a lock nor an orphan process.
+startup_case="$tmp/startup-race"
+mkdir "$startup_case"
+cd "$startup_case"
+"$SP" init --name startup-race >/dev/null
+stop_watcher "$startup_case"
+startup_barrier="$tmp/startup-barrier"
+(
+  trap - EXIT
+  STITCHPAD_WATCH_TEST_BEFORE_FSWATCH_BARRIER="$startup_barrier" exec "$SP" watch
+) > "$startup_case/watcher.out" 2>&1 &
+startup_pid=$!
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40; do
+  [ -f "$startup_barrier.ready" ] && break
+  sleep 0.05
+done
+[ -f "$startup_barrier.ready" ] || fail 'paused watcher never published startup ownership'
+[ -s "$startup_case/.stitchpad/.state/watch.lock.d/owner" ] \
+  || fail 'paused watcher omitted exact owner metadata'
+STITCHPAD_PAD_DIR="$startup_case/.stitchpad" "$SP" daemon stop >/dev/null 2>&1 || true
+touch "$startup_barrier.release"
+wait "$startup_pid" 2>/dev/null || true
+[ ! -d "$startup_case/.stitchpad/.state/watch.lock.d" ] \
+  || fail 'paused watcher stop left its generation lock'
+startup_left="$(
+  STITCHPAD_PAD_DIR="$startup_case/.stitchpad" bash -c \
+    'BIN_DIR="$1/tool/bin"; source "$BIN_DIR/lib.sh"; sp_init_paths >/dev/null 2>&1; sp_watch_processes_for_pad' \
+    _ "$ROOT" 2>/dev/null || true
+)"
+[ -z "$startup_left" ] || fail "paused watcher stop left fixture processes: $startup_left"
+
+# Normal ensure_watcher/CLI start publishes the same contract and remains a
+# singleton. A concurrent foreground contender must exit without replacing the
+# live owner's generation or starting a second fswatch.
+singleton_case="$tmp/start-singleton"
+mkdir "$singleton_case"
+cd "$singleton_case"
+"$SP" init --name start-singleton >/dev/null
+"$SP" join agent codex pull - >/dev/null
+stop_watcher "$singleton_case"
+printf '{}' > "$singleton_case/.stitchpad/.state/alive.agent"
+"$SP" start >/dev/null
+singleton_pairs=""
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40; do
+  singleton_pairs="$(
+    STITCHPAD_PAD_DIR="$singleton_case/.stitchpad" bash -c \
+      'BIN_DIR="$1/tool/bin"; source "$BIN_DIR/lib.sh"; sp_init_paths >/dev/null 2>&1; sp_watch_pairs_for_pad' \
+      _ "$ROOT" 2>/dev/null || true
+  )"
+  [ "$(printf '%s\n' "$singleton_pairs" | grep -c .)" -eq 1 ] && break
+  sleep 0.05
+done
+if [ "$(printf '%s\n' "$singleton_pairs" | grep -c .)" -ne 1 ]; then
+  sed -n '1,120p' "$singleton_case/.stitchpad/.state/watch.log" >&2 2>/dev/null || true
+  ls -la "$singleton_case/.stitchpad/.state/watch.lock.d" >&2 2>/dev/null || true
+  fail 'normal CLI start did not produce exactly one fswatch pair'
+fi
+singleton_owner="$singleton_case/.stitchpad/.state/watch.lock.d/owner"
+[ -s "$singleton_owner" ] || fail 'normal CLI start omitted owner manifest'
+owner_before="$(cksum < "$singleton_owner")"
+"$SP" start >/dev/null
+if "$SP" watch > "$singleton_case/contender.out" 2>&1; then
+  fail 'foreground contender stole a live watcher generation'
+fi
+owner_after="$(cksum < "$singleton_owner")"
+[ "$owner_after" = "$owner_before" ] || fail 'foreground contender replaced live owner manifest'
+singleton_pairs="$(
+  STITCHPAD_PAD_DIR="$singleton_case/.stitchpad" bash -c \
+    'BIN_DIR="$1/tool/bin"; source "$BIN_DIR/lib.sh"; sp_init_paths >/dev/null 2>&1; sp_watch_pairs_for_pad' \
+    _ "$ROOT" 2>/dev/null || true
+)"
+[ "$(printf '%s\n' "$singleton_pairs" | grep -c .)" -eq 1 ] \
+  || fail 'repeated CLI start/contender created duplicate fswatch processes'
+stop_watcher "$singleton_case"
 
 # Regression 1: an addressed block should not sweep later replies into the wake
 # prompt. The hook prompt should contain only the addressed message block.
@@ -48,7 +234,7 @@ cd "$case1"
 stop_watcher "$case1"
 STITCHPAD_NAME=tester "$SP" say '@dale first ping' >/dev/null
 STITCHPAD_NAME=larry "$SP" say 'unrelated after first ping' >/dev/null
-out="$("$SP" wake dale)"
+out="$(STITCHPAD_NAME=dale "$SP" wake dale)"
 contains "$out" '@dale first ping' || fail 'wake did not include addressed message'
 if contains "$out" 'unrelated after first ping'; then
   fail 'wake included a later unrelated block'
@@ -69,7 +255,7 @@ STITCHPAD_NAME=larry "$SP" say 'unrelated status update' >/dev/null
 second="$("$SP" wake dale --peek)"
 contains "$second" '@dale one-shot ping' || fail 'unrelated commit incorrectly cleared unanswered mention'
 STITCHPAD_NAME=dale "$SP" say '@tester addressed reply clears ping' >/dev/null
-third="$("$SP" wake dale)"
+third="$(STITCHPAD_NAME=dale "$SP" wake dale)"
 if [ -n "$third" ]; then
   printf '%s\n' "$third" >&2
   fail 'addressed reply did not clear unanswered mention'
@@ -140,7 +326,7 @@ fi
 	peek1="$("$SP" wake agent --peek)"
 	contains "$peek1" '@agent oldest-first ping' || fail 'FIFO: oldest mention not returned first'
 	# Consume it (non-peek advances seen cursor)
-	"$SP" wake agent >/dev/null
+	STITCHPAD_NAME=agent "$SP" wake agent >/dev/null
 	# Now the next oldest (other's ping) should surface
 	peek2="$("$SP" wake agent --peek)"
 	contains "$peek2" '@agent second burst ping' || fail 'FIFO: second mention not returned after consuming first'
@@ -163,14 +349,14 @@ fi
 	p1="$("$SP" wake agent --peek)"
 	contains "$p1" 'alpha mentions agent' || fail 'same-sender: alpha mention not found'
 	# Consume alpha's mention
-	"$SP" wake agent >/dev/null
+	STITCHPAD_NAME=agent "$SP" wake agent >/dev/null
 	# Agent replies to alpha — should clear alpha's mention gate
 	STITCHPAD_NAME=agent "$SP" say '@alpha thanks for the ping' >/dev/null
 	# Beta's mention should STILL be awake (not swallowed by replying to alpha)
 	p2="$("$SP" wake agent --peek)"
 	contains "$p2" 'beta also mentions agent' || fail 'same-sender: replying to alpha swallowed beta mention'
 	# Consume beta's mention
-	"$SP" wake agent >/dev/null
+	STITCHPAD_NAME=agent "$SP" wake agent >/dev/null
 	# Now agent replies to beta
 	STITCHPAD_NAME=agent "$SP" say '@beta acknowledged' >/dev/null
 	# Both gates should be clear
@@ -195,7 +381,7 @@ fi
 	wake1="$("$SP" wake agent --peek)"
 	contains "$wake1" 'peek-ordinal test' || fail '--peek-ordinal consumed the gate (must be read-only)'
 	# Consume, then --peek-ordinal should be empty (no open mention)
-	"$SP" wake agent >/dev/null
+	STITCHPAD_NAME=agent "$SP" wake agent >/dev/null
 	ord2="$("$SP" wake agent --peek-ordinal)"
 	[ -z "$ord2" ] && ord2=0
 	[ "$ord2" -eq 0 ] || fail '--peek-ordinal returned non-zero after all mentions consumed'
@@ -220,7 +406,7 @@ fi
 	STITCHPAD_NAME=smaths "$SP" say '@agent second mention - CRITICAL' >/dev/null
 
 	# Consume first (ordinal 1, seen → 1)
-	"$SP" wake agent >/dev/null
+	STITCHPAD_NAME=agent "$SP" wake agent >/dev/null
 	[ "$(cat "$case9/.stitchpad/.state/seen.agent")" -eq 1 ] || fail 'invariant5: seen != 1 after first consume'
 
 	# Stamp pending with ordinal 2 (watcher stamps BEFORE consuming second)
@@ -229,7 +415,7 @@ fi
 	printf '%s' "$po" > "$case9/.stitchpad/.state/pending.agent"
 
 	# Consume second (ordinal 2, seen → 2)
-	"$SP" wake agent >/dev/null
+	STITCHPAD_NAME=agent "$SP" wake agent >/dev/null
 	[ "$(cat "$case9/.stitchpad/.state/seen.agent")" -eq 2 ] || fail 'invariant5: seen != 2 after second consume'
 
 	# Turn crashed — normal wake sees nothing (seen advanced past both)
@@ -281,9 +467,9 @@ fi
 	#
 	# Regression 11: Hook preserves pending when DND suppresses --force.
 	#
-	# Regression 12: Adapter FAILURE clears pending — no delivery means
-	# no crash recovery target, so the stamp must be cleared to prevent
-	# the next watcher cycle from deferring forever (the deadlock bug).
+	# Regression 12: Adapter FAILURE remains durable in the per-seat supervisor.
+	# The accepted generation stays pending with state=error, and a later watcher
+	# event restarts that same generation instead of losing it or advancing seen.
 
 	# --- Regression 10: Watcher defer-or-queue (production) ---
 	case10="$tmp/case10"
@@ -292,30 +478,40 @@ fi
 	"$SP" init --name case10 >/dev/null
 	"$SP" join agent herdr push >/dev/null     # push adapter, NOT pull
 	stop_watcher "$case10"
+	rm -f "$case10/.stitchpad/.state"/alive.*
 
 	# Build: one mention consumed (seen=1), second stamped pending=2 then
 	# consumed (turn crashed), third mention posted — watcher must defer.
+	# These two `wake` calls are FIXTURE ONLY — they exist to drive the seen
+	# cursor to a known state before the watcher's defer branch is exercised
+	# below; nothing here asserts wake-on-push semantics. @agent is a PUSH seat
+	# (herdr), and P43 now refuses a push-seat wake issued by anyone OTHER than
+	# that seat, because that shape prints the message to the caller and burns
+	# the cursor without delivering. Name the seat, which is what every real
+	# caller does (see adapters/herdr.sh) — the assertions are unchanged.
 	STITCHPAD_NAME=fable "$SP" say '@agent first mention' >/dev/null
-	"$SP" wake agent >/dev/null                                      # seen=1
+	STITCHPAD_NAME=agent "$SP" wake agent >/dev/null                 # seen=1
 	STITCHPAD_NAME=smaths "$SP" say '@agent second - CRITICAL' >/dev/null
 	printf '2' > "$case10/.stitchpad/.state/pending.agent"           # crash stamp
-	"$SP" wake agent >/dev/null                                      # seen=2
+	STITCHPAD_NAME=agent "$SP" wake agent >/dev/null                 # seen=2
 	STITCHPAD_NAME=other "$SP" say '@agent third mention' >/dev/null
 
 	# Start watcher backgrounded, CAPTURE output, trigger fswatch.
-	"$SP" watch > "$case10/watcher.out" 2>&1 &
+	( trap - EXIT; exec "$SP" watch ) > "$case10/watcher.out" 2>&1 &
 	WATCH_PID=$!
-	sleep 0.5
-	printf '\n' >> "$case10/.stitchpad/stitchpad.md"
-	sleep 1.5
-	kill -9 $WATCH_PID 2>/dev/null || true
-	wait $WATCH_PID 2>/dev/null || true
-	pkill -9 -f "fswatch.*$case10" 2>/dev/null || true
-	rm -rf "$case10/.stitchpad/.state/watch.lock.d" 2>/dev/null || true
+	for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+	  printf '\n' >> "$case10/.stitchpad/stitchpad.md"
+	  grep -q 'deferring.*pending recovery target.*ordinal 2' "$case10/watcher.out" 2>/dev/null && break
+	  sleep 0.25
+	done
+		stop_watcher "$case10"
+		wait $WATCH_PID 2>/dev/null || true
 
 	# Assert: the DEFER branch actually RAN (deferring line present).
-	grep -q 'deferring.*pending recovery target.*ordinal 2' "$case10/watcher.out" \
-	  || fail 'invariant5: watcher did NOT defer — branch not exercised'
+	if ! grep -q 'deferring.*pending recovery target.*ordinal 2' "$case10/watcher.out"; then
+	  sed -n '1,80p' "$case10/watcher.out" >&2
+	  fail 'invariant5: watcher did NOT defer — branch not exercised'
+	fi
 
 	# Assert: NO adapter was fired (defer happened before --peek).
 	! grep -q 'firing' "$case10/watcher.out" \
@@ -340,7 +536,7 @@ fi
 	# Consume one mention (seen=1), stamp pending=1, turn crashes.
 	STITCHPAD_NAME=fable "$SP" say '@agent critical message' >/dev/null
 	printf '1' > "$case11/.stitchpad/.state/pending.agent"
-	"$SP" wake agent >/dev/null                                      # seen=1
+	STITCHPAD_NAME=agent "$SP" wake agent >/dev/null                                      # seen=1
 
 	# Enable DND for agent (wake --force exits 0 silently).
 	touch "$case11/.stitchpad/.state/dnd.agent"
@@ -360,52 +556,64 @@ fi
 	# Assert: delivered_no_reply was NOT created (never recovered the message).
 	[ ! -f "$case11/.stitchpad/.state/delivered_no_reply.agent" ] || fail 'invariant5: hook wrote delivered_no_reply under DND without recovering'
 
-	# --- Regression 12: Adapter failure clears pending (production) ---
+	# --- Regression 12: Adapter failure preserves supervised pending (production) ---
 	case12="$tmp/case12"
 	mkdir "$case12"
 	cd "$case12"
 	"$SP" init --name case12 >/dev/null
 	"$SP" join agent test-fail push >/dev/null    # push adapter that always exits 1
 	stop_watcher "$case12"
+	rm -f "$case12/.stitchpad/.state"/alive.*
 
 	# Post a mention and start the watcher — the test-fail adapter exits 1,
-	# so fire_adapter returns failure. The watcher must create then CLEAR
-	# the pending stamp (no delivery = nothing to recover from crash).
+	# so the seat worker records a durable error and keeps its accepted generation.
 	STITCHPAD_NAME=fable "$SP" say '@agent delivery test' >/dev/null
 
 	# Watcher captures output; trigger TWO fswatch events to prove
 	# both cycles ran (adapter failure -> clear -> retry -> clear again).
-	"$SP" watch > "$case12/watcher.out" 2>&1 &
+	( trap - EXIT; exec "$SP" watch ) > "$case12/watcher.out" 2>&1 &
 	WATCH_PID=$!
-	sleep 0.5
+	wait_for_fswatch "$case12"
 
-	# EVENT 1: trigger fswatch, adapter fails, pending cleared.
+	# EVENT 1: trigger fswatch; adapter fails and supervised pending survives.
 	printf '\n' >> "$case12/.stitchpad/stitchpad.md"
-	sleep 1.5
-	[ ! -f "$case12/.stitchpad/.state/pending.agent" ] \
-	  || fail 'invariant5: pending not cleared after event-1 adapter failure'
+	for _ in $(seq 1 100); do
+	  grep -q '^state=error$' "$case12/.stitchpad/.state/delivery.agent.state" 2>/dev/null \
+	    && [ ! -d "$case12/.stitchpad/.state/delivery.agent.worker.lock.d" ] && break
+	  sleep 0.05
+	done
+	[ -f "$case12/.stitchpad/.state/delivery.agent.pending" ] \
+	  || fail 'supervision: adapter failure discarded accepted generation'
+	grep -q '^state=error$' "$case12/.stitchpad/.state/delivery.agent.state" \
+	  || fail 'supervision: adapter failure did not persist error state'
 	_s12_1="$(cat "$case12/.stitchpad/.state/seen.agent" 2>/dev/null || echo 0)"
 	[ "${_s12_1:-0}" -eq 0 ] \
 	  || fail "invariant5: seen advanced after event-1 failure; seen=$_s12_1"
 
-	# EVENT 2: trigger fswatch again — same mention is still unanswered,
-	# watcher must fire adapter again (no deadlock from stale pending).
+	# EVENT 2: same mention is still current; watcher restarts the failed
+	# generation without creating a duplicate generation or consuming seen.
+	_gen12="$(cat "$case12/.stitchpad/.state/delivery.agent.generation")"
 	printf '\n' >> "$case12/.stitchpad/stitchpad.md"
-	sleep 1.5
-	[ ! -f "$case12/.stitchpad/.state/pending.agent" ] \
-	  || fail 'invariant5: pending not cleared after event-2 adapter failure'
+	for _ in $(seq 1 100); do
+	  [ "$(grep -c 'exit 1 (not consuming gate)' "$case12/.stitchpad/.state/delivery.agent.log" 2>/dev/null || true)" -ge 2 ] \
+	    && [ ! -d "$case12/.stitchpad/.state/delivery.agent.worker.lock.d" ] && break
+	  sleep 0.05
+	done
+	[ "$(cat "$case12/.stitchpad/.state/delivery.agent.generation")" = "$_gen12" ] \
+	  || fail 'supervision: retry created a duplicate generation'
+	[ -f "$case12/.stitchpad/.state/delivery.agent.pending" ] \
+	  || fail 'supervision: retry discarded failed generation'
 	_s12_2="$(cat "$case12/.stitchpad/.state/seen.agent" 2>/dev/null || echo 0)"
 	[ "${_s12_2:-0}" -eq 0 ] \
 	  || fail "invariant5: seen advanced after event-2 failure; seen=$_s12_2"
 
-	kill -9 $WATCH_PID 2>/dev/null || true
-	wait $WATCH_PID 2>/dev/null || true
-	pkill -9 -f "fswatch.*$case12" 2>/dev/null || true
-	rm -rf "$case12/.stitchpad/.state/watch.lock.d" 2>/dev/null || true
+		stop_watcher "$case12"
+		wait $WATCH_PID 2>/dev/null || true
 
-	# Assert: TWO adapter failure calls (branch ran twice, not once,
-	# not zero — proves event 2 retried instead of deferring forever).
-	_failcount="$(grep -c 'exit 1 (not consuming gate)' "$case12/watcher.out" 2>/dev/null || echo 0)"
+	# Assert: TWO adapter failure calls in the independent seat log (branch ran
+	# twice, proving event 2 supervised the error instead of wedging forever).
+	_failcount="$(grep -c 'exit 1 (not consuming gate)' "$case12/.stitchpad/.state/delivery.agent.log" 2>/dev/null || true)"
+	_failcount="${_failcount:-0}"
 	[ "${_failcount:-0}" -ge 2 ] \
 	  || fail "invariant5: expected >=2 adapter-failure calls, got $_failcount"
 
@@ -420,6 +628,7 @@ fi
 	"$SP" init --name case13 >/dev/null
 	"$SP" join agent ocean push ocean-session >/dev/null
 	stop_watcher "$case13"
+	rm -f "$case13/.stitchpad/.state"/alive.*
 	rm -f "$case13/.stitchpad/.state/alive.agent"
 	[ "$(cat "$case13/.stitchpad/.state/sessions/ocean-session" 2>/dev/null)" = "agent" ] \
 	  || fail 'ocean join did not bind push session identity'
@@ -430,33 +639,98 @@ fi
 	mkdir "$mockbin"
 	cat > "$mockbin/curl" <<'EOF'
 #!/usr/bin/env bash
-printf '{"session":{"active_turn":null}}\n'
+case "${!#}" in
+  */v1/requests) printf '{"ok":true,"requests":[{"request_id":"turn-13","state":"completed"}]}\n' ;;
+  *) printf '{"session":{"active_turn":null}}\n' ;;
+esac
 EOF
 	cat > "$mockbin/ocean-heartbeat" <<'EOF'
 #!/usr/bin/env bash
+printf '{"ok":true,"session_id":"ocean-session","turn_id":"turn-13"}\n'
 exit 0
 EOF
 	chmod +x "$mockbin/curl" "$mockbin/ocean-heartbeat"
 
 	STITCHPAD_NAME=sender "$SP" say '@agent exactly once over ocean push' >/dev/null
-	PATH="$mockbin:$PATH" "$SP" watch > "$case13/watcher.out" 2>&1 &
+	( trap - EXIT; PATH="$mockbin:$PATH" exec "$SP" watch ) > "$case13/watcher.out" 2>&1 &
 	WATCH_PID=$!
-	sleep 0.5
+	wait_for_fswatch "$case13"
 	printf '\n' >> "$case13/.stitchpad/stitchpad.md"
 	for _ in 1 2 3 4 5 6 7 8 9 10; do
 	  [ "$(cat "$case13/.stitchpad/.state/seen.agent" 2>/dev/null || echo 0)" -eq 1 ] && break
 	  sleep 0.5
 	done
-	kill -9 $WATCH_PID 2>/dev/null || true
+	stop_watcher "$case13"
 	wait $WATCH_PID 2>/dev/null || true
-	pkill -9 -f "fswatch.*$case13" 2>/dev/null || true
-	rm -rf "$case13/.stitchpad/.state/watch.lock.d" 2>/dev/null || true
 
-	grep -q 'unanswered @agent -> firing ocean (push)' "$case13/watcher.out" \
-	  || fail 'ocean exactly-once branch did not fire adapter'
+	grep -q '^state=completed$' "$case13/.stitchpad/.state/delivery.agent.state" \
+	  || fail 'ocean exactly-once branch did not complete supervised delivery'
 	[ "$(cat "$case13/.stitchpad/.state/seen.agent" 2>/dev/null || echo 0)" -eq 1 ] \
 	  || fail 'ocean successful delivery did not consume seen cursor'
+	[ ! -f "$case13/.stitchpad/.state/delivery.agent.pending" ] \
+	  || fail 'ocean successful delivery left supervised pending state'
 	[ ! -f "$case13/.stitchpad/.state/pending.agent" ] \
 	  || fail 'ocean successful delivery left replay-causing pending stamp'
 
+	# Regression 14: reply-target extraction must scan ALL reply tokens in
+	# ordinal order, not just the second one. A reply whose @target sits past
+	# token 2 (e.g. "sure thing @alice" — @alice is token 4) must still populate
+	# reply_target so the same-sender gate fires. Pre-fix the awk used
+	# `for (i in tokens)` + `if (i > 20) break` — hash-order iteration visits
+	# token 2 first and the STRING comparison "2" > "20" breaks immediately, so
+	# only token 2 was ever examined; reply_target stayed empty and the
+	# already-answered sender was re-woken forever (flash2 Defect A).
+	case14="$tmp/case14"
+	mkdir "$case14"
+	cd "$case14"
+	"$SP" init --name case14 >/dev/null
+	"$SP" join agent codex >/dev/null
+	"$SP" join alice claude >/dev/null
+	stop_watcher "$case14"
+	STITCHPAD_NAME=alice "$SP" say '@agent question from alice' >/dev/null
+	STITCHPAD_NAME=agent "$SP" say 'sure thing @alice' >/dev/null   # @alice is token 4, not token 2
+	out14="$(STITCHPAD_NAME=agent "$SP" wake agent)"
+	[ -z "$out14" ] || {
+	  printf '%s\n' "$out14" >&2
+	  fail 'reply-target: @target past token 2 did not clear the same-sender gate'
+	}
+
+	# Regression 15: a reply suppresses ONLY the answered mention. When the
+	# FIRST (oldest) mention is already answered by the agent's own reply,
+	# later mentions from OTHER senders must still deliver FIFO — not starve
+	# behind a gate that fires on the answered mention and exits before
+	# advancing the seen cursor. Pre-fix nothing ever delivered charlie's
+	# newer mention (only `wake --force N` could escape) (flash2 Defect B).
+	case15="$tmp/case15"
+	mkdir "$case15"
+	cd "$case15"
+	"$SP" init --name case15 >/dev/null
+	"$SP" join agent codex >/dev/null
+	"$SP" join alice claude >/dev/null
+	"$SP" join charlie claude >/dev/null
+	stop_watcher "$case15"
+	STITCHPAD_NAME=alice "$SP" say '@agent question from alice' >/dev/null      # ord 1
+	STITCHPAD_NAME=agent "$SP" say '@alice answered' >/dev/null                 # ord 2 — clears alice's mention
+	STITCHPAD_NAME=charlie "$SP" say '@agent question from charlie' >/dev/null  # ord 3 — must still deliver
+	out15="$(STITCHPAD_NAME=agent "$SP" wake agent)"
+	contains "$out15" 'question from charlie' \
+	  || fail 'reply-clears-gate starved a later mention from another sender'
+	if contains "$out15" 'question from alice'; then
+	  printf '%s\n' "$out15" >&2
+	  fail 'reply-clears-gate re-delivered the already-answered mention'
+	fi
+	# FIFO cursor consumed charlie's mention (ordinal 3), not alice's (1)
+	_seen15="$(cat "$case15/.stitchpad/.state/seen.agent" 2>/dev/null || echo 0)"
+	[ "$_seen15" -eq 3 ] \
+	  || fail "reply-clears-gate advanced seen to wrong ordinal: $_seen15 (want 3)"
+	# Everything drained → the next wake is silent
+	second15="$(STITCHPAD_NAME=agent "$SP" wake agent)"
+	[ -z "$second15" ] || fail 'reply-clears-gate left an extra mention queued'
+
+	stop_all_fixture_runtime
+	cleanup_fixture_registry
+	fixture_registry_is_clean \
+	  || fail 'fixture path leaked into the machine-global terminal registry'
+	fixture_watchers_are_clean \
+	  || fail 'fixture watcher process survived exact teardown'
 	printf 'wake regression ok\n'
