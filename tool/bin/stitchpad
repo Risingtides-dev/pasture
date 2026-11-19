@@ -3,7 +3,7 @@
 #
 #   stitchpad init [--name <pad>]         create .stitchpad/ in the current project
 #   stitchpad join <name> <adapter> [wake] [target]   add a participant to the roster
-#   STITCHPAD_NAME=<you> stitchpad say [--image <path>] <text...>   post a message (auto-commits)
+#   stitchpad say [--image <path>] <text...|--file <path|->>   post as your joined identity
 #   stitchpad read [-n N]                 print the recent conversation (plain)
 #   stitchpad meta set|get <name> <key> [value] runtime/model metadata
 #   stitchpad dnd on|off [--drain]|status silence/resume wake delivery
@@ -830,15 +830,38 @@ PY
       _holder="$(sp_term_lock_check "$_ssurf" "$from")" || {
         echo "stitchpad: REFUSED — this terminal is bound to ${_holder%%|*} (as @$(echo "$_holder" | cut -d'|' -f2)), not $PAD_DIR. cd there or 'stitchpad leave' first." >&2; exit 1; }
     fi
-    image_path=""
-    if [ "${1:-}" = "--image" ]; then
-      shift
-      image_path="${1:-}"
-      [ -n "$image_path" ] || { echo "usage: stitchpad say --image <path> [text...]" >&2; exit 1; }
-      shift
+    image_path=""; body_src=""
+    _say_usage="usage: stitchpad say [--image <path>] <text...|--file <path|->>"
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --image)
+          [ -z "$image_path" ] || { echo "stitchpad: pass --image only once" >&2; exit 1; }
+          image_path="${2:-}"
+          [ -n "$image_path" ] || { echo "$_say_usage" >&2; exit 1; }
+          shift 2 ;;
+        --file)
+          [ -z "$body_src" ] || { echo "stitchpad: pass --file only once" >&2; exit 1; }
+          body_src="${2:-}"
+          [ -n "$body_src" ] || { echo "$_say_usage" >&2; exit 1; }
+          shift 2 ;;
+        --) shift; break ;;
+        *) break ;;
+      esac
+    done
+    if [ -n "$body_src" ]; then
+      [ $# -eq 0 ] || { echo "stitchpad: --file and trailing text are mutually exclusive" >&2; exit 1; }
+      # Read bytes as data, never as shell source. -r accepts process substitution
+      # and FIFOs too. A failed read must not post partial content or an image.
+      if [ "$body_src" = "-" ]; then
+        text="$(cat)" || { echo "stitchpad: failed to read stdin" >&2; exit 1; }
+      else
+        [ -r "$body_src" ] || { echo "stitchpad: --file needs a readable path (or '-' for stdin)" >&2; exit 1; }
+        text="$(cat -- "$body_src")" || { echo "stitchpad: failed to read message file" >&2; exit 1; }
+      fi
+    else
+      text="$*"
     fi
-    text="$*"
-    [ -z "$text" ] && [ -z "$image_path" ] && { echo "usage: stitchpad say [--image <path>] <text...>  (you are @$from)" >&2; exit 1; }
+    [ -z "$text" ] && [ -z "$image_path" ] && { echo "$_say_usage  (you are @$from)" >&2; exit 1; }
 
     if [ -n "$image_path" ]; then
       [ -f "$image_path" ] || { echo "stitchpad: image not found: $image_path" >&2; exit 1; }

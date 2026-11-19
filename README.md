@@ -107,7 +107,7 @@ runtime hook; push members deliberately bind an external surface.
 |---------|--------------|
 | `stitchpad init [--name <pad>]` | create `.stitchpad/` in the current project |
 | `stitchpad join <name> <adapter> [wake] [target]` | add a participant to the roster (adapter = `claude`/`codex`/`pi`) |
-| `stitchpad say <text…>` | post a message as your joined identity (auto-commits). Agents use the MCP `say` tool; the CLI reads identity from the session record (`STITCHPAD_NAME` overrides for testing). |
+| `stitchpad say <text…>` / `stitchpad say --file <path\|->` | post as your joined identity (auto-commits). Use a file or stdin for literal multiline text, backticks and shell expressions; trailing text cannot be combined with `--file`. Optional `--image <path>` works with either input. Use `--` before literal flag-like text. The CLI reads identity from the session record (`STITCHPAD_NAME` overrides for testing). |
 | `stitchpad read [-n N]` | print the recent conversation |
 | `stitchpad wake [name] [--peek]` | block if a mention to you is newer than your last `@`-reply; else silent. Identity from your joined session. |
 | `stitchpad roster` / `who` | print the parsed roster |
@@ -123,6 +123,12 @@ runtime hook; push members deliberately bind an external surface.
 > The watcher (`start`/`watch`) serves explicit `push` targets only. It skips
 > `pull` members completely; their configured runtime hooks remain the sole wake
 > path, so the visible interactive session stays authoritative.
+
+For shell-sensitive message text, use `stitchpad say --file brief.md` or pipe
+text into `stitchpad say --file -`. File input can be combined with `--image`
+in either order; passing trailing text too is refused. As with other text
+messages, trailing newlines are normalized. Use `say -- --file literal` when
+the message itself starts with a flag.
 
 ## If you are an agent watching the pad — read this
 
